@@ -1,0 +1,177 @@
+{
+  "_file": "src/world/flat/world.json",
+  "schemaVersion": "world.schema.v1",
+  "worldId": "flat",
+  "worldType": "flat",
+  "label": "Flat Debug World",
+  "description": "Initial deterministic flat world for the VECTOPLAN chunk service.",
+  "status": "development",
+
+  "planetId": "dev-earth",
+  "worldVersion": "1",
+
+  "generatorType": "flat-world",
+  "generatorVersion": "1",
+  "seed": "vectoplan-flat-dev-seed-v1",
+
+  "chunkSize": 16,
+  "cellSize": 1,
+
+  "coordinateSystem": "vectoplan-world-y-up-v1",
+  "projectionType": "flat-local-v1",
+  "topologyType": "flat-unbounded-v1",
+
+  "surfaceY": 0,
+  "minY": -8,
+  "maxY": 64,
+
+  "blockRegistryId": "debug-blocks",
+  "blockRegistryVersion": "1",
+
+  "cellEncoding": {
+    "version": "cell-encoding.palette-index-plus-one.v1",
+    "airCellValue": 0,
+    "blockCellValueRule": "paletteIndex + 1",
+    "examples": [
+      {
+        "paletteIndex": 0,
+        "cellValue": 1,
+        "blockTypeId": "debug_grass"
+      },
+      {
+        "paletteIndex": 1,
+        "cellValue": 2,
+        "blockTypeId": "debug_dirt"
+      }
+    ]
+  },
+
+  "cellIndexing": {
+    "version": "cell-indexing.x-fastest-y-then-z.v1",
+    "order": "x-fastest-y-then-z",
+    "formula": "index = localX + chunkSize * (localY + chunkSize * localZ)",
+    "axes": {
+      "x": "east-west",
+      "y": "up-down",
+      "z": "north-south"
+    }
+  },
+
+  "palette": [
+    {
+      "registryId": "debug-blocks",
+      "registryVersion": "1",
+      "blockTypeId": "debug_grass",
+      "label": "Debug Grass",
+      "solid": true,
+      "placeable": true,
+      "breakable": true,
+      "metadata": {
+        "category": "debug",
+        "role": "surface",
+        "debugColor": "#4caf50",
+        "editorHint": "Temporary surface block for the first flat world."
+      }
+    },
+    {
+      "registryId": "debug-blocks",
+      "registryVersion": "1",
+      "blockTypeId": "debug_dirt",
+      "label": "Debug Dirt",
+      "solid": true,
+      "placeable": true,
+      "breakable": true,
+      "metadata": {
+        "category": "debug",
+        "role": "subsurface",
+        "debugColor": "#795548",
+        "editorHint": "Temporary subsurface block for the first flat world."
+      }
+    }
+  ],
+
+  "layers": {
+    "version": "flat-layers.v1",
+    "airBlockValue": 0,
+    "surfaceBlockTypeId": "debug_grass",
+    "subsurfaceBlockTypeId": "debug_dirt",
+    "rules": [
+      {
+        "name": "above_surface_is_air",
+        "condition": "worldY > surfaceY",
+        "cellValue": 0,
+        "blockTypeId": null
+      },
+      {
+        "name": "surface_is_grass",
+        "condition": "worldY == surfaceY",
+        "blockTypeId": "debug_grass"
+      },
+      {
+        "name": "subsurface_is_dirt",
+        "condition": "minY <= worldY < surfaceY",
+        "blockTypeId": "debug_dirt"
+      },
+      {
+        "name": "below_min_y_is_air",
+        "condition": "worldY < minY",
+        "cellValue": 0,
+        "blockTypeId": null
+      },
+      {
+        "name": "above_max_y_is_air",
+        "condition": "worldY > maxY",
+        "cellValue": 0,
+        "blockTypeId": null
+      }
+    ]
+  },
+
+  "spawn": {
+    "position": {
+      "x": 0,
+      "y": 2,
+      "z": 0
+    },
+    "lookAt": {
+      "x": 8,
+      "y": 0,
+      "z": 8
+    }
+  },
+
+  "runtime": {
+    "source": "generated",
+    "materializeUnchangedChunks": false,
+    "supportsSnapshots": false,
+    "supportsEvents": false,
+    "supportsCommands": false,
+    "supportsBatchChunks": true,
+    "supportsNegativeChunkCoordinates": true
+  },
+
+  "editor": {
+    "intendedConsumer": "vectoplan-editor",
+    "contentType": "RuntimeChunkContent",
+    "renderingMode": "voxel-cells",
+    "meshingHint": "solid-block-faces",
+    "targetingHint": "cell-raycast",
+    "reloadDirtyChunksAfterCommand": true
+  },
+
+  "metadata": {
+    "purpose": "First deterministic flat world used to validate remote chunk loading before database snapshots and commands exist.",
+    "phase": "phase-1-world-generation",
+    "isPlaceholderWorld": true,
+    "usesDatabase": false,
+    "usesGeoData": false,
+    "usesCore": false,
+    "usesLibraryService": false,
+    "notes": [
+      "This world config is loaded from src/world/flat/world.json.",
+      "The generator uses surfaceY, minY, maxY and layer blockTypeIds to create cells.",
+      "Unchanged chunks are generated and not persisted in this phase.",
+      "Database snapshots and events are intentionally not part of this file."
+    ]
+  }
+}

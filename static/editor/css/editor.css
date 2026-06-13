@@ -1,0 +1,846 @@
+/* services/vectoplan-editor/static/editor/css/editor.css */
+
+/* -----------------------------------------------------------------------------
+   VECTOPLAN Editor - Erste sichtbare Editor-Shell
+   -----------------------------------------------------------------------------
+   Ziele dieser Datei:
+   - stabile visuelle Grundstruktur für /editor
+   - klarer Editor-Charakter statt generischer Admin-Oberfläche
+   - saubere Trennung von Shell, Panels, Viewport und Hotbar
+   - robuste Defaults für frühe Entwicklungsphasen
+   - responsive Verhalten für kleinere Viewports
+   - gute Erweiterbarkeit für spätere Runtime-, Tool- und 3D-Ausbaustufen
+
+   Wichtig:
+   - Diese Datei beschreibt die visuelle Shell, nicht die fachliche Logik.
+   - Sie ist absichtlich umfangreicher als ein Minimal-CSS, damit das Layout
+     früh stabil bleibt und später ohne Strukturbruch wachsen kann.
+   -------------------------------------------------------------------------- */
+
+
+/* -----------------------------------------------------------------------------
+   Design Tokens / Grundvariablen
+   -------------------------------------------------------------------------- */
+
+:root {
+  color-scheme: dark;
+
+  --editor-font-family:
+    Arial,
+    "Helvetica Neue",
+    Helvetica,
+    sans-serif;
+
+  --editor-bg-app: #111111;
+  --editor-bg-topbar: #1b1b1b;
+  --editor-bg-panel: #161616;
+  --editor-bg-viewport: #0b0b0b;
+  --editor-bg-card: #1f1f1f;
+  --editor-bg-slot: #262626;
+  --editor-bg-slot-hover: #2d2d2d;
+  --editor-bg-slot-active: #333333;
+  --editor-bg-pill: #262626;
+  --editor-bg-overlay: rgba(0, 0, 0, 0.28);
+  --editor-bg-overlay-strong: rgba(0, 0, 0, 0.45);
+
+  --editor-text-primary: #eeeeee;
+  --editor-text-secondary: #c7c7c7;
+  --editor-text-muted: #a5a5a5;
+  --editor-text-soft: #888888;
+
+  --editor-border-subtle: #2b2b2b;
+  --editor-border-default: #3a3a3a;
+  --editor-border-strong: #4a4a4a;
+  --editor-border-overlay: rgba(255, 255, 255, 0.08);
+
+  --editor-shadow-soft: 0 6px 20px rgba(0, 0, 0, 0.18);
+  --editor-shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.22);
+
+  --editor-radius-xs: 6px;
+  --editor-radius-sm: 8px;
+  --editor-radius-md: 10px;
+  --editor-radius-lg: 12px;
+  --editor-radius-pill: 999px;
+
+  --editor-space-1: 4px;
+  --editor-space-2: 8px;
+  --editor-space-3: 12px;
+  --editor-space-4: 16px;
+  --editor-space-5: 20px;
+  --editor-space-6: 24px;
+  --editor-space-8: 32px;
+
+  --editor-topbar-height: 56px;
+  --editor-hotbar-height: 88px;
+
+  --editor-left-panel-width: 260px;
+  --editor-right-panel-width: 320px;
+
+  --editor-slot-size: 56px;
+  --editor-grid-size: 32px;
+
+  --editor-transition-fast: 120ms ease;
+  --editor-transition-base: 180ms ease;
+
+  --editor-z-base: 1;
+  --editor-z-overlay: 2;
+  --editor-z-noscript: 20;
+
+  --editor-focus-outline: 2px solid rgba(255, 255, 255, 0.28);
+  --editor-focus-offset: 2px;
+}
+
+
+/* -----------------------------------------------------------------------------
+   Reset / Basis
+   -------------------------------------------------------------------------- */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+}
+
+html {
+  background: var(--editor-bg-app);
+}
+
+body {
+  overflow: hidden;
+  background: var(--editor-bg-app);
+  color: var(--editor-text-primary);
+  font-family: var(--editor-font-family);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    monospace;
+}
+
+img,
+svg,
+canvas {
+  display: block;
+  max-width: 100%;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+:focus-visible {
+  outline: var(--editor-focus-outline);
+  outline-offset: var(--editor-focus-offset);
+}
+
+
+/* -----------------------------------------------------------------------------
+   Root Shell
+   -------------------------------------------------------------------------- */
+
+#editor-app {
+  display: grid;
+  grid-template-columns:
+    var(--editor-left-panel-width)
+    minmax(0, 1fr)
+    var(--editor-right-panel-width);
+  grid-template-rows:
+    var(--editor-topbar-height)
+    minmax(0, 1fr)
+    var(--editor-hotbar-height);
+  grid-template-areas:
+    "topbar topbar topbar"
+    "left viewport right"
+    "hotbar hotbar hotbar";
+  width: 100vw;
+  width: 100dvw;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--editor-bg-app);
+  color: var(--editor-text-primary);
+  isolation: isolate;
+}
+
+#editor-app[data-app-name="vectoplan-editor"] {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.008), rgba(0, 0, 0, 0.04)),
+    var(--editor-bg-app);
+}
+
+
+/* -----------------------------------------------------------------------------
+   Topbar
+   -------------------------------------------------------------------------- */
+
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--editor-space-4);
+  min-width: 0;
+  padding: 0 var(--editor-space-4);
+  background: var(--editor-bg-topbar);
+  border-bottom: 1px solid var(--editor-border-subtle);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.015);
+  position: relative;
+  z-index: var(--editor-z-base);
+}
+
+.topbar::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.035),
+    transparent
+  );
+  pointer-events: none;
+}
+
+.topbar__left,
+.topbar__right {
+  display: flex;
+  align-items: center;
+  gap: var(--editor-space-3);
+  min-width: 0;
+}
+
+.brand {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.topbar__badge,
+.topbar__route {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--editor-border-default);
+  border-radius: var(--editor-radius-pill);
+  background: var(--editor-bg-pill);
+  color: var(--editor-text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.topbar__route {
+  color: var(--editor-text-muted);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--editor-radius-pill);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--editor-text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    background-color var(--editor-transition-fast),
+    color var(--editor-transition-fast),
+    border-color var(--editor-transition-fast);
+}
+
+.status:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+
+/* -----------------------------------------------------------------------------
+   Panels
+   -------------------------------------------------------------------------- */
+
+.left-panel,
+.right-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--editor-bg-panel);
+  padding: var(--editor-space-4);
+  scrollbar-width: thin;
+  scrollbar-color: var(--editor-border-default) transparent;
+}
+
+.left-panel::-webkit-scrollbar,
+.right-panel::-webkit-scrollbar {
+  width: 10px;
+}
+
+.left-panel::-webkit-scrollbar-track,
+.right-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.left-panel::-webkit-scrollbar-thumb,
+.right-panel::-webkit-scrollbar-thumb {
+  background: var(--editor-border-default);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.left-panel {
+  grid-area: left;
+  border-right: 1px solid var(--editor-border-subtle);
+}
+
+.right-panel {
+  grid-area: right;
+  border-left: 1px solid var(--editor-border-subtle);
+}
+
+.panel-section + .panel-section {
+  margin-top: var(--editor-space-5);
+}
+
+.panel-title {
+  margin: 0 0 var(--editor-space-3) 0;
+  color: var(--editor-text-primary);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.panel-section .panel-title:is(h3, h4, h5, h6) {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--editor-text-secondary);
+}
+
+.panel-text,
+.panel-note {
+  margin: 0;
+  color: var(--editor-text-secondary);
+  line-height: 1.55;
+}
+
+.panel-note {
+  font-size: 13px;
+  color: var(--editor-text-soft);
+}
+
+.panel-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--editor-text-secondary);
+  line-height: 1.55;
+}
+
+.panel-list li + li {
+  margin-top: var(--editor-space-2);
+}
+
+.left-panel strong,
+.right-panel strong {
+  color: var(--editor-text-primary);
+}
+
+.left-panel code,
+.right-panel code {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: var(--editor-radius-xs);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--editor-text-primary);
+  font-size: 0.95em;
+}
+
+
+/* -----------------------------------------------------------------------------
+   Viewport
+   -------------------------------------------------------------------------- */
+
+.viewport-container {
+  grid-area: viewport;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at top center, rgba(255, 255, 255, 0.02), transparent 38%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(0, 0, 0, 0.08)),
+    var(--editor-bg-viewport);
+}
+
+.viewport-container::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.08) 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+#editor-viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  isolation: isolate;
+}
+
+#editor-viewport[data-runtime-state="bootstrapping"] {
+  cursor: progress;
+}
+
+#editor-viewport[data-runtime-state="running"] {
+  cursor: default;
+}
+
+#editor-viewport[data-runtime-state="error"] {
+  cursor: not-allowed;
+}
+
+.viewport-grid-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.14;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.11) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.11) 1px, transparent 1px);
+  background-size: var(--editor-grid-size) var(--editor-grid-size);
+  mask-image: radial-gradient(circle at center, black 35%, transparent 95%);
+  -webkit-mask-image: radial-gradient(circle at center, black 35%, transparent 95%);
+}
+
+.viewport-overlay {
+  position: absolute;
+  z-index: var(--editor-z-overlay);
+  max-width: min(420px, calc(100% - 32px));
+  padding: 10px 12px;
+  border: 1px solid var(--editor-border-overlay);
+  border-radius: var(--editor-radius-md);
+  background: var(--editor-bg-overlay);
+  color: var(--editor-text-secondary);
+  box-shadow: var(--editor-shadow-overlay);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.viewport-overlay--top-left {
+  top: 16px;
+  left: 16px;
+}
+
+.viewport-overlay--bottom-right {
+  right: 16px;
+  bottom: 16px;
+}
+
+.viewport-overlay__title {
+  margin: 0 0 6px 0;
+  color: var(--editor-text-primary);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.viewport-overlay__text {
+  margin: 0;
+  color: var(--editor-text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+[data-viewport-placeholder] {
+  word-break: break-word;
+}
+
+
+/* -----------------------------------------------------------------------------
+   Hotbar
+   -------------------------------------------------------------------------- */
+
+.hotbar {
+  grid-area: hotbar;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--editor-space-3);
+  min-width: 0;
+  padding: 0 var(--editor-space-4);
+  background: var(--editor-bg-topbar);
+  border-top: 1px solid var(--editor-border-subtle);
+  position: relative;
+}
+
+.hotbar::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.035),
+    transparent
+  );
+  pointer-events: none;
+}
+
+.slot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--editor-slot-size);
+  height: var(--editor-slot-size);
+  border: 1px solid var(--editor-border-default);
+  border-radius: var(--editor-radius-sm);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(0, 0, 0, 0.05)),
+    var(--editor-bg-slot);
+  color: var(--editor-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  user-select: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 4px 10px rgba(0, 0, 0, 0.12);
+  transition:
+    transform var(--editor-transition-fast),
+    background-color var(--editor-transition-fast),
+    border-color var(--editor-transition-fast),
+    box-shadow var(--editor-transition-fast);
+}
+
+.slot:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(0, 0, 0, 0.04)),
+    var(--editor-bg-slot-hover);
+  border-color: var(--editor-border-strong);
+  transform: translateY(-1px);
+}
+
+.slot:active {
+  transform: translateY(0);
+  background: var(--editor-bg-slot-active);
+}
+
+.slot[data-hotbar-slot="1"] {
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 0 0 1px rgba(255, 255, 255, 0.03),
+    0 4px 10px rgba(0, 0, 0, 0.12);
+}
+
+
+/* -----------------------------------------------------------------------------
+   Noscript / Hilfselemente
+   -------------------------------------------------------------------------- */
+
+.noscript-notice {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  z-index: var(--editor-z-noscript);
+  padding: 12px 14px;
+  border: 1px solid #653c12;
+  border-radius: var(--editor-radius-md);
+  background: #2b1d10;
+  color: #f2d1a8;
+  box-shadow: var(--editor-shadow-soft);
+  line-height: 1.45;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+
+/* -----------------------------------------------------------------------------
+   Runtime-Zustände
+   -------------------------------------------------------------------------- */
+
+html.vectoplan-editor-shell-ready body {
+  background: var(--editor-bg-app);
+}
+
+#editor-app[data-runtime-state="running"] .status,
+#editor-viewport[data-runtime-state="running"] ~ .status {
+  color: #d2e7d2;
+}
+
+#editor-app[data-runtime-state="error"] .status {
+  color: #f0b4b4;
+}
+
+#editor-app[data-runtime-state="bootstrapping"] .status {
+  color: var(--editor-text-secondary);
+}
+
+
+/* -----------------------------------------------------------------------------
+   Responsive Verhalten
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 1400px) {
+  :root {
+    --editor-left-panel-width: 240px;
+    --editor-right-panel-width: 300px;
+  }
+}
+
+@media (max-width: 1200px) {
+  :root {
+    --editor-left-panel-width: 220px;
+    --editor-right-panel-width: 280px;
+  }
+
+  .topbar__route {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  #editor-app {
+    grid-template-columns: minmax(200px, 220px) minmax(0, 1fr);
+    grid-template-rows:
+      var(--editor-topbar-height)
+      minmax(0, 1fr)
+      var(--editor-hotbar-height);
+    grid-template-areas:
+      "topbar topbar"
+      "left viewport"
+      "hotbar hotbar";
+  }
+
+  .right-panel {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  :root {
+    --editor-topbar-height: auto;
+    --editor-hotbar-height: auto;
+  }
+
+  #editor-app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "topbar"
+      "viewport"
+      "hotbar"
+      "left";
+  }
+
+  .topbar {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .topbar__left,
+  .topbar__right {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .left-panel {
+    border-right: 0;
+    border-top: 1px solid var(--editor-border-subtle);
+    max-height: 36vh;
+  }
+
+  .viewport-overlay {
+    max-width: calc(100% - 24px);
+  }
+
+  .viewport-overlay--top-left {
+    top: 12px;
+    left: 12px;
+  }
+
+  .viewport-overlay--bottom-right {
+    right: 12px;
+    bottom: 12px;
+  }
+
+  .hotbar {
+    flex-wrap: wrap;
+    justify-content: center;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  :root {
+    --editor-slot-size: 52px;
+  }
+
+  .brand {
+    font-size: 14px;
+  }
+
+  .topbar__badge,
+  .status {
+    font-size: 12px;
+  }
+
+  .left-panel,
+  .right-panel {
+    padding: 14px;
+  }
+
+  .panel-title {
+    font-size: 16px;
+  }
+
+  .viewport-overlay {
+    padding: 9px 10px;
+  }
+}
+
+
+/* -----------------------------------------------------------------------------
+   Motion / Accessibility
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .slot:hover {
+    transform: none;
+  }
+}
+
+
+/* -----------------------------------------------------------------------------
+   High Contrast / Forced Colors
+   -------------------------------------------------------------------------- */
+
+@media (forced-colors: active) {
+  :root {
+    --editor-focus-outline: 2px solid Highlight;
+  }
+
+  .topbar,
+  .left-panel,
+  .right-panel,
+  .viewport-container,
+  .hotbar,
+  .slot,
+  .topbar__badge,
+  .topbar__route,
+  .status,
+  .viewport-overlay,
+  .noscript-notice {
+    forced-color-adjust: auto;
+    border-color: CanvasText;
+  }
+
+  .viewport-grid-hint {
+    opacity: 0.2;
+  }
+}
+
+
+/* -----------------------------------------------------------------------------
+   Print
+   -------------------------------------------------------------------------- */
+
+@media print {
+  html,
+  body {
+    overflow: visible;
+    background: #ffffff;
+    color: #000000;
+  }
+
+  #editor-app {
+    display: block;
+    width: auto;
+    height: auto;
+    background: #ffffff;
+    color: #000000;
+  }
+
+  .topbar,
+  .left-panel,
+  .right-panel,
+  .hotbar,
+  .viewport-overlay,
+  .noscript-notice {
+    display: none !important;
+  }
+
+  .viewport-container,
+  #editor-viewport {
+    min-height: 60vh;
+    border: 1px solid #000000;
+    background: #ffffff;
+  }
+}

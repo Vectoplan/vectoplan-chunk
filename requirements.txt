@@ -1,0 +1,76 @@
+# services/vectoplan-chunk/requirements.txt
+# -----------------------------------------------------------------------------
+# VECTOPLAN Chunk Service - Python dependencies
+#
+# Purpose of this service:
+# - Flask microservice for project-scoped editable chunk worlds
+# - PostgreSQL-backed Project / Universe / WorldInstance persistence
+# - PostgreSQL-backed ChunkSnapshot persistence
+# - PostgreSQL-backed WorldCommandLog / ChunkEvent history
+# - preparation for future multi-block object persistence
+#
+# Dependency principles:
+# - keep runtime dependencies small
+# - use stable major-version ranges
+# - prefer SQLAlchemy 2.x compatible libraries
+# - use psycopg 3.x for PostgreSQL
+# - keep migration support available from the start
+# -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# Runtime / Web Application
+# -----------------------------------------------------------------------------
+
+# Flask is the HTTP framework for app factory, routing, JSON responses,
+# templates/static fallback routes, and service health/status endpoints.
+Flask>=3.1,<4.0
+
+# Gunicorn is the WSGI server for containerized local/staging/production usage.
+gunicorn>=22.0,<26.0
+
+# Loads optional environment variables from .env files during local development.
+python-dotenv>=1.0,<2.0
+
+
+# -----------------------------------------------------------------------------
+# Database / Persistence
+# -----------------------------------------------------------------------------
+
+# Flask-SQLAlchemy provides the shared `db` extension used by models/*.py.
+Flask-SQLAlchemy>=3.1,<4.0
+
+# SQLAlchemy 2.x is the ORM foundation. Kept explicit so the service has a
+# predictable major version even when transitive dependency ranges shift.
+SQLAlchemy>=2.0,<3.0
+
+# psycopg 3.x PostgreSQL driver with bundled binary package for containers and
+# local development. This avoids requiring system-level libpq build setup.
+psycopg[binary]>=3.2,<4.0
+
+# Flask-Migrate integrates Alembic migrations with the Flask app.
+Flask-Migrate>=4.0,<5.0
+
+# Alembic is the schema migration engine. Flask-Migrate depends on it, but
+# keeping it explicit makes migration tooling predictable.
+alembic>=1.13,<2.0
+
+
+# -----------------------------------------------------------------------------
+# Serialization / Utilities
+# -----------------------------------------------------------------------------
+
+# No extra serialization framework is required yet.
+# The current service uses Python dataclasses, dicts and SQLAlchemy JSON/JSONB.
+# Add Marshmallow/Pydantic only when DTO validation is moved out of service code.
+
+
+# -----------------------------------------------------------------------------
+# Testing
+# -----------------------------------------------------------------------------
+
+# pytest for unit, integration and service tests.
+pytest>=8.0,<10.0
+
+# Optional but useful for Flask route and app-factory tests.
+pytest-cov>=5.0,<8.0
