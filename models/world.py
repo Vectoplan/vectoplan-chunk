@@ -1,6 +1,6 @@
 # services/vectoplan-chunk/models/world.py
 """
-SQLAlchemy model for concrete VECTOPLAN world instances.
+SQLAlchemy model for concrete VECTOPLAN Chunk world instances.
 
 A WorldInstance is the persistent editable world inside a Universe. It is not
 the same thing as a provider/template world.
@@ -16,15 +16,17 @@ Current intended hierarchy:
 
 Important design rules:
 - `id` is the internal database primary key.
+- `project_db_id` references `projects.id`.
+- `universe_db_id` references `universes.id`.
 - `world_id` is the stable public/API identifier inside one universe.
 - `world_id` is only unique per universe, not globally.
-- `world_spawn` is a concrete editable world instance.
-- `flat` is a provider/template world and should be stored as
+- `world_spawn` or generated `chk_wld_...` is a concrete editable world.
+- `flat` is a provider/template world and must be stored as
   `template_id` / `provider_world_id`, not as the concrete `world_id`.
-- This model does not store chunk cells.
+- This model stores world configuration, not chunk cells.
 - Chunk cells are stored in ChunkSnapshot.
 - This model does not perform commits.
-- Repository/service layers are responsible for database transactions.
+- Repository/service/route/bootstrap layers own database transactions.
 """
 
 from __future__ import annotations
@@ -59,10 +61,17 @@ except Exception:  # pragma: no cover - fallback is useful for tests/non-postgre
     JSONB = None  # type: ignore[assignment]
 
 
-JSON_COLUMN_TYPE = JSONB if JSONB is not None else db.JSON
+try:
+    JSON_COLUMN_TYPE = (
+        JSONB()
+        .with_variant(db.JSON(), "sqlite")
+        .with_variant(db.JSON(), "mysql")
+    ) if JSONB is not None else db.JSON
+except Exception:  # pragma: no cover
+    JSON_COLUMN_TYPE = db.JSON
 
 
-WORLD_INSTANCE_SCHEMA_VERSION = "world-instance.schema.v1"
+WORLD_INSTANCE_SCHEMA_VERSION = "world-instance.schema.v2"
 
 WORLD_STATUS_ACTIVE = "active"
 WORLD_STATUS_ARCHIVED = "archived"
@@ -144,6 +153,8 @@ DEFAULT_BLOCK_REGISTRY_VERSION = "1"
 DEFAULT_SPAWN_X = 0
 DEFAULT_SPAWN_Y = 2
 DEFAULT_SPAWN_Z = 0
+DEFAULT_SPAWN_YAW = 0.0
+DEFAULT_SPAWN_PITCH = 0.0
 
 WORLD_ID_MAX_LENGTH = 96
 WORLD_SLUG_MAX_LENGTH = 120
@@ -164,8 +175,10 @@ WORLD_SEED_MAX_LENGTH = 128
 WORLD_BLOCK_REGISTRY_ID_MAX_LENGTH = 128
 WORLD_BLOCK_REGISTRY_VERSION_MAX_LENGTH = 64
 WORLD_USER_ID_MAX_LENGTH = 128
+WORLD_SOURCE_SERVICE_MAX_LENGTH = 96
+WORLD_EXTERNAL_REF_MAX_LENGTH = 128
 
-PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -232,7 +245,11 @@ def normalize_optional_text(
     if value is None:
         return None
 
-    text = str(value).strip()
+    try:
+        text = str(value).strip()
+    except Exception as exc:
+        raise ValueError(f"{field_name} must be text-like.") from exc
+
     if not text:
         return None
 
@@ -277,6 +294,8 @@ def normalize_public_id(
     - numbers
     - underscore
     - dash
+    - dot
+    - colon
 
     The first character must be alphanumeric.
     """
@@ -288,11 +307,31 @@ def normalize_public_id(
 
     if not PUBLIC_ID_PATTERN.match(text):
         raise ValueError(
-            f"{field_name} may only contain letters, numbers, underscores "
-            "and dashes, and must start with a letter or number."
+            f"{field_name} may only contain letters, numbers, underscores, "
+            "dashes, dots and colons, and must start with a letter or number."
         )
 
     return text
+
+
+def is_provider_like_world_id(value: Any) -> bool:
+    """
+    Return true if a value looks like a provider/template id rather than a
+    concrete editable world id.
+    """
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return False
+
+    if not text:
+        return False
+
+    return text in {
+        DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+    }
 
 
 def normalize_world_id(value: Any) -> str:
@@ -302,6 +341,28 @@ def normalize_world_id(value: Any) -> str:
         field_name="world_id",
         max_length=WORLD_ID_MAX_LENGTH,
     )
+
+
+def normalize_concrete_world_id(
+    value: Any,
+    *,
+    default: str = DEFAULT_WORLD_ID,
+    field_name: str = "world_id",
+    allow_provider_like: bool = False,
+) -> str:
+    """
+    Normalize a concrete editable world id.
+
+    By default this rejects provider/template ids such as `flat`. This protects
+    the bootstrap path from accidentally using provider ids as concrete world ids.
+    """
+    fallback = normalize_world_id(default)
+    candidate = normalize_world_id(value or fallback)
+
+    if not allow_provider_like and is_provider_like_world_id(candidate):
+        return fallback
+
+    return candidate
 
 
 def normalize_template_id(value: Any) -> str:
@@ -356,7 +417,10 @@ def normalize_status(value: Any) -> str:
     if value is None:
         return WORLD_STATUS_ACTIVE
 
-    status = str(value).strip().lower()
+    try:
+        status = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("status must be text-like.") from exc
 
     if status not in VALID_WORLD_STATUSES:
         allowed = ", ".join(sorted(VALID_WORLD_STATUSES))
@@ -370,7 +434,10 @@ def normalize_world_type(value: Any) -> str:
     if value is None:
         return WORLD_TYPE_RUNTIME
 
-    world_type = str(value).strip().lower()
+    try:
+        world_type = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("world_type must be text-like.") from exc
 
     if world_type not in VALID_WORLD_TYPES:
         allowed = ", ".join(sorted(VALID_WORLD_TYPES))
@@ -384,7 +451,10 @@ def normalize_world_role(value: Any) -> str:
     if value is None:
         return WORLD_ROLE_DEFAULT_SPAWN
 
-    role = str(value).strip().lower()
+    try:
+        role = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("world_role must be text-like.") from exc
 
     if role not in VALID_WORLD_ROLES:
         allowed = ", ".join(sorted(VALID_WORLD_ROLES))
@@ -398,7 +468,10 @@ def normalize_world_scope(value: Any) -> str:
     if value is None:
         return WORLD_SCOPE_PROJECT
 
-    scope = str(value).strip().lower()
+    try:
+        scope = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("world_scope must be text-like.") from exc
 
     if scope not in VALID_WORLD_SCOPES:
         allowed = ", ".join(sorted(VALID_WORLD_SCOPES))
@@ -500,6 +573,22 @@ def normalize_int(
         raise ValueError(f"{field_name} must be an integer.") from exc
 
 
+def normalize_float(
+    value: Any,
+    *,
+    field_name: str,
+    default: float,
+) -> float:
+    """Normalize float configuration values."""
+    if value is None:
+        value = default
+
+    try:
+        return float(value)
+    except Exception as exc:
+        raise ValueError(f"{field_name} must be a number.") from exc
+
+
 def normalize_positive_float(
     value: Any,
     *,
@@ -507,13 +596,11 @@ def normalize_positive_float(
     default: float,
 ) -> float:
     """Normalize positive float configuration values."""
-    if value is None:
-        value = default
-
-    try:
-        float_value = float(value)
-    except Exception as exc:
-        raise ValueError(f"{field_name} must be a number.") from exc
+    float_value = normalize_float(
+        value,
+        field_name=field_name,
+        default=default,
+    )
 
     if float_value <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
@@ -545,26 +632,75 @@ def generate_world_id(prefix: str = "world") -> str:
     return f"{normalized_prefix}_{uuid4().hex}"
 
 
+def _payload_metadata_value(payload: Mapping[str, Any]) -> Any:
+    """Read metadata payload from several compatible keys."""
+    if "metadataJson" in payload:
+        return payload.get("metadataJson")
+    if "metadata_json" in payload:
+        return payload.get("metadata_json")
+    if "metadata" in payload:
+        return payload.get("metadata")
+    if "worldMetadata" in payload:
+        return payload.get("worldMetadata")
+    if "world_metadata" in payload:
+        return payload.get("world_metadata")
+    return None
+
+
+def _payload_get(payload: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read first available payload value."""
+    for key in keys:
+        if key in payload:
+            return payload.get(key)
+    return default
+
+
+def _resolve_project_universe_db_ids(
+    *,
+    project: Any = None,
+    universe: Any = None,
+    project_db_id: Any = None,
+    universe_db_id: Any = None,
+) -> tuple[int, int]:
+    """Resolve internal project/universe ids from either objects or explicit ids."""
+    resolved_project_db_id = project_db_id
+    resolved_universe_db_id = universe_db_id
+
+    if resolved_project_db_id is None and project is not None:
+        resolved_project_db_id = getattr(project, "id", None)
+
+    if resolved_universe_db_id is None and universe is not None:
+        resolved_universe_db_id = getattr(universe, "id", None)
+
+    if resolved_project_db_id is None and universe is not None:
+        resolved_project_db_id = getattr(universe, "project_db_id", None)
+
+    return (
+        normalize_db_id(resolved_project_db_id, field_name="project_db_id"),
+        normalize_db_id(resolved_universe_db_id, field_name="universe_db_id"),
+    )
+
+
 class WorldInstance(db.Model):
     """
-    Persistent concrete VECTOPLAN world instance.
+    Persistent concrete VECTOPLAN Chunk world instance.
 
-    The first development flow usually creates:
+    The default app-integrated flow creates:
 
-        Project(project_id="...")
-          -> Universe(universe_id="...")
+        Project(external_app_project_id="prj_...")
+          -> Universe(universe_id="chk_uni_...")
               -> WorldInstance(
-                     world_id="world_spawn",
+                     world_id="chk_wld_..." or "world_spawn",
                      template_id="flat",
                      provider_world_id="flat",
                      generator_type="flat-world"
                  )
 
     Important:
-    - This model stores world configuration and provider mapping.
-    - This model does not store generated chunks.
-    - Unchanged chunks are still generated from provider/template config.
-    - Changed chunks are stored as ChunkSnapshot.
+    - this model stores world configuration and provider mapping,
+    - this model does not store generated chunks,
+    - unchanged chunks are generated from provider/template config,
+    - changed chunks are stored as ChunkSnapshot.
     """
 
     __tablename__ = "world_instances"
@@ -775,6 +911,30 @@ class WorldInstance(db.Model):
         default=DEFAULT_SPAWN_Z,
     )
 
+    spawn_yaw = db.Column(
+        db.Float,
+        nullable=False,
+        default=DEFAULT_SPAWN_YAW,
+    )
+
+    spawn_pitch = db.Column(
+        db.Float,
+        nullable=False,
+        default=DEFAULT_SPAWN_PITCH,
+    )
+
+    source_service = db.Column(
+        db.String(WORLD_SOURCE_SERVICE_MAX_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
+    external_ref = db.Column(
+        db.String(WORLD_EXTERNAL_REF_MAX_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
     created_by_user_id = db.Column(
         db.String(WORLD_USER_ID_MAX_LENGTH),
         nullable=True,
@@ -932,6 +1092,11 @@ class WorldInstance(db.Model):
             "block_registry_id",
             "block_registry_version",
         ),
+        db.Index(
+            "ix_world_instances_source_external",
+            "source_service",
+            "external_ref",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -974,18 +1139,23 @@ class WorldInstance(db.Model):
         spawn_x: int = DEFAULT_SPAWN_X,
         spawn_y: int = DEFAULT_SPAWN_Y,
         spawn_z: int = DEFAULT_SPAWN_Z,
+        spawn_yaw: float = DEFAULT_SPAWN_YAW,
+        spawn_pitch: float = DEFAULT_SPAWN_PITCH,
+        source_service: Optional[str] = None,
+        external_ref: Optional[str] = None,
         created_by_user_id: Optional[str] = None,
         metadata_json: Optional[Mapping[str, Any]] = None,
+        allow_provider_like_world_id: bool = False,
     ) -> "WorldInstance":
         """
         Create a WorldInstance without adding it to a session.
 
         Repository/service code is responsible for:
-        - checking project/universe existence
-        - checking that universe belongs to project
-        - checking uniqueness inside the universe
-        - adding to db.session
-        - committing or rolling back
+        - checking project/universe existence,
+        - checking that universe belongs to project,
+        - checking uniqueness inside the universe,
+        - adding to db.session,
+        - committing or rolling back.
         """
         normalized_project_db_id = normalize_db_id(
             project_db_id,
@@ -996,7 +1166,10 @@ class WorldInstance(db.Model):
             field_name="universe_db_id",
         )
 
-        public_world_id = normalize_world_id(world_id or generate_world_id())
+        public_world_id = normalize_concrete_world_id(
+            world_id or generate_world_id(),
+            allow_provider_like=allow_provider_like_world_id,
+        )
 
         normalized_name = normalize_required_text(
             name or public_world_id,
@@ -1121,6 +1294,26 @@ class WorldInstance(db.Model):
                 field_name="spawn_z",
                 default=DEFAULT_SPAWN_Z,
             ),
+            spawn_yaw=normalize_float(
+                spawn_yaw,
+                field_name="spawn_yaw",
+                default=DEFAULT_SPAWN_YAW,
+            ),
+            spawn_pitch=normalize_float(
+                spawn_pitch,
+                field_name="spawn_pitch",
+                default=DEFAULT_SPAWN_PITCH,
+            ),
+            source_service=normalize_optional_text(
+                source_service,
+                field_name="source_service",
+                max_length=WORLD_SOURCE_SERVICE_MAX_LENGTH,
+            ),
+            external_ref=normalize_optional_text(
+                external_ref,
+                field_name="external_ref",
+                max_length=WORLD_EXTERNAL_REF_MAX_LENGTH,
+            ),
             created_by_user_id=normalize_optional_text(
                 created_by_user_id,
                 field_name="created_by_user_id",
@@ -1142,24 +1335,52 @@ class WorldInstance(db.Model):
     def create_flat_spawn(
         cls,
         *,
-        project_db_id: int,
-        universe_db_id: int,
+        project: Any = None,
+        universe: Any = None,
+        project_db_id: Optional[int] = None,
+        universe_db_id: Optional[int] = None,
         world_id: str = DEFAULT_WORLD_ID,
         slug: str = DEFAULT_WORLD_SLUG,
         name: str = DEFAULT_WORLD_NAME,
         created_by_user_id: Optional[str] = None,
         metadata_json: Optional[Mapping[str, Any]] = None,
+        source_service: Optional[str] = "vectoplan-chunk-bootstrap",
+        external_ref: Optional[str] = None,
     ) -> "WorldInstance":
         """
         Create the default project spawn world backed by the `flat` provider.
 
-        This is the intended initial world for new projects in the current
-        service slice.
+        This factory accepts either:
+        - explicit `project_db_id` and `universe_db_id`, or
+        - persisted `project` and `universe` model instances.
+
+        This flexibility is intentional because bootstrap paths and provisioning
+        paths do not always call factories with the same shape.
         """
-        return cls.create(
+        resolved_project_db_id, resolved_universe_db_id = _resolve_project_universe_db_ids(
+            project=project,
+            universe=universe,
             project_db_id=project_db_id,
             universe_db_id=universe_db_id,
-            world_id=world_id,
+        )
+
+        concrete_world_id = normalize_concrete_world_id(
+            world_id or DEFAULT_WORLD_ID,
+            default=DEFAULT_WORLD_ID,
+        )
+
+        merged_metadata = normalize_metadata(metadata_json)
+        merged_metadata.setdefault("schemaVersion", WORLD_INSTANCE_SCHEMA_VERSION)
+        merged_metadata.setdefault("seededBy", "WorldInstance.create_flat_spawn")
+        merged_metadata.setdefault("chunkWorldId", concrete_world_id)
+        merged_metadata.setdefault("templateId", DEFAULT_TEMPLATE_ID)
+        merged_metadata.setdefault("providerId", DEFAULT_PROVIDER_ID)
+        merged_metadata.setdefault("providerWorldId", DEFAULT_PROVIDER_WORLD_ID)
+
+        return cls.create(
+            project_db_id=resolved_project_db_id,
+            universe_db_id=resolved_universe_db_id,
+            world_id=concrete_world_id,
             slug=slug,
             name=name,
             status=WORLD_STATUS_ACTIVE,
@@ -1184,8 +1405,12 @@ class WorldInstance(db.Model):
             spawn_x=DEFAULT_SPAWN_X,
             spawn_y=DEFAULT_SPAWN_Y,
             spawn_z=DEFAULT_SPAWN_Z,
+            spawn_yaw=DEFAULT_SPAWN_YAW,
+            spawn_pitch=DEFAULT_SPAWN_PITCH,
+            source_service=source_service,
+            external_ref=external_ref or concrete_world_id,
             created_by_user_id=created_by_user_id,
-            metadata_json=metadata_json,
+            metadata_json=merged_metadata,
         )
 
     @classmethod
@@ -1252,8 +1477,8 @@ class WorldInstance(db.Model):
         Create a WorldInstance from an API-style payload.
 
         Supported keys:
-        - worldId / world_id
-        - name
+        - worldId / world_id / chunkWorldId / chunk_world_id
+        - name / worldName
         - slug
         - description
         - worldType / world_type
@@ -1274,28 +1499,28 @@ class WorldInstance(db.Model):
         - seed
         - blockRegistryId / block_registry_id
         - blockRegistryVersion / block_registry_version
-        - spawn / spawnX/spawnY/spawnZ
+        - spawn / spawnX/spawnY/spawnZ/spawnYaw/spawnPitch
         - metadata / metadataJson / metadata_json
         """
         if not isinstance(payload, Mapping):
             raise ValueError("World create payload must be a JSON object.")
 
-        metadata_value = (
-            payload.get("metadataJson")
-            if "metadataJson" in payload
-            else payload.get("metadata_json")
-            if "metadata_json" in payload
-            else payload.get("metadata")
-        )
-
+        metadata_value = _payload_metadata_value(payload)
         spawn = payload.get("spawn") if isinstance(payload.get("spawn"), Mapping) else {}
+
+        raw_world_id = (
+            payload.get("chunkWorldId")
+            or payload.get("chunk_world_id")
+            or payload.get("worldId")
+            or payload.get("world_id")
+        )
 
         return cls.create(
             project_db_id=project_db_id,
             universe_db_id=universe_db_id,
-            world_id=payload.get("worldId") or payload.get("world_id"),
-            slug=payload.get("slug"),
-            name=payload.get("name"),
+            world_id=raw_world_id,
+            slug=payload.get("slug") or payload.get("worldSlug") or payload.get("world_slug"),
+            name=payload.get("worldName") or payload.get("world_name") or payload.get("name"),
             description=payload.get("description"),
             world_type=payload.get("worldType") or payload.get("world_type") or WORLD_TYPE_RUNTIME,
             world_role=payload.get("worldRole") or payload.get("world_role") or WORLD_ROLE_DEFAULT_SPAWN,
@@ -1319,6 +1544,10 @@ class WorldInstance(db.Model):
             spawn_x=payload.get("spawnX") if "spawnX" in payload else payload.get("spawn_x", spawn.get("x", DEFAULT_SPAWN_X)),
             spawn_y=payload.get("spawnY") if "spawnY" in payload else payload.get("spawn_y", spawn.get("y", DEFAULT_SPAWN_Y)),
             spawn_z=payload.get("spawnZ") if "spawnZ" in payload else payload.get("spawn_z", spawn.get("z", DEFAULT_SPAWN_Z)),
+            spawn_yaw=payload.get("spawnYaw") if "spawnYaw" in payload else payload.get("spawn_yaw", spawn.get("yaw", DEFAULT_SPAWN_YAW)),
+            spawn_pitch=payload.get("spawnPitch") if "spawnPitch" in payload else payload.get("spawn_pitch", spawn.get("pitch", DEFAULT_SPAWN_PITCH)),
+            source_service=payload.get("sourceService") or payload.get("source_service"),
+            external_ref=payload.get("externalRef") or payload.get("external_ref"),
             created_by_user_id=created_by_user_id,
             metadata_json=metadata_value,
         )
@@ -1352,6 +1581,21 @@ class WorldInstance(db.Model):
             return getattr(universe, "universe_id", None)
         except Exception:
             return None
+
+    @property
+    def chunk_project_id(self) -> Optional[str]:
+        """Compatibility alias for parent Project.project_id."""
+        return self.project_public_id
+
+    @property
+    def chunk_universe_id(self) -> Optional[str]:
+        """Compatibility alias for parent Universe.universe_id."""
+        return self.universe_public_id
+
+    @property
+    def chunk_world_id(self) -> str:
+        """Compatibility alias for world_id."""
+        return self.world_id
 
     @property
     def chunk_config(self) -> Dict[str, Any]:
@@ -1395,9 +1639,43 @@ class WorldInstance(db.Model):
             "z": int(self.spawn_z),
         }
 
+    @property
+    def spawn_rotation(self) -> Dict[str, float]:
+        """Return spawn camera/player rotation."""
+        return {
+            "yaw": float(self.spawn_yaw),
+            "pitch": float(self.spawn_pitch),
+        }
+
+    @property
+    def spawn_context(self) -> Dict[str, Any]:
+        """Return combined spawn context."""
+        return {
+            "position": self.spawn_position,
+            "rotation": self.spawn_rotation,
+        }
+
     def build_world_context_key(self) -> str:
         """Build a stable debug/context key for logs and traces."""
         return f"{self.project_db_id}:{self.universe_db_id}:{self.world_id}"
+
+    def build_route_hints(self, *, api_prefix: str = "") -> Dict[str, str]:
+        """Build project-scoped route hints for this world."""
+        prefix = str(api_prefix or "").rstrip("/")
+        project_id = self.project_public_id or str(self.project_db_id)
+        world_id = self.world_id
+
+        return {
+            "projectBootstrap": f"{prefix}/projects/{project_id}/bootstrap",
+            "project": f"{prefix}/projects/{project_id}",
+            "worlds": f"{prefix}/projects/{project_id}/worlds",
+            "world": f"{prefix}/projects/{project_id}/worlds/{world_id}",
+            "blocks": f"{prefix}/projects/{project_id}/worlds/{world_id}/blocks",
+            "chunk": f"{prefix}/projects/{project_id}/worlds/{world_id}/chunks",
+            "chunks": f"{prefix}/projects/{project_id}/worlds/{world_id}/chunks",
+            "chunksBatch": f"{prefix}/projects/{project_id}/worlds/{world_id}/chunks/batch",
+            "commands": f"{prefix}/projects/{project_id}/worlds/{world_id}/commands",
+        }
 
     def touch(self, *, updated_by_user_id: Optional[str] = None) -> None:
         """Mark the world as updated and increment its optimistic revision."""
@@ -1706,13 +1984,94 @@ class WorldInstance(db.Model):
         x: int,
         y: int,
         z: int,
+        yaw: Optional[float] = None,
+        pitch: Optional[float] = None,
         updated_by_user_id: Optional[str] = None,
     ) -> None:
-        """Set world spawn position."""
+        """Set world spawn position and optional rotation."""
         self.ensure_not_deleted()
         self.spawn_x = normalize_int(x, field_name="spawn_x", default=DEFAULT_SPAWN_X)
         self.spawn_y = normalize_int(y, field_name="spawn_y", default=DEFAULT_SPAWN_Y)
         self.spawn_z = normalize_int(z, field_name="spawn_z", default=DEFAULT_SPAWN_Z)
+
+        if yaw is not None:
+            self.spawn_yaw = normalize_float(
+                yaw,
+                field_name="spawn_yaw",
+                default=DEFAULT_SPAWN_YAW,
+            )
+
+        if pitch is not None:
+            self.spawn_pitch = normalize_float(
+                pitch,
+                field_name="spawn_pitch",
+                default=DEFAULT_SPAWN_PITCH,
+            )
+
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_source_context(
+        self,
+        *,
+        source_service: Optional[str],
+        external_ref: Optional[str],
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Set source service/external reference metadata."""
+        self.ensure_not_deleted()
+        self.source_service = normalize_optional_text(
+            source_service,
+            field_name="source_service",
+            max_length=WORLD_SOURCE_SERVICE_MAX_LENGTH,
+        )
+        self.external_ref = normalize_optional_text(
+            external_ref,
+            field_name="external_ref",
+            max_length=WORLD_EXTERNAL_REF_MAX_LENGTH,
+        )
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def ensure_bootstrap_defaults(
+        self,
+        *,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Ensure required bootstrap/default-world fields are populated.
+
+        This is intentionally light-touch and does not change world_id.
+        """
+        if not self.template_id:
+            self.template_id = DEFAULT_TEMPLATE_ID
+        if not self.provider_id:
+            self.provider_id = DEFAULT_PROVIDER_ID
+        if not self.provider_world_id:
+            self.provider_world_id = DEFAULT_PROVIDER_WORLD_ID
+        if not self.generator_type:
+            self.generator_type = DEFAULT_GENERATOR_TYPE
+        if not self.generator_version:
+            self.generator_version = DEFAULT_GENERATOR_VERSION
+        if not self.projection_type:
+            self.projection_type = DEFAULT_PROJECTION_TYPE
+        if not self.topology_type:
+            self.topology_type = DEFAULT_TOPOLOGY_TYPE
+        if not self.coordinate_system:
+            self.coordinate_system = DEFAULT_COORDINATE_SYSTEM
+        if not self.block_registry_id:
+            self.block_registry_id = DEFAULT_BLOCK_REGISTRY_ID
+        if not self.block_registry_version:
+            self.block_registry_version = DEFAULT_BLOCK_REGISTRY_VERSION
+        if self.chunk_size is None or int(self.chunk_size) <= 0:
+            self.chunk_size = DEFAULT_CHUNK_SIZE
+        if self.cell_size is None or float(self.cell_size) <= 0:
+            self.cell_size = DEFAULT_CELL_SIZE
+        if self.spawn_y is None:
+            self.spawn_y = DEFAULT_SPAWN_Y
+        if self.spawn_yaw is None:
+            self.spawn_yaw = DEFAULT_SPAWN_YAW
+        if self.spawn_pitch is None:
+            self.spawn_pitch = DEFAULT_SPAWN_PITCH
+
         self.touch(updated_by_user_id=updated_by_user_id)
 
     def replace_metadata(
@@ -1757,6 +2116,32 @@ class WorldInstance(db.Model):
         self.metadata_json = current
         self.touch(updated_by_user_id=updated_by_user_id)
 
+    def merge_provisioning_metadata(
+        self,
+        *,
+        chunk_project_id: Optional[str] = None,
+        chunk_universe_id: Optional[str] = None,
+        external_app_project_id: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Merge standard provisioning metadata."""
+        self.update_metadata(
+            {
+                "schemaVersion": WORLD_INSTANCE_SCHEMA_VERSION,
+                "chunkProjectId": chunk_project_id or self.project_public_id,
+                "chunkUniverseId": chunk_universe_id or self.universe_public_id,
+                "chunkWorldId": self.world_id,
+                "externalAppProjectId": external_app_project_id,
+                "templateId": self.template_id,
+                "providerWorldId": self.provider_world_id,
+                "blockRegistryId": self.block_registry_id,
+                "blockRegistryVersion": self.block_registry_version,
+                "spawn": self.spawn_context,
+                "provisionedAt": datetime_to_iso(utc_now()),
+            },
+            updated_by_user_id=updated_by_user_id,
+        )
+
     def get_metadata_value(self, key: str, default: Any = None) -> Any:
         """Read one metadata value safely."""
         try:
@@ -1795,7 +2180,9 @@ class WorldInstance(db.Model):
         - seed
         - blockRegistryId / block_registry_id
         - blockRegistryVersion / block_registry_version
-        - spawn / spawnX/spawnY/spawnZ
+        - sourceService / source_service
+        - externalRef / external_ref
+        - spawn / spawnX/spawnY/spawnZ/spawnYaw/spawnPitch
         - metadata / metadataJson / metadata_json
         - metadataMerge
         - metadataRemoveKeys
@@ -2006,6 +2393,26 @@ class WorldInstance(db.Model):
             )
             changed = True
 
+        if "sourceService" in payload or "source_service" in payload:
+            self.source_service = normalize_optional_text(
+                payload.get("sourceService")
+                if "sourceService" in payload
+                else payload.get("source_service"),
+                field_name="source_service",
+                max_length=WORLD_SOURCE_SERVICE_MAX_LENGTH,
+            )
+            changed = True
+
+        if "externalRef" in payload or "external_ref" in payload:
+            self.external_ref = normalize_optional_text(
+                payload.get("externalRef")
+                if "externalRef" in payload
+                else payload.get("external_ref"),
+                field_name="external_ref",
+                max_length=WORLD_EXTERNAL_REF_MAX_LENGTH,
+            )
+            changed = True
+
         spawn = payload.get("spawn") if isinstance(payload.get("spawn"), Mapping) else None
         spawn_changed = spawn is not None
 
@@ -2036,6 +2443,26 @@ class WorldInstance(db.Model):
                 else payload.get("spawn_z", spawn.get("z", self.spawn_z) if spawn else self.spawn_z),
                 field_name="spawn_z",
                 default=DEFAULT_SPAWN_Z,
+            )
+            changed = True
+
+        if spawn_changed or "spawnYaw" in payload or "spawn_yaw" in payload:
+            self.spawn_yaw = normalize_float(
+                payload.get("spawnYaw")
+                if "spawnYaw" in payload
+                else payload.get("spawn_yaw", spawn.get("yaw", self.spawn_yaw) if spawn else self.spawn_yaw),
+                field_name="spawn_yaw",
+                default=DEFAULT_SPAWN_YAW,
+            )
+            changed = True
+
+        if spawn_changed or "spawnPitch" in payload or "spawn_pitch" in payload:
+            self.spawn_pitch = normalize_float(
+                payload.get("spawnPitch")
+                if "spawnPitch" in payload
+                else payload.get("spawn_pitch", spawn.get("pitch", self.spawn_pitch) if spawn else self.spawn_pitch),
+                field_name="spawn_pitch",
+                default=DEFAULT_SPAWN_PITCH,
             )
             changed = True
 
@@ -2101,6 +2528,12 @@ class WorldInstance(db.Model):
             normalize_world_id(self.world_id)
         except Exception as exc:
             errors["worldId"] = str(exc)
+
+        if is_provider_like_world_id(self.world_id):
+            errors["worldId"] = (
+                "world_id must be a concrete editable world id. "
+                "`flat` belongs in template_id/provider_world_id."
+            )
 
         try:
             normalize_required_text(
@@ -2174,6 +2607,24 @@ class WorldInstance(db.Model):
             errors["verticalBounds"] = str(exc)
 
         try:
+            normalize_float(
+                self.spawn_yaw,
+                field_name="spawn_yaw",
+                default=DEFAULT_SPAWN_YAW,
+            )
+        except Exception as exc:
+            errors["spawnYaw"] = str(exc)
+
+        try:
+            normalize_float(
+                self.spawn_pitch,
+                field_name="spawn_pitch",
+                default=DEFAULT_SPAWN_PITCH,
+            )
+        except Exception as exc:
+            errors["spawnPitch"] = str(exc)
+
+        try:
             normalize_metadata(self.metadata_json)
         except Exception as exc:
             errors["metadataJson"] = str(exc)
@@ -2183,6 +2634,26 @@ class WorldInstance(db.Model):
                 normalize_slug(self.slug)
             except Exception as exc:
                 errors["slug"] = str(exc)
+
+        if self.source_service is not None:
+            try:
+                normalize_optional_text(
+                    self.source_service,
+                    field_name="source_service",
+                    max_length=WORLD_SOURCE_SERVICE_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["sourceService"] = str(exc)
+
+        if self.external_ref is not None:
+            try:
+                normalize_optional_text(
+                    self.external_ref,
+                    field_name="external_ref",
+                    max_length=WORLD_EXTERNAL_REF_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["externalRef"] = str(exc)
 
         if self.revision is None or int(self.revision) < 1:
             errors["revision"] = "revision must be greater than or equal to 1."
@@ -2207,8 +2678,11 @@ class WorldInstance(db.Model):
 
         result: Dict[str, Any] = {
             "projectId": resolved_project_id,
+            "chunkProjectId": resolved_project_id,
             "universeId": resolved_universe_id,
+            "chunkUniverseId": resolved_universe_id,
             "worldId": self.world_id,
+            "chunkWorldId": self.world_id,
             "slug": self.slug,
             "name": self.name,
             "description": self.description,
@@ -2234,17 +2708,26 @@ class WorldInstance(db.Model):
             "seed": self.seed,
             "blockRegistryId": self.block_registry_id,
             "blockRegistryVersion": self.block_registry_version,
-            "spawn": self.spawn_position,
+            "spawn": self.spawn_context,
+            "sourceService": self.source_service,
+            "externalRef": self.external_ref,
             "createdByUserId": self.created_by_user_id,
             "updatedByUserId": self.updated_by_user_id,
             "createdAt": datetime_to_iso(self.created_at),
             "updatedAt": datetime_to_iso(self.updated_at),
             "archivedAt": datetime_to_iso(self.archived_at),
             "deletedAt": datetime_to_iso(self.deleted_at),
+            "chunkConfig": self.chunk_config,
+            "providerMapping": self.provider_mapping,
+            "registryContext": self.registry_context,
+            "routeHints": self.build_route_hints(),
             "flags": {
                 "active": self.is_active,
                 "archived": self.is_archived,
                 "deleted": self.is_deleted,
+                "runtimeWorld": self.world_type == WORLD_TYPE_RUNTIME,
+                "defaultSpawn": self.world_role == WORLD_ROLE_DEFAULT_SPAWN,
+                "providerLikeWorldId": is_provider_like_world_id(self.world_id),
             },
         }
 
@@ -2255,6 +2738,7 @@ class WorldInstance(db.Model):
             result["id"] = self.id
             result["projectDbId"] = self.project_db_id
             result["universeDbId"] = self.universe_db_id
+            result["worldContextKey"] = self.build_world_context_key()
 
         return result
 
@@ -2271,3 +2755,50 @@ class WorldInstance(db.Model):
             project_id=project_id,
             universe_id=universe_id,
         )
+
+
+__all__ = [
+    "DEFAULT_BLOCK_REGISTRY_ID",
+    "DEFAULT_BLOCK_REGISTRY_VERSION",
+    "DEFAULT_CELL_SIZE",
+    "DEFAULT_CHUNK_SIZE",
+    "DEFAULT_COORDINATE_SYSTEM",
+    "DEFAULT_GENERATOR_TYPE",
+    "DEFAULT_GENERATOR_VERSION",
+    "DEFAULT_MAX_Y",
+    "DEFAULT_MIN_Y",
+    "DEFAULT_PROJECTION_TYPE",
+    "DEFAULT_PROVIDER_ID",
+    "DEFAULT_PROVIDER_WORLD_ID",
+    "DEFAULT_SPAWN_PITCH",
+    "DEFAULT_SPAWN_X",
+    "DEFAULT_SPAWN_Y",
+    "DEFAULT_SPAWN_YAW",
+    "DEFAULT_SPAWN_Z",
+    "DEFAULT_SURFACE_Y",
+    "DEFAULT_TEMPLATE_ID",
+    "DEFAULT_TOPOLOGY_TYPE",
+    "DEFAULT_WORLD_ID",
+    "DEFAULT_WORLD_NAME",
+    "DEFAULT_WORLD_SLUG",
+    "JSON_COLUMN_TYPE",
+    "VALID_WORLD_ROLES",
+    "VALID_WORLD_SCOPES",
+    "VALID_WORLD_STATUSES",
+    "VALID_WORLD_TYPES",
+    "WORLD_INSTANCE_SCHEMA_VERSION",
+    "WORLD_ROLE_DEFAULT_SPAWN",
+    "WORLD_SCOPE_PROJECT",
+    "WORLD_STATUS_ACTIVE",
+    "WORLD_STATUS_ARCHIVED",
+    "WORLD_STATUS_DELETED",
+    "WORLD_TYPE_RUNTIME",
+    "WorldInstance",
+    "datetime_to_iso",
+    "generate_world_id",
+    "is_provider_like_world_id",
+    "make_json_safe",
+    "normalize_concrete_world_id",
+    "normalize_world_id",
+    "utc_now",
+]

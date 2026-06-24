@@ -5,20 +5,29 @@ Explicit database bootstrap command for the `vectoplan-chunk` service.
 This script is the controlled entrypoint for local/dev DB initialization.
 
 Responsibilities:
-- create a Flask app safely
-- explicitly disable normal runtime startup hooks while the app is being created
-- run schema bootstrap when requested
-- run default seed bootstrap when requested
-- print a JSON or human-readable result
-- return a useful process exit code
+- create a Flask app safely,
+- explicitly disable normal runtime startup hooks while the app is being created,
+- run schema bootstrap when requested,
+- optionally repair missing columns for local/dev schema drift,
+- run default seed bootstrap when requested,
+- repair missing default seed invariants when requested,
+- ensure the concrete editable default world `world_spawn` exists in init mode,
+- run read-only check-only diagnostics,
+- print a JSON or human-readable result,
+- return a useful process exit code.
 
 Important boundaries:
-- this script is not the normal Gunicorn runtime
-- this script should not serve HTTP requests
-- this script should not generate chunks
-- this script should not execute chunk commands
-- this script should not load snapshots/events/object refs
-- this script should not replace Alembic in production
+- this script is not the normal Gunicorn runtime,
+- this script should not serve HTTP requests,
+- this script should not generate chunks,
+- this script should not execute chunk commands,
+- this script should not load ChunkSnapshots/ChunkEvents/ObjectRefs,
+- this script does not replace Alembic for production-grade migrations.
+
+World-id rule:
+- world_spawn = concrete editable WorldInstance.
+- flat        = template/provider id.
+- A concrete default world must not silently become "flat".
 
 Typical local usage from service root:
 
@@ -28,9 +37,13 @@ Typical container usage:
 
     python /opt/vectoplan/services/vectoplan-chunk/scripts/bootstrap_db.py --create-all --seed --json
 
+Typical runtime readiness check:
+
+    python scripts/bootstrap_db.py --check-only --json
+
 Exit codes:
-    0 = bootstrap succeeded or was intentionally skipped
-    1 = bootstrap failed
+    0 = bootstrap/check succeeded or was intentionally skipped
+    1 = bootstrap/check failed
     2 = app creation/import failed
     3 = invalid arguments
 """
@@ -53,7 +66,7 @@ from typing import Any, Mapping, Sequence
 # Constants
 # -----------------------------------------------------------------------------
 
-SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v1"
+SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v4"
 
 EXIT_OK = 0
 EXIT_BOOTSTRAP_FAILED = 1
@@ -63,6 +76,18 @@ EXIT_INVALID_ARGS = 3
 DEFAULT_CREATE_ALL = True
 DEFAULT_SEED = True
 DEFAULT_JSON = False
+
+TRUE_VALUES = {"1", "true", "t", "yes", "y", "on", "enabled", "enable"}
+FALSE_VALUES = {"0", "false", "f", "no", "n", "off", "disabled", "disable"}
+
+DEFAULT_PROJECT_ID = "dev-project"
+DEFAULT_UNIVERSE_ID = "dev-universe"
+DEFAULT_WORLD_ID = "world_spawn"
+DEFAULT_TEMPLATE_ID = "flat"
+DEFAULT_PROVIDER_ID = "flat"
+DEFAULT_PROVIDER_WORLD_ID = "flat"
+DEFAULT_BLOCK_REGISTRY_ID = "debug-blocks"
+DEFAULT_BLOCK_REGISTRY_VERSION = "1"
 
 
 # -----------------------------------------------------------------------------
@@ -121,11 +146,56 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
 
     text = _safe_str(value, "").lower()
 
-    if text in {"1", "true", "t", "yes", "y", "on", "enabled"}:
+    if text in TRUE_VALUES:
         return True
 
-    if text in {"0", "false", "f", "no", "n", "off", "disabled"}:
+    if text in FALSE_VALUES:
         return False
+
+    return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Convert value to int robustly."""
+    if isinstance(value, bool):
+        return int(value)
+
+    if isinstance(value, int):
+        return value
+
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert value to float robustly."""
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read boolean environment variable."""
+    return _safe_bool(os.environ.get(name), default)
+
+
+def _env_str(name: str, default: str = "") -> str:
+    """Read string environment variable."""
+    return _safe_str(os.environ.get(name), default)
+
+
+def _env_str_any(names: Sequence[str], default: str = "") -> str:
+    """Read first non-empty env var from a list."""
+    for name in names:
+        value = _env_str(name, "")
+        if value:
+            return value
 
     return default
 
@@ -202,25 +272,39 @@ def _print_human_result(result: dict[str, Any]) -> None:
     print("")
     print("VECTOPLAN Chunk DB Bootstrap")
     print("=" * 32)
-    print(f"ok:                 {result.get('ok')}")
-    print(f"status:             {result.get('status')}")
-    print(f"durationMs:         {result.get('durationMs')}")
-    print(f"schema requested:   {result.get('schemaBootstrapRequested')}")
-    print(f"schema executed:    {result.get('schemaBootstrapExecuted')}")
-    print(f"schema ok:          {result.get('schemaBootstrapOk')}")
-    print(f"seed requested:     {result.get('seedBootstrapRequested')}")
-    print(f"seed executed:      {result.get('seedBootstrapExecuted')}")
-    print(f"seed ok:            {result.get('seedBootstrapOk')}")
-    print(f"warnings:           {result.get('warningCount')}")
-    print(f"errors:             {result.get('errorCount')}")
+    print(f"ok:                    {result.get('ok')}")
+    print(f"status:                {result.get('status')}")
+    print(f"durationMs:            {result.get('durationMs')}")
+    print(f"schema ready:          {result.get('schemaReady')}")
+    print(f"seed ready:            {result.get('seedReady')}")
+    print(f"default project ready: {result.get('defaultProjectReady')}")
+    print(f"default universe ready:{result.get('defaultUniverseReady')}")
+    print(f"default world ready:   {result.get('defaultWorldReady')}")
+    print(f"schema requested:      {result.get('schemaBootstrapRequested')}")
+    print(f"schema executed:       {result.get('schemaBootstrapExecuted')}")
+    print(f"schema ok:             {result.get('schemaBootstrapOk')}")
+    print(f"repair requested:      {result.get('schemaRepairRequested')}")
+    print(f"repair executed:       {result.get('schemaRepairExecuted')}")
+    print(f"repair ok:             {result.get('schemaRepairOk')}")
+    print(f"seed requested:        {result.get('seedBootstrapRequested')}")
+    print(f"seed executed:         {result.get('seedBootstrapExecuted')}")
+    print(f"seed ok:               {result.get('seedBootstrapOk')}")
+    print(f"seed repair executed:  {result.get('seedInvariantRepairExecuted')}")
+    print(f"seed repair ok:        {result.get('seedInvariantRepairOk')}")
+    print(f"warnings:              {result.get('warningCount')}")
+    print(f"errors:                {result.get('errorCount')}")
     print("")
 
     errors = result.get("errors") or []
     if errors:
         print("Errors:")
         for item in errors:
-            message = _safe_str(item.get("message") if isinstance(item, dict) else item, "")
-            code = _safe_str(item.get("code") if isinstance(item, dict) else "", "")
+            if isinstance(item, Mapping):
+                message = _safe_str(item.get("message"), "")
+                code = _safe_str(item.get("code"), "")
+            else:
+                message = _safe_str(item, "")
+                code = ""
             print(f"  - {code}: {message}")
         print("")
 
@@ -228,8 +312,12 @@ def _print_human_result(result: dict[str, Any]) -> None:
     if warnings:
         print("Warnings:")
         for item in warnings:
-            message = _safe_str(item.get("message") if isinstance(item, dict) else item, "")
-            code = _safe_str(item.get("code") if isinstance(item, dict) else "", "")
+            if isinstance(item, Mapping):
+                message = _safe_str(item.get("message"), "")
+                code = _safe_str(item.get("code"), "")
+            else:
+                message = _safe_str(item, "")
+                code = ""
             print(f"  - {code}: {message}")
         print("")
 
@@ -265,45 +353,141 @@ def configure_python_path(service_root: Path) -> None:
         sys.path.insert(0, root_text)
 
 
+def set_env_value(name: str, value: str, *, override: bool = False) -> None:
+    """Set environment value with optional override."""
+    if override or name not in os.environ:
+        os.environ[name] = value
+
+
+def _looks_like_provider_or_template_world_id(value: str) -> bool:
+    """Return whether a world id looks like provider/template id rather than concrete world id."""
+    text = _safe_str(value, "").lower()
+    if not text:
+        return False
+
+    template_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", DEFAULT_TEMPLATE_ID).lower()
+    provider_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", DEFAULT_PROVIDER_ID).lower()
+    provider_world_id = _env_str(
+        "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
+        DEFAULT_PROVIDER_WORLD_ID,
+    ).lower()
+
+    return text in {
+        DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+        template_id,
+        provider_id,
+        provider_world_id,
+    }
+
+
+def _resolve_concrete_default_world_id() -> str:
+    """
+    Resolve concrete editable default world id.
+
+    Defensive rule:
+    If VECTOPLAN_CHUNK_DEFAULT_WORLD_ID is accidentally "flat", ignore it and
+    use VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID or world_spawn.
+    """
+    explicit_instance = _env_str_any(
+        (
+            "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_INSTANCE_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_SPAWN_WORLD_ID",
+        ),
+        "",
+    )
+    if explicit_instance:
+        return explicit_instance
+
+    default_world = _env_str("VECTOPLAN_CHUNK_DEFAULT_WORLD_ID", "")
+    if default_world and not _looks_like_provider_or_template_world_id(default_world):
+        return default_world
+
+    return DEFAULT_WORLD_ID
+
+
+def _ensure_world_id_env_defaults() -> None:
+    """Ensure concrete-world/template/provider env values are internally consistent."""
+    concrete_world_id = _resolve_concrete_default_world_id()
+
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID", concrete_world_id, override=True)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_WORLD_ID", concrete_world_id, override=True)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", DEFAULT_TEMPLATE_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", DEFAULT_PROVIDER_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", DEFAULT_PROVIDER_WORLD_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID", DEFAULT_UNIVERSE_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", DEFAULT_BLOCK_REGISTRY_ID), override=False)
+    set_env_value("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", DEFAULT_BLOCK_REGISTRY_VERSION), override=False)
+
+
 def set_default_env(
     *,
     create_all: bool,
     seed: bool,
+    check_only: bool,
     mode: str,
     force_runtime_hooks_off: bool,
+    repair_missing_columns: bool,
+    repair_seed_invariants: bool,
 ) -> None:
     """
     Set safe default env values before app import.
 
-    Existing environment values are respected unless explicitly safety-critical.
+    Existing environment values are respected unless safety-critical.
 
-    The key safety rule is:
+    Safety rule:
         normal runtime startup hooks must not perform DB mutation while this
-        script creates the Flask app. The DB bootstrap happens explicitly after
-        app creation.
+        script creates the Flask app. Bootstrap happens explicitly after app
+        creation.
     """
-    os.environ.setdefault("VECTOPLAN_CHUNK_MODE", mode)
-    os.environ.setdefault("VECTOPLAN_CHUNK_RUN_MODE", mode)
+    effective_mode = "check-only" if check_only else mode or "db-bootstrap"
 
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED", "true")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL", "true" if create_all else "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS", "true" if seed else "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS", "true" if seed else "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT", "true" if seed else "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY", "true")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS", "true")
-    os.environ.setdefault("VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR", "true")
+    _ensure_world_id_env_defaults()
 
-    os.environ.setdefault("VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS", "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_AUTO_CREATE_ALL", "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "false")
-    os.environ.setdefault("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "false")
+    set_env_value("VECTOPLAN_CHUNK_MODE", effective_mode, override=True)
+    set_env_value("VECTOPLAN_CHUNK_STARTUP_MODE", effective_mode, override=True)
+    set_env_value("VECTOPLAN_CHUNK_RUNTIME_MODE", effective_mode, override=True)
+    set_env_value("VECTOPLAN_CHUNK_RUN_MODE", effective_mode, override=True)
+    set_env_value("SERVICE_STARTUP_MODE", effective_mode, override=False)
+    set_env_value("APP_STARTUP_MODE", effective_mode, override=False)
+    set_env_value("STARTUP_MODE", effective_mode, override=False)
+
+    if check_only:
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY", "true", override=True)
+        set_env_value("VECTOPLAN_CHUNK_AUTO_CREATE_ALL", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "false", override=True)
+    else:
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED", "true", override=True)
+        set_env_value("VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS", "true", override=True)
+        set_env_value("VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_AUTO_CREATE_ALL", "true" if create_all else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "true" if repair_seed_invariants else "false", override=True)
+
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL", "true" if create_all else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS", "true" if seed else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS", "true" if repair_missing_columns else "false", override=False)
+
+    set_env_value("VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY", "true", override=False)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS", "true", override=False)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR", "true", override=False)
 
     if force_runtime_hooks_off:
         os.environ["VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS"] = "false"
     else:
-        os.environ.setdefault("VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS", "false")
+        set_env_value("VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS", "false", override=False)
 
 
 def create_flask_app(
@@ -347,9 +531,1173 @@ def create_flask_app(
     return target
 
 
+def _has_app_context() -> bool:
+    """Return whether a Flask app context is currently active."""
+    try:
+        from flask import has_app_context
+
+        return bool(has_app_context())
+    except Exception:
+        return False
+
+
+# -----------------------------------------------------------------------------
+# SQLAlchemy schema helpers
+# -----------------------------------------------------------------------------
+
+def _get_db() -> Any:
+    """Import and return Flask-SQLAlchemy db."""
+    from extensions import db
+
+    return db
+
+
+def _get_model_classes() -> dict[str, Any]:
+    """Return model classes from models registry."""
+    try:
+        from models import get_model_class_map
+
+        result = get_model_class_map()
+        if isinstance(result, Mapping):
+            return dict(result)
+    except Exception:
+        pass
+
+    from models import (
+        BlockRegistry,
+        BlockType,
+        ChunkEvent,
+        ChunkSnapshot,
+        Project,
+        Universe,
+        WorldCommandLog,
+        WorldInstance,
+        WorldObjectChunkRef,
+        WorldObjectInstance,
+    )
+
+    return {
+        "Project": Project,
+        "Universe": Universe,
+        "WorldInstance": WorldInstance,
+        "BlockRegistry": BlockRegistry,
+        "BlockType": BlockType,
+        "ChunkSnapshot": ChunkSnapshot,
+        "WorldCommandLog": WorldCommandLog,
+        "ChunkEvent": ChunkEvent,
+        "WorldObjectInstance": WorldObjectInstance,
+        "WorldObjectChunkRef": WorldObjectChunkRef,
+    }
+
+
+def _model_table(model_class: Any) -> Any | None:
+    """Return SQLAlchemy table from model class."""
+    try:
+        return getattr(model_class, "__table__", None)
+    except Exception:
+        return None
+
+
+def _model_table_name(model_class: Any) -> str | None:
+    """Return table name from model class."""
+    try:
+        table = _model_table(model_class)
+        if table is not None:
+            return str(table.name)
+    except Exception:
+        pass
+
+    try:
+        return str(getattr(model_class, "__tablename__"))
+    except Exception:
+        return None
+
+
+def _model_columns(model_class: Any) -> set[str]:
+    """Return model column names."""
+    table = _model_table(model_class)
+    if table is None:
+        return set()
+
+    try:
+        return {str(column.name) for column in table.columns}
+    except Exception:
+        return set()
+
+
+def _model_has_column(model_class: Any, column_name: str) -> bool:
+    """Return whether model has a mapped column."""
+    return column_name in _model_columns(model_class)
+
+
+def _set_attr_if_supported(instance: Any, name: str, value: Any) -> bool:
+    """Set attribute if supported by model."""
+    if instance is None:
+        return False
+
+    if not hasattr(instance, name) and not _model_has_column(instance.__class__, name):
+        return False
+
+    try:
+        setattr(instance, name, value)
+        return True
+    except Exception:
+        return False
+
+
+def _set_attr_if_empty(instance: Any, name: str, value: Any) -> bool:
+    """Set attribute if currently empty."""
+    try:
+        current = getattr(instance, name, None)
+    except Exception:
+        current = None
+
+    if current not in (None, "", {}, []):
+        return False
+
+    return _set_attr_if_supported(instance, name, value)
+
+
+def _merge_metadata_json(instance: Any, payload: Mapping[str, Any]) -> None:
+    """Merge metadata_json if supported."""
+    if instance is None:
+        return
+
+    if not hasattr(instance, "metadata_json") and not _model_has_column(instance.__class__, "metadata_json"):
+        return
+
+    try:
+        existing = getattr(instance, "metadata_json", None)
+    except Exception:
+        existing = None
+
+    if isinstance(existing, Mapping):
+        merged = dict(existing)
+    else:
+        merged = {}
+
+    merged.update(dict(payload))
+
+    try:
+        setattr(instance, "metadata_json", merged)
+    except Exception:
+        pass
+
+
+def _inspect_database_schema_inner() -> dict[str, Any]:
+    """Inspect database schema. Requires an active app context."""
+    db = _get_db()
+    model_classes = _get_model_classes()
+
+    try:
+        from sqlalchemy import inspect
+
+        inspector = inspect(db.engine)
+        db_table_names = set(inspector.get_table_names())
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "inspection_failed",
+            "error": _safe_exception_message(exc),
+            "tables": {},
+            "missingTables": [],
+            "missingColumns": {},
+        }
+
+    tables: dict[str, Any] = {}
+    missing_tables: list[str] = []
+    missing_columns: dict[str, list[str]] = {}
+
+    for class_name, model_class in model_classes.items():
+        if model_class is None:
+            continue
+
+        table = _model_table(model_class)
+        table_name = _model_table_name(model_class)
+
+        if table is None or table_name is None:
+            continue
+
+        model_columns = [str(column.name) for column in table.columns]
+
+        if table_name not in db_table_names:
+            missing_tables.append(table_name)
+            tables[table_name] = {
+                "modelClass": class_name,
+                "exists": False,
+                "modelColumns": model_columns,
+                "databaseColumns": [],
+                "missingColumns": model_columns,
+            }
+            continue
+
+        try:
+            database_columns = [
+                str(column["name"])
+                for column in inspector.get_columns(table_name)
+            ]
+        except Exception:
+            database_columns = []
+
+        database_column_set = set(database_columns)
+        missing = [
+            column_name
+            for column_name in model_columns
+            if column_name not in database_column_set
+        ]
+
+        if missing:
+            missing_columns[table_name] = missing
+
+        tables[table_name] = {
+            "modelClass": class_name,
+            "exists": True,
+            "modelColumns": model_columns,
+            "databaseColumns": database_columns,
+            "missingColumns": missing,
+        }
+
+    ok = not missing_tables and not missing_columns
+
+    return {
+        "ok": ok,
+        "status": "ready" if ok else "schema_drift",
+        "tables": tables,
+        "missingTables": sorted(set(missing_tables)),
+        "missingColumns": missing_columns,
+    }
+
+
+def _inspect_database_schema(app: Any) -> dict[str, Any]:
+    """Inspect database tables/columns against SQLAlchemy model metadata."""
+    if _has_app_context():
+        return _inspect_database_schema_inner()
+
+    with app.app_context():
+        return _inspect_database_schema_inner()
+
+
+def _compile_column_type(column: Any, dialect: Any) -> str:
+    """Compile SQLAlchemy column type for DDL."""
+    try:
+        return column.type.compile(dialect=dialect)
+    except Exception:
+        return str(column.type)
+
+
+def _quote_identifier(dialect: Any, name: str) -> str:
+    """Quote SQL identifier for current dialect."""
+    try:
+        return dialect.identifier_preparer.quote(name)
+    except Exception:
+        return f'"{name}"'
+
+
+def _scalar_default_value(column: Any) -> Any:
+    """Return scalar Python default value for a column when safe."""
+    try:
+        default = getattr(column, "default", None)
+        if default is None:
+            return None
+
+        if getattr(default, "is_scalar", False):
+            return default.arg
+    except Exception:
+        return None
+
+    return None
+
+
+def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
+    """
+    Best-effort local/dev schema repair.
+
+    Requires active app context.
+    """
+    db = _get_db()
+    model_classes = _get_model_classes()
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "dryRun": bool(dry_run),
+        "executed": False,
+        "addedColumns": [],
+        "skippedColumns": [],
+        "errors": [],
+        "warnings": [],
+    }
+
+    before = _inspect_database_schema_inner()
+    missing_columns = before.get("missingColumns") or {}
+
+    if not missing_columns:
+        result["status"] = "nothing_to_repair"
+        return result
+
+    try:
+        from sqlalchemy import inspect, text
+    except Exception as exc:
+        result["ok"] = False
+        result["status"] = "sqlalchemy_import_failed"
+        result["errors"].append(
+            {
+                "code": "sqlalchemy_import_failed",
+                "message": _safe_exception_message(exc),
+            }
+        )
+        return result
+
+    try:
+        engine = db.engine
+        dialect = engine.dialect
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+    except Exception as exc:
+        result["ok"] = False
+        result["status"] = "engine_unavailable"
+        result["errors"].append(
+            {
+                "code": "engine_unavailable",
+                "message": _safe_exception_message(exc),
+            }
+        )
+        return result
+
+    table_to_model: dict[str, Any] = {}
+    for model_class in model_classes.values():
+        if model_class is None:
+            continue
+        table_name = _model_table_name(model_class)
+        if table_name:
+            table_to_model[table_name] = model_class
+
+    try:
+        with engine.begin() as connection:
+            for table_name, column_names in missing_columns.items():
+                model_class = table_to_model.get(table_name)
+                table = _model_table(model_class)
+
+                if table is None:
+                    continue
+
+                if table_name not in existing_tables:
+                    result["skippedColumns"].append(
+                        {
+                            "table": table_name,
+                            "reason": "table_missing",
+                            "columns": list(column_names),
+                        }
+                    )
+                    continue
+
+                quoted_table = _quote_identifier(dialect, table_name)
+
+                for column_name in column_names:
+                    column = table.columns.get(column_name)
+                    if column is None:
+                        result["skippedColumns"].append(
+                            {
+                                "table": table_name,
+                                "column": column_name,
+                                "reason": "column_not_in_model_table",
+                            }
+                        )
+                        continue
+
+                    if getattr(column, "primary_key", False):
+                        result["skippedColumns"].append(
+                            {
+                                "table": table_name,
+                                "column": column_name,
+                                "reason": "primary_key_not_repaired",
+                            }
+                        )
+                        continue
+
+                    column_type_sql = _compile_column_type(column, dialect)
+                    quoted_column = _quote_identifier(dialect, column_name)
+                    add_sql = f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {column_type_sql}"
+
+                    if dry_run:
+                        result["addedColumns"].append(
+                            {
+                                "table": table_name,
+                                "column": column_name,
+                                "ddl": add_sql,
+                                "dryRun": True,
+                            }
+                        )
+                        continue
+
+                    try:
+                        connection.execute(text(add_sql))
+                        result["executed"] = True
+
+                        default_value = _scalar_default_value(column)
+                        default_applied = False
+
+                        if default_value is not None and isinstance(default_value, (str, int, float, bool)):
+                            update_sql = f"UPDATE {quoted_table} SET {quoted_column} = :value WHERE {quoted_column} IS NULL"
+                            connection.execute(text(update_sql), {"value": default_value})
+                            default_applied = True
+
+                        not_null_applied = False
+                        if not getattr(column, "nullable", True):
+                            null_count_sql = f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} IS NULL"
+                            null_count = connection.execute(text(null_count_sql)).scalar()
+                            if int(null_count or 0) == 0:
+                                try:
+                                    connection.execute(
+                                        text(
+                                            f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} SET NOT NULL"
+                                        )
+                                    )
+                                    not_null_applied = True
+                                except Exception as exc:
+                                    result["warnings"].append(
+                                        {
+                                            "code": "set_not_null_failed",
+                                            "message": _safe_exception_message(exc),
+                                            "table": table_name,
+                                            "column": column_name,
+                                        }
+                                    )
+
+                        result["addedColumns"].append(
+                            {
+                                "table": table_name,
+                                "column": column_name,
+                                "type": column_type_sql,
+                                "defaultApplied": default_applied,
+                                "notNullApplied": not_null_applied,
+                            }
+                        )
+
+                    except Exception as exc:
+                        result["ok"] = False
+                        result["errors"].append(
+                            {
+                                "code": "add_column_failed",
+                                "message": _safe_exception_message(exc),
+                                "table": table_name,
+                                "column": column_name,
+                                "ddl": add_sql,
+                            }
+                        )
+
+    except Exception as exc:
+        result["ok"] = False
+        result["errors"].append(
+            {
+                "code": "schema_repair_transaction_failed",
+                "message": _safe_exception_message(exc),
+            }
+        )
+
+    after = _inspect_database_schema_inner()
+    result["before"] = before
+    result["after"] = after
+    result["remainingMissingColumns"] = after.get("missingColumns") or {}
+    result["status"] = "repaired" if result["ok"] and not result["remainingMissingColumns"] else "repair_incomplete"
+
+    if result["remainingMissingColumns"]:
+        result["warnings"].append(
+            {
+                "code": "remaining_missing_columns",
+                "message": "Some model columns are still missing after schema repair.",
+                "details": result["remainingMissingColumns"],
+            }
+        )
+
+    return result
+
+
+def _repair_missing_columns(app: Any, *, dry_run: bool = False) -> dict[str, Any]:
+    """Best-effort local/dev schema repair."""
+    if _has_app_context():
+        return _repair_missing_columns_inner(dry_run=dry_run)
+
+    with app.app_context():
+        return _repair_missing_columns_inner(dry_run=dry_run)
+
+
+def _direct_create_all_inner() -> dict[str, Any]:
+    """Run direct db.create_all() fallback. Requires active app context."""
+    db = _get_db()
+
+    db.create_all()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+
+    return {
+        "ok": True,
+        "status": "create_all_completed",
+        "executed": True,
+    }
+
+
+def _direct_create_all(app: Any) -> dict[str, Any]:
+    """Run direct db.create_all() fallback."""
+    if _has_app_context():
+        return _direct_create_all_inner()
+
+    with app.app_context():
+        return _direct_create_all_inner()
+
+
+def _query_first_by_fields(session: Any, model: Any, **fields: Any) -> Any | None:
+    """Best-effort multi-field query helper."""
+    if session is None or model is None:
+        return None
+
+    filters = {
+        key: value
+        for key, value in fields.items()
+        if value is not None and _model_has_column(model, key)
+    }
+
+    if not filters:
+        return None
+
+    try:
+        query = session.query(model)
+        for key, value in filters.items():
+            query = query.filter(getattr(model, key) == value)
+        return query.first()
+    except Exception:
+        try:
+            return session.query(model).filter_by(**filters).first()
+        except Exception:
+            return None
+
+
+def _query_first_by_field(session: Any, model: Any, field_name: str, value: Any) -> Any | None:
+    """Best-effort query helper."""
+    return _query_first_by_fields(session, model, **{field_name: value})
+
+
+def _direct_seed_defaults_inner() -> dict[str, Any]:
+    """
+    Seed minimal dev Project/Universe/WorldInstance fallback.
+
+    Requires active app context.
+    """
+    db = _get_db()
+
+    from models import Project, Universe, WorldInstance
+
+    created: list[str] = []
+    reused: list[str] = []
+    warnings: list[dict[str, Any]] = []
+
+    project_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
+    universe_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID", DEFAULT_UNIVERSE_ID)
+    world_id = _resolve_concrete_default_world_id()
+    template_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", DEFAULT_TEMPLATE_ID)
+    provider_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", DEFAULT_PROVIDER_ID)
+    provider_world_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", DEFAULT_PROVIDER_WORLD_ID)
+    block_registry_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", DEFAULT_BLOCK_REGISTRY_ID)
+    block_registry_version = _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", DEFAULT_BLOCK_REGISTRY_VERSION)
+
+    project = _query_first_by_field(db.session, Project, "project_id", project_id)
+
+    if project is None:
+        if hasattr(Project, "create_dev_project"):
+            try:
+                project = Project.create_dev_project(
+                    project_id=project_id,
+                    default_universe_id=universe_id,
+                    default_world_id=world_id,
+                    spawn_world_id=world_id,
+                    created_by_user_id="bootstrap",
+                )
+            except TypeError:
+                try:
+                    project = Project.create_dev_project(
+                        project_id=project_id,
+                        default_universe_id=universe_id,
+                        default_world_id=world_id,
+                        created_by_user_id="bootstrap",
+                    )
+                except TypeError:
+                    project = Project.create_dev_project(
+                        project_id=project_id,
+                        default_universe_id=universe_id,
+                        created_by_user_id="bootstrap",
+                    )
+        else:
+            project = Project(
+                project_id=project_id,
+                slug=project_id,
+                name="Dev Project",
+                default_universe_id=universe_id,
+                default_world_id=world_id,
+                spawn_world_id=world_id,
+                metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+            )
+
+        db.session.add(project)
+        db.session.flush()
+        created.append("Project")
+    else:
+        reused.append("Project")
+
+    _set_attr_if_empty(project, "slug", project_id)
+    _set_attr_if_empty(project, "name", "Dev Project")
+    _set_attr_if_empty(project, "status", "active")
+    _set_attr_if_supported(project, "default_universe_id", universe_id)
+    _set_attr_if_supported(project, "default_world_id", world_id)
+    _set_attr_if_supported(project, "spawn_world_id", world_id)
+    _set_attr_if_supported(project, "updated_by_user_id", "bootstrap")
+    _merge_metadata_json(
+        project,
+        {
+            "seed": True,
+            "createdBy": "bootstrap_db.py",
+            "defaultUniverseId": universe_id,
+            "defaultWorldId": world_id,
+            "spawnWorldId": world_id,
+        },
+    )
+
+    universe = None
+    try:
+        universe = (
+            db.session.query(Universe)
+            .filter(Universe.project_db_id == project.id)
+            .filter(Universe.universe_id == universe_id)
+            .first()
+        )
+    except Exception:
+        universe = _query_first_by_field(db.session, Universe, "universe_id", universe_id)
+
+    if universe is None:
+        if hasattr(Universe, "create_for_project"):
+            try:
+                universe = Universe.create_for_project(
+                    project,
+                    universe_id=universe_id,
+                    name="Dev Universe",
+                    slug=universe_id,
+                    default_world_id=world_id,
+                    spawn_world_id=world_id,
+                    created_by_user_id="bootstrap",
+                    metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+                )
+            except TypeError:
+                universe = Universe(
+                    project_db_id=project.id,
+                    universe_id=universe_id,
+                    slug=universe_id,
+                    name="Dev Universe",
+                    default_world_id=world_id,
+                    spawn_world_id=world_id,
+                    metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+                )
+        else:
+            universe = Universe(
+                project_db_id=project.id,
+                universe_id=universe_id,
+                slug=universe_id,
+                name="Dev Universe",
+                default_world_id=world_id,
+                spawn_world_id=world_id,
+                metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+            )
+
+        db.session.add(universe)
+        db.session.flush()
+        created.append("Universe")
+    else:
+        reused.append("Universe")
+
+    _set_attr_if_supported(universe, "project_db_id", getattr(project, "id", None))
+    _set_attr_if_empty(universe, "slug", universe_id)
+    _set_attr_if_empty(universe, "name", "Dev Universe")
+    _set_attr_if_empty(universe, "status", "active")
+    _set_attr_if_supported(universe, "default_world_id", world_id)
+    _set_attr_if_supported(universe, "spawn_world_id", world_id)
+    _set_attr_if_supported(universe, "updated_by_user_id", "bootstrap")
+    _merge_metadata_json(
+        universe,
+        {
+            "seed": True,
+            "createdBy": "bootstrap_db.py",
+            "defaultWorldId": world_id,
+            "spawnWorldId": world_id,
+        },
+    )
+
+    world = None
+    try:
+        world = (
+            db.session.query(WorldInstance)
+            .filter(WorldInstance.universe_db_id == universe.id)
+            .filter(WorldInstance.world_id == world_id)
+            .first()
+        )
+    except Exception:
+        world = _query_first_by_field(db.session, WorldInstance, "world_id", world_id)
+
+    if world is None:
+        if hasattr(WorldInstance, "create_flat_spawn"):
+            try:
+                world = WorldInstance.create_flat_spawn(
+                    project_db_id=project.id,
+                    universe_db_id=universe.id,
+                    world_id=world_id,
+                    slug="spawn",
+                    name="Flat Spawn World",
+                    created_by_user_id="bootstrap",
+                    metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+                )
+            except TypeError:
+                world = WorldInstance.create_flat_spawn(
+                    project=project,
+                    universe=universe,
+                    world_id=world_id,
+                    slug="spawn",
+                    name="Flat Spawn World",
+                    created_by_user_id="bootstrap",
+                    metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+                )
+        else:
+            world = WorldInstance(
+                project_db_id=project.id,
+                universe_db_id=universe.id,
+                world_id=world_id,
+                slug="spawn",
+                name="Flat Spawn World",
+                template_id=template_id,
+                provider_id=provider_id,
+                provider_world_id=provider_world_id,
+                generator_type="flat-world",
+                generator_version="1",
+                projection_type="flat-local-v1",
+                topology_type="flat-unbounded-v1",
+                coordinate_system="vectoplan-world-y-up-v1",
+                chunk_size=16,
+                cell_size=1.0,
+                surface_y=0,
+                min_y=-8,
+                max_y=64,
+                block_registry_id=block_registry_id,
+                block_registry_version=block_registry_version,
+                spawn_x=0,
+                spawn_y=2,
+                spawn_z=0,
+                spawn_yaw=0.0,
+                spawn_pitch=0.0,
+                source_service="vectoplan-chunk-bootstrap",
+                external_ref=world_id,
+                metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
+            )
+
+        db.session.add(world)
+        db.session.flush()
+        created.append("WorldInstance")
+    else:
+        reused.append("WorldInstance")
+
+    _set_attr_if_supported(world, "project_db_id", getattr(project, "id", None))
+    _set_attr_if_supported(world, "universe_db_id", getattr(universe, "id", None))
+    _set_attr_if_empty(world, "slug", "spawn")
+    _set_attr_if_empty(world, "name", "Flat Spawn World")
+    _set_attr_if_empty(world, "status", "active")
+    _set_attr_if_supported(world, "template_id", template_id)
+    _set_attr_if_supported(world, "provider_id", provider_id)
+    _set_attr_if_supported(world, "provider_world_id", provider_world_id)
+    _set_attr_if_supported(world, "block_registry_id", block_registry_id)
+    _set_attr_if_supported(world, "block_registry_version", block_registry_version)
+    _set_attr_if_supported(world, "spawn_x", _safe_int(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", "0"), 0))
+    _set_attr_if_supported(world, "spawn_y", _safe_int(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", "2"), 2))
+    _set_attr_if_supported(world, "spawn_z", _safe_int(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", "0"), 0))
+    _set_attr_if_supported(world, "spawn_yaw", _safe_float(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", "0.0"), 0.0))
+    _set_attr_if_supported(world, "spawn_pitch", _safe_float(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", "0.0"), 0.0))
+    _set_attr_if_supported(world, "source_service", "vectoplan-chunk-bootstrap")
+    _set_attr_if_supported(world, "external_ref", world_id)
+    _set_attr_if_supported(world, "updated_by_user_id", "bootstrap")
+    _merge_metadata_json(
+        world,
+        {
+            "seed": True,
+            "createdBy": "bootstrap_db.py",
+            "worldId": world_id,
+            "templateId": template_id,
+            "providerId": provider_id,
+            "providerWorldId": provider_world_id,
+        },
+    )
+
+    try:
+        if hasattr(project, "set_world_refs"):
+            project.set_world_refs(
+                default_universe_id=universe_id,
+                default_world_id=world_id,
+                spawn_world_id=world_id,
+                updated_by_user_id="bootstrap",
+            )
+        else:
+            _set_attr_if_supported(project, "default_universe_id", universe_id)
+            _set_attr_if_supported(project, "default_world_id", world_id)
+            _set_attr_if_supported(project, "spawn_world_id", world_id)
+
+        if hasattr(universe, "set_world_defaults"):
+            universe.set_world_defaults(
+                default_world_id=world_id,
+                spawn_world_id=world_id,
+                updated_by_user_id="bootstrap",
+            )
+        else:
+            _set_attr_if_supported(universe, "default_world_id", world_id)
+            _set_attr_if_supported(universe, "spawn_world_id", world_id)
+    except Exception as exc:
+        warnings.append(
+            {
+                "code": "reference_backfill_warning",
+                "message": _safe_exception_message(exc),
+            }
+        )
+
+    db.session.commit()
+
+    return {
+        "ok": True,
+        "status": "seed_completed",
+        "executed": True,
+        "created": created,
+        "reused": reused,
+        "warnings": warnings,
+        "defaultProjectReady": True,
+        "defaultUniverseReady": True,
+        "defaultWorldReady": True,
+        "defaults": {
+            "projectId": project_id,
+            "universeId": universe_id,
+            "worldId": world_id,
+            "templateId": template_id,
+            "providerId": provider_id,
+            "providerWorldId": provider_world_id,
+            "blockRegistryId": block_registry_id,
+            "blockRegistryVersion": block_registry_version,
+        },
+    }
+
+
+def _direct_seed_defaults(app: Any) -> dict[str, Any]:
+    """
+    Seed minimal dev Project/Universe/WorldInstance fallback.
+
+    The preferred seed path is src.bootstrap.db_bootstrap. This fallback exists
+    so local bootstrap remains usable even if that module is temporarily broken.
+    """
+    if _has_app_context():
+        return _direct_seed_defaults_inner()
+
+    with app.app_context():
+        return _direct_seed_defaults_inner()
+
+
+def _run_seed_invariant_repair(app: Any) -> dict[str, Any]:
+    """Run preferred seed-invariant repair if available, otherwise direct seed fallback."""
+    try:
+        from src.bootstrap.db_bootstrap import repair_default_world_invariant
+
+        result = repair_default_world_invariant(app, commit=True)
+        data = _to_plain_dict(result)
+        data.setdefault("backend", "src.bootstrap.db_bootstrap.repair_default_world_invariant")
+        return data
+    except Exception as exc:
+        fallback = _direct_seed_defaults(app)
+        fallback.setdefault("warnings", []).append(
+            {
+                "code": "preferred_seed_invariant_repair_unavailable",
+                "message": _safe_exception_message(exc),
+            }
+        )
+        fallback["backend"] = "direct_seed_defaults"
+        return fallback
+
+
+def _fallback_bootstrap(
+    app: Any,
+    *,
+    run_schema: bool,
+    run_seed: bool,
+    repair_missing_columns: bool,
+    dry_run_repair: bool,
+    repair_seed_invariants: bool,
+) -> dict[str, Any]:
+    """Fallback bootstrap when src.bootstrap.db_bootstrap is unavailable or returned not-ok."""
+    warnings: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    schema_result: dict[str, Any] = {
+        "ok": True,
+        "executed": False,
+        "status": "not_requested",
+    }
+    repair_result: dict[str, Any] = {
+        "ok": True,
+        "executed": False,
+        "status": "not_requested",
+    }
+    seed_result: dict[str, Any] = {
+        "ok": True,
+        "executed": False,
+        "status": "not_requested",
+    }
+
+    pre_status = _inspect_database_schema(app)
+
+    if run_schema:
+        try:
+            schema_result = _direct_create_all(app)
+        except Exception as exc:
+            schema_result = {
+                "ok": False,
+                "executed": True,
+                "status": "create_all_failed",
+                "error": _safe_exception_message(exc),
+            }
+            errors.append(
+                {
+                    "code": "create_all_failed",
+                    "message": _safe_exception_message(exc),
+                }
+            )
+
+    if repair_missing_columns and schema_result.get("ok"):
+        repair_result = _repair_missing_columns(app, dry_run=dry_run_repair)
+        for item in repair_result.get("warnings") or []:
+            warnings.append(item)
+        for item in repair_result.get("errors") or []:
+            errors.append(item)
+
+    if run_seed and schema_result.get("ok") and repair_result.get("ok"):
+        try:
+            if repair_seed_invariants:
+                seed_result = _run_seed_invariant_repair(app)
+            else:
+                seed_result = _direct_seed_defaults(app)
+
+            for item in seed_result.get("warnings") or []:
+                warnings.append(item)
+            for item in seed_result.get("errors") or []:
+                errors.append(item)
+        except Exception as exc:
+            seed_result = {
+                "ok": False,
+                "executed": True,
+                "status": "seed_failed",
+                "error": _safe_exception_message(exc),
+            }
+            errors.append(
+                {
+                    "code": "seed_failed",
+                    "message": _safe_exception_message(exc),
+                }
+            )
+
+    post_status = _inspect_database_schema(app)
+    invariant_status = _build_invariant_status_if_available(app)
+
+    default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
+    default_universe_ready = _nested_bool(invariant_status, ("ready", "universe"))
+    default_world_ready = _nested_bool(invariant_status, ("ready", "world"))
+    seed_ready = bool(seed_result.get("ok")) and (default_world_ready is not False)
+
+    ok = (
+        bool(schema_result.get("ok"))
+        and bool(repair_result.get("ok"))
+        and bool(seed_result.get("ok"))
+        and bool(post_status.get("ok"))
+        and (default_world_ready is not False)
+    )
+
+    if not post_status.get("ok"):
+        errors.append(
+            {
+                "code": "post_bootstrap_schema_not_ready",
+                "message": "Database schema is not ready after bootstrap.",
+                "details": {
+                    "missingTables": post_status.get("missingTables"),
+                    "missingColumns": post_status.get("missingColumns"),
+                },
+            }
+        )
+
+    if run_seed and default_world_ready is False:
+        errors.append(
+            {
+                "code": "post_bootstrap_default_world_not_ready",
+                "message": "Default concrete world is not ready after bootstrap.",
+                "details": invariant_status,
+            }
+        )
+
+    result = {
+        "ok": ok,
+        "status": "completed" if ok else "failed",
+        "enabled": True,
+        "backend": "fallback",
+        "schemaReady": bool(post_status.get("ok")),
+        "seedReady": seed_ready,
+        "defaultProjectReady": default_project_ready,
+        "defaultUniverseReady": default_universe_ready,
+        "defaultWorldReady": default_world_ready,
+        "schema_bootstrap_requested": bool(run_schema),
+        "schema_bootstrap_executed": bool(schema_result.get("executed")),
+        "schema_bootstrap_ok": bool(schema_result.get("ok")),
+        "schema": schema_result,
+        "schema_repair_requested": bool(repair_missing_columns),
+        "schema_repair_executed": bool(repair_result.get("executed")),
+        "schema_repair_ok": bool(repair_result.get("ok")),
+        "schemaRepair": repair_result,
+        "seed_bootstrap_requested": bool(run_seed),
+        "seed_bootstrap_executed": bool(seed_result.get("executed", True if run_seed else False)),
+        "seed_bootstrap_ok": seed_ready,
+        "seed_invariant_repair_requested": bool(repair_seed_invariants),
+        "seed_invariant_repair_executed": bool(seed_result.get("executed", False)),
+        "seed_invariant_repair_ok": seed_result.get("ok"),
+        "seed": seed_result,
+        "seedInvariant": invariant_status,
+        "warnings": warnings,
+        "errors": errors,
+        "pre_status": pre_status,
+        "post_status": post_status,
+    }
+    result["summary"] = summarize_bootstrap_result(result)
+
+    return result
+
+
 # -----------------------------------------------------------------------------
 # Result helpers
 # -----------------------------------------------------------------------------
+
+def _nested_value(payload: Mapping[str, Any] | Any, path: Sequence[str], default: Any = None) -> Any:
+    """Read nested mapping value."""
+    current: Any = payload
+
+    for part in path:
+        if not isinstance(current, Mapping):
+            return default
+        current = current.get(part)
+
+    return current if current is not None else default
+
+
+def _nested_bool(payload: Mapping[str, Any] | Any, path: Sequence[str]) -> bool | None:
+    """Read nested bool value."""
+    value = _nested_value(payload, path, None)
+
+    if value is None:
+        return None
+
+    return _safe_bool(value, False)
+
+
+def _append_unique_errors(target: list[dict[str, Any]], items: Sequence[Any]) -> None:
+    """Append error/warning items without obvious duplicates."""
+    seen = set()
+    for existing in target:
+        if isinstance(existing, Mapping):
+            seen.add((_safe_str(existing.get("code"), ""), _safe_str(existing.get("message"), "")))
+
+    for item in items:
+        if isinstance(item, Mapping):
+            payload = dict(item)
+        else:
+            payload = {"code": "message", "message": _safe_str(item, "")}
+
+        key = (_safe_str(payload.get("code"), ""), _safe_str(payload.get("message"), ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        target.append(payload)
+
+
+def _build_invariant_status_if_available(app: Any) -> dict[str, Any]:
+    """Build default-world invariant status if preferred helper is available."""
+    try:
+        from src.bootstrap.db_bootstrap import build_default_world_invariant_status
+
+        result = build_default_world_invariant_status(app)
+        return _to_plain_dict(result)
+    except Exception as exc:
+        return {
+            "ok": None,
+            "status": "unavailable",
+            "error": _safe_exception_message(exc),
+            "ready": {
+                "project": None,
+                "universe": None,
+                "world": None,
+            },
+        }
+
+
+def _bootstrap_indicates_seed_not_ready(result: Mapping[str, Any] | Any) -> bool:
+    """Return whether a bootstrap result indicates seed/default-world not ready."""
+    data = _to_plain_dict(result)
+
+    if data.get("seed_ready") is False or data.get("seedReady") is False:
+        return True
+
+    if data.get("default_world_ready") is False or data.get("defaultWorldReady") is False:
+        return True
+
+    seed = data.get("seed")
+    if isinstance(seed, Mapping):
+        if seed.get("ok") is False:
+            return True
+        if _safe_str(seed.get("status"), "").lower() in {"partial", "failed", "not_ready"}:
+            return True
+
+        world = seed.get("world")
+        if isinstance(world, Mapping) and world.get("exists") is False:
+            return True
+
+        invariant = seed.get("defaultWorldInvariant") or seed.get("invariantAfterRepair")
+        if isinstance(invariant, Mapping):
+            if invariant.get("ok") is False:
+                return True
+            ready = invariant.get("ready")
+            if isinstance(ready, Mapping) and ready.get("world") is False:
+                return True
+
+    post_status = data.get("post_status") or data.get("postStatus")
+    if isinstance(post_status, Mapping):
+        if post_status.get("seedReady") is False:
+            return True
+        if post_status.get("defaultWorldReady") is False:
+            return True
+
+        seed_payload = post_status.get("seed")
+        if isinstance(seed_payload, Mapping):
+            invariant = seed_payload.get("defaultWorldInvariant")
+            if isinstance(invariant, Mapping):
+                ready = invariant.get("ready")
+                if isinstance(ready, Mapping) and ready.get("world") is False:
+                    return True
+
+    errors = data.get("errors") or []
+    for item in errors:
+        if not isinstance(item, Mapping):
+            continue
+        code = _safe_str(item.get("code"), "").lower()
+        message = _safe_str(item.get("message"), "").lower()
+        if "seed" in code or "world" in code or "invariant" in code:
+            return True
+        if "world" in message or "seed" in message or "invariant" in message:
+            return True
+
+    return False
+
 
 def make_script_result(
     *,
@@ -381,6 +1729,9 @@ def make_script_result(
         "seed": bool(args.seed),
         "checkOnly": bool(args.check_only),
         "mode": args.mode,
+        "repairMissingColumns": bool(args.repair_missing_columns),
+        "repairSeedInvariants": bool(args.repair_seed_invariants),
+        "dryRunRepair": bool(args.dry_run_repair),
         "bootstrap": bootstrap_result,
         "summary": summary,
         "error": error,
@@ -390,16 +1741,31 @@ def make_script_result(
         result["traceback"] = traceback_text
 
     if bootstrap_result:
+        warnings = bootstrap_result.get("warnings") or []
+        errors = bootstrap_result.get("errors") or []
+
         result.update(
             {
+                "schemaReady": summary.get("schemaReady", bootstrap_result.get("schemaReady")),
+                "seedReady": summary.get("seedReady", bootstrap_result.get("seedReady")),
+                "defaultProjectReady": summary.get("defaultProjectReady", bootstrap_result.get("defaultProjectReady")),
+                "defaultUniverseReady": summary.get("defaultUniverseReady", bootstrap_result.get("defaultUniverseReady")),
+                "defaultWorldReady": summary.get("defaultWorldReady", bootstrap_result.get("defaultWorldReady")),
                 "schemaBootstrapRequested": summary.get("schemaBootstrapRequested"),
                 "schemaBootstrapExecuted": summary.get("schemaBootstrapExecuted"),
                 "schemaBootstrapOk": summary.get("schemaBootstrapOk"),
+                "schemaRepairRequested": summary.get("schemaRepairRequested"),
+                "schemaRepairExecuted": summary.get("schemaRepairExecuted"),
+                "schemaRepairOk": summary.get("schemaRepairOk"),
                 "seedBootstrapRequested": summary.get("seedBootstrapRequested"),
                 "seedBootstrapExecuted": summary.get("seedBootstrapExecuted"),
                 "seedBootstrapOk": summary.get("seedBootstrapOk"),
-                "warningCount": summary.get("warningCount"),
-                "errorCount": summary.get("errorCount"),
+                "seedInvariantRepairExecuted": summary.get("seedInvariantRepairExecuted", bootstrap_result.get("seed_invariant_repair_executed")),
+                "seedInvariantRepairOk": summary.get("seedInvariantRepairOk", bootstrap_result.get("seed_invariant_repair_ok")),
+                "warningCount": summary.get("warningCount", len(warnings)),
+                "errorCount": summary.get("errorCount", len(errors)),
+                "warnings": warnings,
+                "errors": errors,
             }
         )
 
@@ -407,30 +1773,53 @@ def make_script_result(
 
 
 def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
-    """Build compact summary from db_bootstrap result."""
+    """Build compact summary from bootstrap result."""
     try:
         from src.bootstrap.db_bootstrap import build_db_bootstrap_summary
 
         summary = build_db_bootstrap_summary(result)
         if isinstance(summary, dict):
+            plain = _to_plain_dict(result)
+            summary.setdefault("schemaReady", plain.get("schema_ready", plain.get("schemaReady")))
+            summary.setdefault("seedReady", plain.get("seed_ready", plain.get("seedReady")))
+            summary.setdefault("defaultProjectReady", plain.get("default_project_ready", plain.get("defaultProjectReady")))
+            summary.setdefault("defaultUniverseReady", plain.get("default_universe_ready", plain.get("defaultUniverseReady")))
+            summary.setdefault("defaultWorldReady", plain.get("default_world_ready", plain.get("defaultWorldReady")))
+            summary.setdefault("schemaRepairRequested", bool(plain.get("schema_repair_requested")))
+            summary.setdefault("schemaRepairExecuted", bool(plain.get("schema_repair_executed")))
+            summary.setdefault("schemaRepairOk", plain.get("schema_repair_ok"))
+            summary.setdefault("seedInvariantRepairExecuted", bool(plain.get("seed_invariant_repair_executed")))
+            summary.setdefault("seedInvariantRepairOk", plain.get("seed_invariant_repair_ok"))
             return summary
     except Exception:
         pass
 
     data = _to_plain_dict(result)
+    warnings = data.get("warnings") or []
+    errors = data.get("errors") or []
 
     return {
         "ok": bool(data.get("ok")),
         "status": _safe_str(data.get("status"), "unknown"),
         "enabled": bool(data.get("enabled")),
+        "schemaReady": data.get("schema_ready", data.get("schemaReady")),
+        "seedReady": data.get("seed_ready", data.get("seedReady")),
+        "defaultProjectReady": data.get("default_project_ready", data.get("defaultProjectReady")),
+        "defaultUniverseReady": data.get("default_universe_ready", data.get("defaultUniverseReady")),
+        "defaultWorldReady": data.get("default_world_ready", data.get("defaultWorldReady")),
         "schemaBootstrapRequested": bool(data.get("schema_bootstrap_requested")),
         "schemaBootstrapExecuted": bool(data.get("schema_bootstrap_executed")),
         "schemaBootstrapOk": data.get("schema_bootstrap_ok"),
+        "schemaRepairRequested": bool(data.get("schema_repair_requested")),
+        "schemaRepairExecuted": bool(data.get("schema_repair_executed")),
+        "schemaRepairOk": data.get("schema_repair_ok"),
         "seedBootstrapRequested": bool(data.get("seed_bootstrap_requested")),
         "seedBootstrapExecuted": bool(data.get("seed_bootstrap_executed")),
         "seedBootstrapOk": data.get("seed_bootstrap_ok"),
-        "warningCount": len(data.get("warnings") or []),
-        "errorCount": len(data.get("errors") or []),
+        "seedInvariantRepairExecuted": bool(data.get("seed_invariant_repair_executed")),
+        "seedInvariantRepairOk": data.get("seed_invariant_repair_ok"),
+        "warningCount": len(warnings),
+        "errorCount": len(errors),
         "durationMs": data.get("duration_ms"),
     }
 
@@ -438,8 +1827,365 @@ def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
 def normalize_bootstrap_result(result: Any) -> dict[str, Any]:
     """Normalize DB bootstrap result to plain dict and attach summary."""
     data = _to_plain_dict(result)
-    data["summary"] = summarize_bootstrap_result(result)
+    data.setdefault("warnings", [])
+    data.setdefault("errors", [])
+    data["summary"] = summarize_bootstrap_result(data)
     return data
+
+
+def _check_only_result_inner(app: Any) -> dict[str, Any]:
+    """Build read-only check-only status. Requires active app context."""
+    try:
+        from src.bootstrap.db_bootstrap import build_db_bootstrap_status
+
+        status = build_db_bootstrap_status(app)
+        schema_audit = _inspect_database_schema_inner()
+        invariant_status = _build_invariant_status_if_available(app)
+
+        schema_ready = bool(status.get("schemaReady")) and bool(schema_audit.get("ok"))
+        seed_ready = bool(status.get("seedReady"))
+        default_project_ready = status.get("defaultProjectReady")
+        default_universe_ready = status.get("defaultUniverseReady")
+        default_world_ready = status.get("defaultWorldReady")
+
+        if default_project_ready is None:
+            default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
+        if default_universe_ready is None:
+            default_universe_ready = _nested_bool(invariant_status, ("ready", "universe"))
+        if default_world_ready is None:
+            default_world_ready = _nested_bool(invariant_status, ("ready", "world"))
+
+        ok = bool(schema_ready and seed_ready and default_world_ready is not False)
+
+        errors = [] if ok else [
+            {
+                "code": "check_only_not_ready",
+                "message": "DB bootstrap read-only status is not ready.",
+                "details": {
+                    "bootstrapStatus": status,
+                    "schemaAudit": schema_audit,
+                    "seedInvariant": invariant_status,
+                },
+            }
+        ]
+
+        result = {
+            "ok": ok,
+            "status": "ready" if ok else "not_ready",
+            "enabled": False,
+            "backend": "db_bootstrap_status",
+            "schemaReady": schema_ready,
+            "seedReady": seed_ready,
+            "defaultProjectReady": default_project_ready,
+            "defaultUniverseReady": default_universe_ready,
+            "defaultWorldReady": default_world_ready,
+            "schema_bootstrap_requested": False,
+            "seed_bootstrap_requested": False,
+            "schema_bootstrap_executed": False,
+            "seed_bootstrap_executed": False,
+            "seed_invariant_repair_executed": False,
+            "schema_bootstrap_ok": schema_ready,
+            "seed_bootstrap_ok": seed_ready,
+            "seed_invariant_repair_ok": None,
+            "schema_repair_requested": False,
+            "schema_repair_executed": False,
+            "schema_repair_ok": None,
+            "warnings": [],
+            "errors": errors,
+            "pre_status": status,
+            "schemaAudit": schema_audit,
+            "seedInvariant": invariant_status,
+        }
+        result["summary"] = summarize_bootstrap_result(result)
+
+        return result
+
+    except Exception as exc:
+        schema_audit = _inspect_database_schema_inner()
+        ok = bool(schema_audit.get("ok"))
+
+        errors = [] if ok else [
+            {
+                "code": "check_only_schema_not_ready",
+                "message": "Schema audit is not ready.",
+                "details": schema_audit,
+            }
+        ]
+
+        warnings = [
+            {
+                "code": "db_bootstrap_status_unavailable",
+                "message": _safe_exception_message(exc),
+            }
+        ]
+
+        result = {
+            "ok": ok,
+            "status": "ready" if ok else "not_ready",
+            "enabled": False,
+            "backend": "schema_audit",
+            "schemaReady": bool(schema_audit.get("ok")),
+            "seedReady": None,
+            "defaultProjectReady": None,
+            "defaultUniverseReady": None,
+            "defaultWorldReady": None,
+            "schema_bootstrap_requested": False,
+            "seed_bootstrap_requested": False,
+            "schema_bootstrap_executed": False,
+            "seed_bootstrap_executed": False,
+            "seed_invariant_repair_executed": False,
+            "schema_bootstrap_ok": bool(schema_audit.get("ok")),
+            "seed_bootstrap_ok": None,
+            "seed_invariant_repair_ok": None,
+            "schema_repair_requested": False,
+            "schema_repair_executed": False,
+            "schema_repair_ok": None,
+            "warnings": warnings,
+            "errors": errors,
+            "schemaAudit": schema_audit,
+        }
+        result["summary"] = summarize_bootstrap_result(result)
+
+        return result
+
+
+def _check_only_result(app: Any) -> dict[str, Any]:
+    """Build read-only check-only status."""
+    if _has_app_context():
+        return _check_only_result_inner(app)
+
+    with app.app_context():
+        return _check_only_result_inner(app)
+
+
+def _run_preferred_or_fallback_bootstrap(
+    app: Any,
+    args: argparse.Namespace,
+    *,
+    effective_create_all: bool,
+    effective_seed: bool,
+) -> dict[str, Any]:
+    """
+    Run DB bootstrap inside a Flask app context.
+
+    Critical behavior:
+    - Preferred src.bootstrap.db_bootstrap runs under app.app_context().
+    - If preferred bootstrap returns ok=false without raising and tables are
+      still missing, direct fallback db.create_all()/seed is attempted.
+    - If preferred bootstrap returns ok=false because seed/default world is not
+      ready, a direct seed invariant repair fallback is attempted.
+    - Schema audit and repair also run under app context.
+    """
+    with app.app_context():
+        if args.check_only:
+            return _check_only_result_inner(app)
+
+        try:
+            from src.bootstrap.db_bootstrap import run_db_bootstrap
+
+            raw_result = run_db_bootstrap(
+                app,
+                enabled=True,
+                run_schema=effective_create_all,
+                run_seed=effective_seed,
+                fail_on_error=False,
+                include_pre_status=True,
+                include_post_status=True,
+            )
+            bootstrap_result = normalize_bootstrap_result(raw_result)
+            bootstrap_result["backend"] = bootstrap_result.get("backend") or "src.bootstrap.db_bootstrap"
+
+            schema_audit_before_repair = _inspect_database_schema_inner()
+            bootstrap_result["schemaAuditBeforeRepair"] = schema_audit_before_repair
+
+            preferred_ok = bool(bootstrap_result.get("ok"))
+            missing_tables = list(schema_audit_before_repair.get("missingTables") or [])
+            seed_not_ready = _bootstrap_indicates_seed_not_ready(bootstrap_result)
+
+            if not preferred_ok and effective_create_all and missing_tables:
+                fallback_result = _fallback_bootstrap(
+                    app,
+                    run_schema=effective_create_all,
+                    run_seed=effective_seed,
+                    repair_missing_columns=bool(args.repair_missing_columns),
+                    dry_run_repair=bool(args.dry_run_repair),
+                    repair_seed_invariants=bool(args.repair_seed_invariants),
+                )
+                fallback_result["backend"] = "fallback_after_preferred_failed_missing_tables"
+                fallback_result["preferredBootstrap"] = bootstrap_result
+                fallback_result.setdefault("warnings", []).append(
+                    {
+                        "code": "preferred_bootstrap_returned_not_ok",
+                        "message": (
+                            "Preferred src.bootstrap.db_bootstrap returned ok=false "
+                            "and required tables were missing; direct fallback bootstrap was executed."
+                        ),
+                        "details": {
+                            "preferredStatus": bootstrap_result.get("status"),
+                            "missingTables": missing_tables,
+                        },
+                    }
+                )
+                fallback_result["summary"] = summarize_bootstrap_result(fallback_result)
+                return fallback_result
+
+            if not preferred_ok and effective_seed and seed_not_ready and args.repair_seed_invariants:
+                seed_repair_result = _run_seed_invariant_repair(app)
+                invariant_after = _build_invariant_status_if_available(app)
+                schema_audit_after_seed_repair = _inspect_database_schema_inner()
+
+                bootstrap_result["seedInvariantRepairFallback"] = seed_repair_result
+                bootstrap_result["seedInvariantAfterFallbackRepair"] = invariant_after
+                bootstrap_result["schemaAuditAfterSeedFallbackRepair"] = schema_audit_after_seed_repair
+                bootstrap_result["seed_invariant_repair_executed"] = True
+                bootstrap_result["seed_invariant_repair_ok"] = bool(seed_repair_result.get("ok"))
+
+                _append_unique_errors(
+                    bootstrap_result.setdefault("warnings", []),
+                    seed_repair_result.get("warnings") or [],
+                )
+                _append_unique_errors(
+                    bootstrap_result.setdefault("errors", []),
+                    seed_repair_result.get("errors") or [],
+                )
+
+                default_project_ready = _nested_bool(invariant_after, ("ready", "project"))
+                default_universe_ready = _nested_bool(invariant_after, ("ready", "universe"))
+                default_world_ready = _nested_bool(invariant_after, ("ready", "world"))
+                seed_ready = bool(seed_repair_result.get("ok")) and default_world_ready is not False
+                schema_ready = bool(schema_audit_after_seed_repair.get("ok"))
+
+                bootstrap_result["schemaReady"] = schema_ready
+                bootstrap_result["seedReady"] = seed_ready
+                bootstrap_result["defaultProjectReady"] = default_project_ready
+                bootstrap_result["defaultUniverseReady"] = default_universe_ready
+                bootstrap_result["defaultWorldReady"] = default_world_ready
+
+                if schema_ready and seed_ready and default_world_ready:
+                    bootstrap_result["ok"] = True
+                    bootstrap_result["status"] = "completed"
+                    bootstrap_result["errors"] = [
+                        item
+                        for item in bootstrap_result.get("errors", [])
+                        if not (
+                            isinstance(item, Mapping)
+                            and (
+                                "seed" in _safe_str(item.get("code"), "").lower()
+                                or "world" in _safe_str(item.get("code"), "").lower()
+                                or "invariant" in _safe_str(item.get("code"), "").lower()
+                            )
+                        )
+                    ]
+                    bootstrap_result.setdefault("warnings", []).append(
+                        {
+                            "code": "seed_invariant_repaired_after_preferred_not_ok",
+                            "message": (
+                                "Preferred bootstrap returned not-ok, but the seed/default-world "
+                                "invariant was repaired successfully by the script fallback."
+                            ),
+                        }
+                    )
+                else:
+                    bootstrap_result["ok"] = False
+                    bootstrap_result.setdefault("errors", []).append(
+                        {
+                            "code": "seed_invariant_repair_fallback_failed",
+                            "message": "Seed invariant repair fallback did not produce a ready default world.",
+                            "details": {
+                                "seedRepair": seed_repair_result,
+                                "invariantAfter": invariant_after,
+                                "schemaAuditAfter": schema_audit_after_seed_repair,
+                            },
+                        }
+                    )
+
+            repair_result = {
+                "ok": True,
+                "executed": False,
+                "status": "not_requested",
+            }
+
+            if args.repair_missing_columns:
+                if schema_audit_before_repair.get("missingColumns"):
+                    repair_result = _repair_missing_columns_inner(
+                        dry_run=bool(args.dry_run_repair),
+                    )
+
+            schema_audit_after_repair = _inspect_database_schema_inner()
+            bootstrap_result["schemaRepair"] = repair_result
+            bootstrap_result["schemaAuditAfterRepair"] = schema_audit_after_repair
+            bootstrap_result["schema_repair_requested"] = bool(args.repair_missing_columns)
+            bootstrap_result["schema_repair_executed"] = bool(repair_result.get("executed"))
+            bootstrap_result["schema_repair_ok"] = bool(repair_result.get("ok"))
+
+            if repair_result.get("warnings"):
+                _append_unique_errors(
+                    bootstrap_result.setdefault("warnings", []),
+                    repair_result.get("warnings") or [],
+                )
+
+            if repair_result.get("errors"):
+                _append_unique_errors(
+                    bootstrap_result.setdefault("errors", []),
+                    repair_result.get("errors") or [],
+                )
+
+            if not schema_audit_after_repair.get("ok"):
+                bootstrap_result.setdefault("errors", []).append(
+                    {
+                        "code": "schema_audit_not_ready",
+                        "message": "Database schema is not ready after bootstrap.",
+                        "details": {
+                            "missingTables": schema_audit_after_repair.get("missingTables"),
+                            "missingColumns": schema_audit_after_repair.get("missingColumns"),
+                        },
+                    }
+                )
+                bootstrap_result["ok"] = False
+
+            invariant_status = _build_invariant_status_if_available(app)
+            bootstrap_result["seedInvariantFinal"] = invariant_status
+            bootstrap_result.setdefault("schemaReady", bool(schema_audit_after_repair.get("ok")))
+            bootstrap_result.setdefault("defaultProjectReady", _nested_bool(invariant_status, ("ready", "project")))
+            bootstrap_result.setdefault("defaultUniverseReady", _nested_bool(invariant_status, ("ready", "universe")))
+            bootstrap_result.setdefault("defaultWorldReady", _nested_bool(invariant_status, ("ready", "world")))
+
+            if effective_seed and bootstrap_result.get("defaultWorldReady") is False:
+                bootstrap_result.setdefault("errors", []).append(
+                    {
+                        "code": "default_world_not_ready_after_bootstrap",
+                        "message": "Default concrete world is not ready after bootstrap.",
+                        "details": invariant_status,
+                    }
+                )
+                bootstrap_result["ok"] = False
+
+            bootstrap_result["summary"] = summarize_bootstrap_result(bootstrap_result)
+            return bootstrap_result
+
+        except Exception as exc:
+            bootstrap_result = _fallback_bootstrap(
+                app,
+                run_schema=effective_create_all,
+                run_seed=effective_seed,
+                repair_missing_columns=bool(args.repair_missing_columns),
+                dry_run_repair=bool(args.dry_run_repair),
+                repair_seed_invariants=bool(args.repair_seed_invariants),
+            )
+            bootstrap_result.setdefault("warnings", []).append(
+                {
+                    "code": "preferred_bootstrap_module_unavailable",
+                    "message": (
+                        "src.bootstrap.db_bootstrap could not be used; "
+                        "fallback bootstrap path was executed."
+                    ),
+                    "details": {
+                        "error": _safe_exception_message(exc),
+                    },
+                }
+            )
+            bootstrap_result["summary"] = summarize_bootstrap_result(bootstrap_result)
+            return bootstrap_result
 
 
 # -----------------------------------------------------------------------------
@@ -503,8 +2249,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only build read-only DB bootstrap status. No create_all and no seed.",
     )
+
+    repair_default = _env_bool("VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS", True)
+    repair_group = parser.add_mutually_exclusive_group()
+    repair_group.add_argument(
+        "--repair-missing-columns",
+        dest="repair_missing_columns",
+        action="store_true",
+        default=repair_default,
+        help=(
+            "Best-effort local/dev repair for missing columns after create_all. "
+            "Default follows VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS, true if unset."
+        ),
+    )
+    repair_group.add_argument(
+        "--no-repair-missing-columns",
+        dest="repair_missing_columns",
+        action="store_false",
+        help="Do not repair missing columns.",
+    )
+
+    seed_repair_default = _env_bool(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
+        True,
+    )
+    seed_repair_group = parser.add_mutually_exclusive_group()
+    seed_repair_group.add_argument(
+        "--repair-seed-invariants",
+        dest="repair_seed_invariants",
+        action="store_true",
+        default=seed_repair_default,
+        help=(
+            "Repair partial seed invariants such as missing world_spawn. "
+            "Default follows VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS, true if unset."
+        ),
+    )
+    seed_repair_group.add_argument(
+        "--no-repair-seed-invariants",
+        dest="repair_seed_invariants",
+        action="store_false",
+        help="Do not repair partial seed/default-world invariants.",
+    )
+
+    parser.add_argument(
+        "--dry-run-repair",
+        action="store_true",
+        help="Show missing-column repair DDL without executing it.",
+    )
+
     parser.add_argument(
         "--fail-on-error",
+        dest="fail_on_error",
         action="store_true",
         default=True,
         help="Return failure exit code on bootstrap errors. Default: true.",
@@ -576,8 +2371,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         set_default_env(
             create_all=effective_create_all,
             seed=effective_seed,
+            check_only=bool(args.check_only),
             mode=args.mode,
             force_runtime_hooks_off=not bool(args.allow_runtime_startup_hooks),
+            repair_missing_columns=bool(args.repair_missing_columns),
+            repair_seed_invariants=bool(args.repair_seed_invariants),
         )
 
         app = create_flask_app(
@@ -610,43 +2408,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_APP_FAILED
 
     try:
-        if args.check_only:
-            from src.bootstrap.db_bootstrap import build_db_bootstrap_status
-
-            status = build_db_bootstrap_status(app)
-            bootstrap_result = {
-                "ok": bool(status.get("ok")),
-                "status": status.get("status"),
-                "enabled": False,
-                "schema_bootstrap_requested": False,
-                "seed_bootstrap_requested": False,
-                "schema_bootstrap_executed": False,
-                "seed_bootstrap_executed": False,
-                "schema_bootstrap_ok": bool((status.get("schema") or {}).get("ok")),
-                "seed_bootstrap_ok": bool((status.get("seed") or {}).get("ok")),
-                "warnings": [],
-                "errors": [] if status.get("ok") else [
-                    {
-                        "code": "check_only_not_complete",
-                        "message": "DB bootstrap read-only status is not complete.",
-                        "details": status,
-                    }
-                ],
-                "pre_status": status,
-            }
-        else:
-            from src.bootstrap.db_bootstrap import run_db_bootstrap
-
-            raw_result = run_db_bootstrap(
-                app,
-                enabled=True,
-                run_schema=effective_create_all,
-                run_seed=effective_seed,
-                fail_on_error=False,
-                include_pre_status=True,
-                include_post_status=True,
-            )
-            bootstrap_result = normalize_bootstrap_result(raw_result)
+        bootstrap_result = _run_preferred_or_fallback_bootstrap(
+            app,
+            args,
+            effective_create_all=effective_create_all,
+            effective_seed=effective_seed,
+        )
 
         if "summary" not in bootstrap_result:
             bootstrap_result["summary"] = summarize_bootstrap_result(bootstrap_result)

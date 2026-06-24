@@ -1,10 +1,22 @@
 # services/vectoplan-chunk/models/project.py
 """
-SQLAlchemy model for VECTOPLAN projects.
+SQLAlchemy model for VECTOPLAN Chunk projects.
 
 A Project is the top-level persistent container for an editable VECTOPLAN
-runtime universe. It does not directly store chunks. Chunks belong to concrete
-world instances inside universes that belong to this project.
+runtime universe inside `vectoplan-chunk`.
+
+Important service boundary:
+
+    vectoplan-app owns App projects.
+    vectoplan-chunk owns Chunk projects.
+
+A chunk Project may be linked to a vectoplan-app Project through:
+
+    external_app_project_id
+
+The chunk Project is still its own service-local entity. It stores the chunk
+world references that belong to the chunk service, not foreign keys into the
+app database.
 
 Current intended hierarchy:
 
@@ -15,13 +27,14 @@ Current intended hierarchy:
               -> WorldCommandLog
               -> ChunkEvent
 
-Important design rules:
+Design rules:
 - `id` is the internal database primary key.
-- `project_id` is the stable public/API identifier.
-- `slug` is optional but should be globally unique when present.
-- Deletion is soft-delete by default.
-- This model does not perform commits.
-- Repository/service layers are responsible for database transactions.
+- `project_id` is the stable chunk-service public/API identifier.
+- `external_app_project_id` stores the vectoplan-app project public id.
+- `slug` is optional but globally unique when present.
+- deletion is soft-delete by default.
+- this model does not perform commits.
+- repository/service/route layers own database transactions.
 """
 
 from __future__ import annotations
@@ -66,7 +79,7 @@ except Exception:  # pragma: no cover
     JSON_COLUMN_TYPE = db.JSON
 
 
-PROJECT_SCHEMA_VERSION = "project.schema.v1"
+PROJECT_SCHEMA_VERSION = "project.schema.v2"
 
 PROJECT_STATUS_ACTIVE = "active"
 PROJECT_STATUS_ARCHIVED = "archived"
@@ -87,9 +100,14 @@ PROJECT_OWNER_TYPE_MAX_LENGTH = 64
 PROJECT_OWNER_ID_MAX_LENGTH = 128
 PROJECT_USER_ID_MAX_LENGTH = 128
 PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH = 96
+PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH = 96
 PROJECT_DESCRIPTION_MAX_LENGTH = 4096
 
-PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+PROJECT_EXTERNAL_APP_PROJECT_ID_MAX_LENGTH = 128
+PROJECT_SOURCE_SERVICE_MAX_LENGTH = 96
+PROJECT_EXTERNAL_URL_MAX_LENGTH = 512
+
+PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -203,6 +221,8 @@ def normalize_public_id(
     - numbers
     - underscore
     - dash
+    - dot
+    - colon
 
     The first character must be alphanumeric.
     """
@@ -214,20 +234,41 @@ def normalize_public_id(
 
     if not PUBLIC_ID_PATTERN.match(text):
         raise ValueError(
-            f"{field_name} may only contain letters, numbers, underscores "
-            "and dashes, and must start with a letter or number."
+            f"{field_name} may only contain letters, numbers, underscores, "
+            "dashes, dots and colons, and must start with a letter or number."
         )
 
     return text
 
 
 def normalize_project_id(value: Any) -> str:
-    """Normalize a public project id."""
+    """Normalize a public chunk project id."""
     return normalize_public_id(
         value,
         field_name="project_id",
         max_length=PROJECT_ID_MAX_LENGTH,
     )
+
+
+def normalize_external_app_project_id(value: Any) -> Optional[str]:
+    """Normalize optional vectoplan-app project public id."""
+    text = normalize_optional_text(
+        value,
+        field_name="external_app_project_id",
+        max_length=PROJECT_EXTERNAL_APP_PROJECT_ID_MAX_LENGTH,
+    )
+
+    if text is None:
+        return None
+
+    if not PUBLIC_ID_PATTERN.match(text):
+        raise ValueError(
+            "external_app_project_id may only contain letters, numbers, "
+            "underscores, dashes, dots and colons, and must start with a "
+            "letter or number."
+        )
+
+    return text
 
 
 def normalize_slug(value: Any) -> Optional[str]:
@@ -286,7 +327,7 @@ def normalize_metadata(value: Any) -> Dict[str, Any]:
 
 def generate_project_id(prefix: str = "proj") -> str:
     """
-    Generate a stable public project identifier.
+    Generate a stable public chunk project identifier.
 
     Example:
         proj_2f2f7a1c9d3b4a44a5d9e41910b51e70
@@ -299,16 +340,70 @@ def generate_project_id(prefix: str = "proj") -> str:
     return f"{normalized_prefix}_{uuid4().hex}"
 
 
+def _coalesce_first_text(*values: Any) -> Optional[str]:
+    """Return first normalized non-empty text value."""
+    for value in values:
+        text = normalize_optional_text(
+            value,
+            field_name="value",
+            max_length=4096,
+        )
+        if text is not None:
+            return text
+
+    return None
+
+
+def _payload_metadata_value(payload: Mapping[str, Any]) -> Any:
+    """Read metadata payload from several compatible keys."""
+    if "metadataJson" in payload:
+        return payload.get("metadataJson")
+    if "metadata_json" in payload:
+        return payload.get("metadata_json")
+    if "metadata" in payload:
+        return payload.get("metadata")
+    if "projectMetadata" in payload:
+        return payload.get("projectMetadata")
+    if "project_metadata" in payload:
+        return payload.get("project_metadata")
+    return None
+
+
+def _merge_metadata(
+    base: Optional[Mapping[str, Any]],
+    update: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Merge two metadata mappings safely."""
+    result = normalize_metadata(base)
+
+    if update is None:
+        return result
+
+    if not isinstance(update, Mapping):
+        raise ValueError("metadata update must be a JSON object/dict.")
+
+    for key, value in update.items():
+        result[str(key)] = make_json_safe(value)
+
+    return result
+
+
 class Project(db.Model):
     """
-    Persistent VECTOPLAN project.
+    Persistent Chunk project.
 
-    A project is the editable top-level container visible to the editor.
-    It usually owns one default universe and one default spawn world in the
-    first implementation phase.
+    A chunk Project is the editable top-level container used by the editor.
+
+    In the app-integrated flow:
+
+        vectoplan-app Project.public_id
+            -> Project.external_app_project_id
+
+        Project.project_id
+            -> chunk-service public/API project id
 
     This model intentionally does not know how to create universes or worlds.
-    That belongs in repositories/services so transactions can create:
+    That belongs in repositories/services/routes so transactions can create:
 
         Project + Universe + WorldInstance
 
@@ -365,10 +460,42 @@ class Project(db.Model):
         default=1,
     )
 
+    # Default universe/world references are public chunk-service IDs.
     default_universe_id = db.Column(
         db.String(PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH),
         nullable=True,
         index=True,
+    )
+
+    default_world_id = db.Column(
+        db.String(PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
+    spawn_world_id = db.Column(
+        db.String(PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
+    # External link to vectoplan-app. This is not a DB FK.
+    external_app_project_id = db.Column(
+        db.String(PROJECT_EXTERNAL_APP_PROJECT_ID_MAX_LENGTH),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+
+    source_service = db.Column(
+        db.String(PROJECT_SOURCE_SERVICE_MAX_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
+    external_url = db.Column(
+        db.String(PROJECT_EXTERNAL_URL_MAX_LENGTH),
+        nullable=True,
     )
 
     owner_type = db.Column(
@@ -433,6 +560,10 @@ class Project(db.Model):
             "slug",
             name="uq_projects_slug",
         ),
+        db.UniqueConstraint(
+            "external_app_project_id",
+            name="uq_projects_external_app_project_id",
+        ),
         db.CheckConstraint(
             "project_id <> ''",
             name="ck_projects_project_id_not_empty",
@@ -465,16 +596,38 @@ class Project(db.Model):
             "default_universe_id",
         ),
         db.Index(
+            "ix_projects_default_world",
+            "project_id",
+            "default_world_id",
+        ),
+        db.Index(
+            "ix_projects_spawn_world",
+            "project_id",
+            "spawn_world_id",
+        ),
+        db.Index(
             "ix_projects_active_lookup",
             "project_id",
             "status",
             "deleted_at",
+        ),
+        db.Index(
+            "ix_projects_app_link_lookup",
+            "external_app_project_id",
+            "status",
+            "deleted_at",
+        ),
+        db.Index(
+            "ix_projects_source_service_lookup",
+            "source_service",
+            "external_app_project_id",
         ),
     )
 
     def __repr__(self) -> str:
         return (
             f"<Project id={self.id!r} project_id={self.project_id!r} "
+            f"external_app_project_id={self.external_app_project_id!r} "
             f"status={self.status!r}>"
         )
 
@@ -488,6 +641,11 @@ class Project(db.Model):
         description: Optional[str] = None,
         status: str = PROJECT_STATUS_ACTIVE,
         default_universe_id: Optional[str] = None,
+        default_world_id: Optional[str] = None,
+        spawn_world_id: Optional[str] = None,
+        external_app_project_id: Optional[str] = None,
+        source_service: Optional[str] = None,
+        external_url: Optional[str] = None,
         owner_type: Optional[str] = None,
         owner_id: Optional[str] = None,
         created_by_user_id: Optional[str] = None,
@@ -529,6 +687,29 @@ class Project(db.Model):
                 field_name="default_universe_id",
                 max_length=PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH,
             ),
+            default_world_id=normalize_optional_text(
+                default_world_id,
+                field_name="default_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            ),
+            spawn_world_id=normalize_optional_text(
+                spawn_world_id,
+                field_name="spawn_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            ),
+            external_app_project_id=normalize_external_app_project_id(
+                external_app_project_id,
+            ),
+            source_service=normalize_optional_text(
+                source_service,
+                field_name="source_service",
+                max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
+            ),
+            external_url=normalize_optional_text(
+                external_url,
+                field_name="external_url",
+                max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
+            ),
             owner_type=normalize_optional_text(
                 owner_type,
                 field_name="owner_type",
@@ -562,12 +743,13 @@ class Project(db.Model):
         *,
         project_id: str = "dev-project",
         default_universe_id: str = "dev-universe",
+        default_world_id: str = "world_spawn",
         created_by_user_id: Optional[str] = None,
     ) -> "Project":
         """
         Create the default development project instance.
 
-        This is useful for idempotent local startup seeding.
+        This is useful for idempotent local DB bootstrap.
         """
         return cls.create(
             project_id=project_id,
@@ -575,12 +757,71 @@ class Project(db.Model):
             name="Dev Project",
             description="Default development project for the chunk-service world slice.",
             default_universe_id=default_universe_id,
+            default_world_id=default_world_id,
+            spawn_world_id=default_world_id,
+            source_service="vectoplan-chunk",
             created_by_user_id=created_by_user_id,
             metadata_json={
                 "seed": True,
                 "seedType": "development",
                 "createdBy": "vectoplan-chunk",
             },
+        )
+
+    @classmethod
+    def create_for_app_project(
+        cls,
+        *,
+        app_project_public_id: str,
+        chunk_project_id: Optional[str] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        default_universe_id: Optional[str] = None,
+        default_world_id: Optional[str] = None,
+        spawn_world_id: Optional[str] = None,
+        source_service: str = "vectoplan-app",
+        external_url: Optional[str] = None,
+        created_by_user_id: Optional[str] = None,
+        metadata_json: Optional[Mapping[str, Any]] = None,
+    ) -> "Project":
+        """
+        Create a chunk Project linked to a vectoplan-app project.
+
+        This method only creates the Project object. Universe/WorldInstance
+        creation belongs in the provisioning service/route transaction.
+        """
+        normalized_app_project_id = normalize_external_app_project_id(
+            app_project_public_id
+        )
+
+        if normalized_app_project_id is None:
+            raise ValueError("app_project_public_id is required.")
+
+        if chunk_project_id is None:
+            chunk_project_id = f"chk_prj_{normalized_app_project_id}_{uuid4().hex[:12]}"
+
+        metadata = _merge_metadata(
+            {
+                "sourceService": source_service,
+                "externalAppProjectId": normalized_app_project_id,
+                "createdBy": "vectoplan-chunk.project-provisioning",
+            },
+            metadata_json,
+        )
+
+        return cls.create(
+            project_id=chunk_project_id,
+            slug=chunk_project_id,
+            name=name or f"Chunk Project for {normalized_app_project_id}",
+            description=description,
+            default_universe_id=default_universe_id,
+            default_world_id=default_world_id,
+            spawn_world_id=spawn_world_id or default_world_id,
+            external_app_project_id=normalized_app_project_id,
+            source_service=source_service,
+            external_url=external_url,
+            created_by_user_id=created_by_user_id,
+            metadata_json=metadata,
         )
 
     @classmethod
@@ -594,11 +835,16 @@ class Project(db.Model):
         Create a Project instance from an API-style payload.
 
         Supported keys:
-        - projectId / project_id
-        - name
+        - projectId / project_id / chunkProjectId / chunk_project_id
+        - name / projectName
         - slug
         - description
         - defaultUniverseId / default_universe_id
+        - defaultWorldId / default_world_id
+        - spawnWorldId / spawn_world_id
+        - externalAppProjectId / external_app_project_id / appProjectPublicId
+        - sourceService / source_service
+        - externalUrl / external_url
         - ownerType / owner_type
         - ownerId / owner_id
         - metadata / metadataJson / metadata_json
@@ -606,23 +852,50 @@ class Project(db.Model):
         if not isinstance(payload, Mapping):
             raise ValueError("Project create payload must be a JSON object.")
 
-        metadata_value = (
-            payload.get("metadataJson")
-            if "metadataJson" in payload
-            else payload.get("metadata_json")
-            if "metadata_json" in payload
-            else payload.get("metadata")
+        metadata_value = _payload_metadata_value(payload)
+
+        app_project_public_id = (
+            payload.get("externalAppProjectId")
+            or payload.get("external_app_project_id")
+            or payload.get("appProjectPublicId")
+            or payload.get("app_project_public_id")
+            or payload.get("appProjectId")
+            or payload.get("app_project_id")
+        )
+
+        project_id = (
+            payload.get("chunkProjectId")
+            or payload.get("chunk_project_id")
+            or payload.get("projectId")
+            or payload.get("project_id")
         )
 
         return cls.create(
-            project_id=payload.get("projectId") or payload.get("project_id"),
-            name=payload.get("name"),
+            project_id=project_id,
+            name=payload.get("name") or payload.get("projectName") or payload.get("project_name"),
             slug=payload.get("slug"),
             description=payload.get("description"),
             default_universe_id=(
                 payload.get("defaultUniverseId")
                 or payload.get("default_universe_id")
+                or payload.get("universeId")
+                or payload.get("universe_id")
             ),
+            default_world_id=(
+                payload.get("defaultWorldId")
+                or payload.get("default_world_id")
+                or payload.get("worldId")
+                or payload.get("world_id")
+            ),
+            spawn_world_id=(
+                payload.get("spawnWorldId")
+                or payload.get("spawn_world_id")
+                or payload.get("worldId")
+                or payload.get("world_id")
+            ),
+            external_app_project_id=app_project_public_id,
+            source_service=payload.get("sourceService") or payload.get("source_service"),
+            external_url=payload.get("externalUrl") or payload.get("external_url"),
             owner_type=payload.get("ownerType") or payload.get("owner_type"),
             owner_id=payload.get("ownerId") or payload.get("owner_id"),
             created_by_user_id=created_by_user_id,
@@ -644,6 +917,15 @@ class Project(db.Model):
     @property
     def public_key(self) -> str:
         return self.project_id
+
+    @property
+    def has_external_app_link(self) -> bool:
+        return bool(self.external_app_project_id)
+
+    @property
+    def app_project_public_id(self) -> Optional[str]:
+        """Compatibility alias for external_app_project_id."""
+        return self.external_app_project_id
 
     def touch(self, *, updated_by_user_id: Optional[str] = None) -> None:
         """Mark the project as updated and increment its optimistic revision."""
@@ -718,6 +1000,104 @@ class Project(db.Model):
             default_universe_id,
             field_name="default_universe_id",
             max_length=PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH,
+        )
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_default_world_id(
+        self,
+        default_world_id: Optional[str],
+        *,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Set the public default world id.
+
+        The repository/service layer should verify that the world exists and
+        belongs to this project/universe.
+        """
+        self.ensure_not_deleted()
+        self.default_world_id = normalize_optional_text(
+            default_world_id,
+            field_name="default_world_id",
+            max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+        )
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_spawn_world_id(
+        self,
+        spawn_world_id: Optional[str],
+        *,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Set the public spawn world id."""
+        self.ensure_not_deleted()
+        self.spawn_world_id = normalize_optional_text(
+            spawn_world_id,
+            field_name="spawn_world_id",
+            max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+        )
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_world_refs(
+        self,
+        *,
+        default_universe_id: Optional[str] = None,
+        default_world_id: Optional[str] = None,
+        spawn_world_id: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Update universe/world references in one revision bump."""
+        self.ensure_not_deleted()
+
+        if default_universe_id is not None:
+            self.default_universe_id = normalize_optional_text(
+                default_universe_id,
+                field_name="default_universe_id",
+                max_length=PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH,
+            )
+
+        if default_world_id is not None:
+            self.default_world_id = normalize_optional_text(
+                default_world_id,
+                field_name="default_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            )
+
+        if spawn_world_id is not None:
+            self.spawn_world_id = normalize_optional_text(
+                spawn_world_id,
+                field_name="spawn_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            )
+
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_external_app_link(
+        self,
+        *,
+        external_app_project_id: Optional[str],
+        source_service: Optional[str] = "vectoplan-app",
+        external_url: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Link or clear this chunk project to a vectoplan-app project.
+
+        This is not a database foreign key. It is a stable service-reference id.
+        """
+        self.ensure_not_deleted()
+        self.external_app_project_id = normalize_external_app_project_id(
+            external_app_project_id,
+        )
+        self.source_service = normalize_optional_text(
+            source_service,
+            field_name="source_service",
+            max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
+        )
+        self.external_url = normalize_optional_text(
+            external_url,
+            field_name="external_url",
+            max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
         )
         self.touch(updated_by_user_id=updated_by_user_id)
 
@@ -839,6 +1219,30 @@ class Project(db.Model):
         self.metadata_json = current
         self.touch(updated_by_user_id=updated_by_user_id)
 
+    def merge_provisioning_metadata(
+        self,
+        *,
+        external_app_project_id: Optional[str] = None,
+        chunk_universe_id: Optional[str] = None,
+        chunk_world_id: Optional[str] = None,
+        route_hints: Optional[Mapping[str, Any]] = None,
+        app_payload: Optional[Mapping[str, Any]] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Merge standard project-provisioning metadata."""
+        metadata_update: Dict[str, Any] = {
+            "schemaVersion": PROJECT_SCHEMA_VERSION,
+            "chunkProjectId": self.project_id,
+            "externalAppProjectId": external_app_project_id or self.external_app_project_id,
+            "chunkUniverseId": chunk_universe_id or self.default_universe_id,
+            "chunkWorldId": chunk_world_id or self.spawn_world_id or self.default_world_id,
+            "sourceService": self.source_service,
+            "routeHints": make_json_safe(route_hints or {}),
+            "appPayload": make_json_safe(app_payload or {}),
+            "linkedAt": datetime_to_iso(utc_now()),
+        }
+        self.update_metadata(metadata_update, updated_by_user_id=updated_by_user_id)
+
     def get_metadata_value(self, key: str, default: Any = None) -> Any:
         """Read one metadata value safely."""
         try:
@@ -861,6 +1265,11 @@ class Project(db.Model):
         - slug
         - description
         - defaultUniverseId / default_universe_id
+        - defaultWorldId / default_world_id
+        - spawnWorldId / spawn_world_id
+        - externalAppProjectId / external_app_project_id
+        - sourceService / source_service
+        - externalUrl / external_url
         - ownerType / owner_type
         - ownerId / owner_id
         - metadata / metadataJson / metadata_json
@@ -902,6 +1311,63 @@ class Project(db.Model):
                 else payload.get("default_universe_id"),
                 field_name="default_universe_id",
                 max_length=PROJECT_DEFAULT_UNIVERSE_ID_MAX_LENGTH,
+            )
+            changed = True
+
+        if "defaultWorldId" in payload or "default_world_id" in payload:
+            self.default_world_id = normalize_optional_text(
+                payload.get("defaultWorldId")
+                if "defaultWorldId" in payload
+                else payload.get("default_world_id"),
+                field_name="default_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            )
+            changed = True
+
+        if "spawnWorldId" in payload or "spawn_world_id" in payload:
+            self.spawn_world_id = normalize_optional_text(
+                payload.get("spawnWorldId")
+                if "spawnWorldId" in payload
+                else payload.get("spawn_world_id"),
+                field_name="spawn_world_id",
+                max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+            )
+            changed = True
+
+        if (
+            "externalAppProjectId" in payload
+            or "external_app_project_id" in payload
+            or "appProjectPublicId" in payload
+            or "app_project_public_id" in payload
+        ):
+            self.external_app_project_id = normalize_external_app_project_id(
+                payload.get("externalAppProjectId")
+                if "externalAppProjectId" in payload
+                else payload.get("external_app_project_id")
+                if "external_app_project_id" in payload
+                else payload.get("appProjectPublicId")
+                if "appProjectPublicId" in payload
+                else payload.get("app_project_public_id")
+            )
+            changed = True
+
+        if "sourceService" in payload or "source_service" in payload:
+            self.source_service = normalize_optional_text(
+                payload.get("sourceService")
+                if "sourceService" in payload
+                else payload.get("source_service"),
+                field_name="source_service",
+                max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
+            )
+            changed = True
+
+        if "externalUrl" in payload or "external_url" in payload:
+            self.external_url = normalize_optional_text(
+                payload.get("externalUrl")
+                if "externalUrl" in payload
+                else payload.get("external_url"),
+                field_name="external_url",
+                max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
             )
             changed = True
 
@@ -1013,6 +1479,52 @@ class Project(db.Model):
             except Exception as exc:
                 errors["defaultUniverseId"] = str(exc)
 
+        if self.default_world_id is not None:
+            try:
+                normalize_optional_text(
+                    self.default_world_id,
+                    field_name="default_world_id",
+                    max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["defaultWorldId"] = str(exc)
+
+        if self.spawn_world_id is not None:
+            try:
+                normalize_optional_text(
+                    self.spawn_world_id,
+                    field_name="spawn_world_id",
+                    max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["spawnWorldId"] = str(exc)
+
+        if self.external_app_project_id is not None:
+            try:
+                normalize_external_app_project_id(self.external_app_project_id)
+            except Exception as exc:
+                errors["externalAppProjectId"] = str(exc)
+
+        if self.source_service is not None:
+            try:
+                normalize_optional_text(
+                    self.source_service,
+                    field_name="source_service",
+                    max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["sourceService"] = str(exc)
+
+        if self.external_url is not None:
+            try:
+                normalize_optional_text(
+                    self.external_url,
+                    field_name="external_url",
+                    max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
+                )
+            except Exception as exc:
+                errors["externalUrl"] = str(exc)
+
         if self.revision is None or int(self.revision) < 1:
             errors["revision"] = "revision must be greater than or equal to 1."
 
@@ -1031,6 +1543,7 @@ class Project(db.Model):
         """
         result: Dict[str, Any] = {
             "projectId": self.project_id,
+            "chunkProjectId": self.project_id,
             "slug": self.slug,
             "name": self.name,
             "description": self.description,
@@ -1038,6 +1551,12 @@ class Project(db.Model):
             "schemaVersion": self.schema_version,
             "revision": self.revision,
             "defaultUniverseId": self.default_universe_id,
+            "defaultWorldId": self.default_world_id,
+            "spawnWorldId": self.spawn_world_id,
+            "externalAppProjectId": self.external_app_project_id,
+            "appProjectPublicId": self.external_app_project_id,
+            "sourceService": self.source_service,
+            "externalUrl": self.external_url,
             "ownerType": self.owner_type,
             "ownerId": self.owner_id,
             "createdByUserId": self.created_by_user_id,
@@ -1050,6 +1569,7 @@ class Project(db.Model):
                 "active": self.is_active,
                 "archived": self.is_archived,
                 "deleted": self.is_deleted,
+                "linkedToAppProject": self.has_external_app_link,
             },
         }
 

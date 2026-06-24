@@ -5,28 +5,28 @@ Explicit default seed bootstrap for the `vectoplan-chunk` service.
 This module owns the controlled default seed path.
 
 Responsibilities:
-- seed the default development Project
-- seed the default development Universe
-- seed the default editable WorldInstance
-- seed the default debug BlockRegistry
-- seed the default debug BlockType entries
-- keep seeding idempotent
-- avoid ORM relationship traversal
-- avoid loading chunks, snapshots, events, commands or object refs
-- protect seed operations with PostgreSQL advisory locks
-- cleanup SQLAlchemy sessions after seed work
-- return serializable results for scripts/logs/status output
+- seed the default development Project,
+- seed the default development Universe,
+- seed the default editable WorldInstance,
+- seed the default debug BlockRegistry,
+- seed the default debug BlockType entries,
+- keep seeding idempotent,
+- repair partial default seed state,
+- avoid loading chunks, snapshots, events, commands or object refs,
+- protect seed operations with PostgreSQL advisory locks,
+- cleanup SQLAlchemy sessions after seed work,
+- return serializable results for scripts/logs/status output.
 
 Important boundaries:
-- no db.create_all() here
-- no Alembic migrations here
-- no chunk generation here
-- no ChunkSnapshot reads here
-- no ChunkEvent reads here
-- no WorldCommandLog reads here
-- no WorldObjectInstance reads here
-- no WorldObjectChunkRef reads here
-- no request handling here
+- no db.create_all() here,
+- no Alembic migrations here,
+- no chunk generation here,
+- no ChunkSnapshot reads here,
+- no ChunkEvent reads here,
+- no WorldCommandLog reads here,
+- no WorldObjectInstance reads here,
+- no WorldObjectChunkRef reads here,
+- no request handling here.
 
 Design rule:
 
@@ -44,18 +44,27 @@ Target default block registry:
     BlockRegistry(registry_id="debug-blocks", registry_version="1")
       -> BlockType(block_type_id="debug_grass")
       -> BlockType(block_type_id="debug_dirt")
+
+World-id rule:
+
+    world_spawn = concrete editable WorldInstance.
+    flat        = provider/template id only.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Final, Mapping, Sequence
 
 try:
-    from flask import Flask
+    from flask import Flask, has_app_context
 except Exception:  # pragma: no cover - partial import environment
     Flask = Any  # type: ignore[misc, assignment]
+
+    def has_app_context() -> bool:  # type: ignore[no-redef]
+        return False
 
 try:
     from extensions import db as default_db
@@ -130,7 +139,7 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v1"
+DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v2"
 
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
 DEFAULT_PROJECT_SLUG: Final[str] = "dev-project"
@@ -164,10 +173,17 @@ DEFAULT_MIN_Y: Final[int] = -8
 DEFAULT_MAX_Y: Final[int] = 64
 DEFAULT_SEED: Final[str] = "dev-seed"
 
+DEFAULT_SPAWN_X: Final[int] = 0
+DEFAULT_SPAWN_Y: Final[int] = 2
+DEFAULT_SPAWN_Z: Final[int] = 0
+DEFAULT_SPAWN_YAW: Final[float] = 0.0
+DEFAULT_SPAWN_PITCH: Final[float] = 0.0
+
 STATUS_COMPLETED: Final[str] = "completed"
 STATUS_SKIPPED: Final[str] = "skipped"
 STATUS_FAILED: Final[str] = "failed"
 STATUS_PARTIAL: Final[str] = "partial"
+STATUS_READY: Final[str] = "ready"
 
 OP_STATUS_OK: Final[str] = "ok"
 OP_STATUS_SKIPPED: Final[str] = "skipped"
@@ -231,13 +247,24 @@ class DefaultSeedResult:
     project_id: str | None = None
     universe_id: str | None = None
     world_id: str | None = None
+    template_id: str | None = None
+    provider_id: str | None = None
+    provider_world_id: str | None = None
     block_registry_id: str | None = None
     block_registry_version: str | None = None
+
+    default_project_ready: bool | None = None
+    default_universe_ready: bool | None = None
+    default_world_ready: bool | None = None
+    block_registry_ready: bool | None = None
+    debug_blocks_ready: bool | None = None
 
     operations: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
 
+    pre_status: dict[str, Any] = field(default_factory=dict)
+    post_status: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -363,6 +390,21 @@ def _safe_dict(value: Any) -> dict[str, Any]:
         except Exception:
             return {}
 
+    try:
+        if is_dataclass(value):
+            return asdict(value)
+    except Exception:
+        pass
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            result = to_dict()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            return {}
+
     return {}
 
 
@@ -451,14 +493,31 @@ def _make_operation(
 
 def _is_flask_app(app: object) -> bool:
     """Return whether object is Flask-like."""
-    if isinstance(app, Flask):
-        return True
+    try:
+        if isinstance(app, Flask):
+            return True
+    except Exception:
+        pass
 
     required_attrs = ("extensions", "config", "logger")
     try:
         return all(hasattr(app, attr_name) for attr_name in required_attrs)
     except Exception:
         return False
+
+
+def _app_context(app: Any) -> Any:
+    """Return app context when no context is active."""
+    try:
+        if has_app_context():
+            return nullcontext()
+    except Exception:
+        return nullcontext()
+
+    try:
+        return app.app_context()
+    except Exception:
+        return nullcontext()
 
 
 def _get_db_extension(db_extension: Any = None) -> Any:
@@ -550,6 +609,23 @@ def _model_supports_column(model_class: Any, column_name: str) -> bool:
     return column_name in _get_model_column_names(model_class)
 
 
+def _object_supports_attr_or_column(obj: Any, name: str) -> bool:
+    """Return whether an object can receive an attribute assignment."""
+    if obj is None:
+        return False
+
+    try:
+        if hasattr(obj, name):
+            return True
+    except Exception:
+        pass
+
+    try:
+        return _model_supports_column(obj.__class__, name)
+    except Exception:
+        return False
+
+
 def _set_attr_if_supported(
     obj: Any,
     name: str,
@@ -557,14 +633,8 @@ def _set_attr_if_supported(
     *,
     overwrite: bool = True,
 ) -> bool:
-    """Set attribute if object supports it."""
-    if obj is None:
-        return False
-
-    try:
-        if not hasattr(obj, name):
-            return False
-    except Exception:
+    """Set attribute if object supports it. Return whether value changed."""
+    if not _object_supports_attr_or_column(obj, name):
         return False
 
     try:
@@ -572,7 +642,10 @@ def _set_attr_if_supported(
     except Exception:
         current_value = None
 
-    if not overwrite and current_value not in (None, ""):
+    if not overwrite and current_value not in (None, "", {}, []):
+        return False
+
+    if current_value == value:
         return False
 
     try:
@@ -594,6 +667,41 @@ def _call_if_available(obj: Any, method_name: str, *args: Any, **kwargs: Any) ->
 
     try:
         method(*args, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
+def _merge_metadata_json(obj: Any, values: Mapping[str, Any]) -> bool:
+    """Merge values into metadata_json if supported."""
+    if not _object_supports_attr_or_column(obj, "metadata_json"):
+        return False
+
+    try:
+        existing = getattr(obj, "metadata_json", None)
+    except Exception:
+        existing = None
+
+    if isinstance(existing, Mapping):
+        current = dict(existing)
+    else:
+        current = {}
+
+    changed = False
+
+    for key, value in values.items():
+        safe_key = _safe_str(key, "")
+        if not safe_key:
+            continue
+        if current.get(safe_key) != value:
+            current[safe_key] = value
+            changed = True
+
+    if not changed:
+        return False
+
+    try:
+        setattr(obj, "metadata_json", current)
         return True
     except Exception:
         return False
@@ -632,20 +740,61 @@ def _instantiate_model(model_class: Any, values: dict[str, Any]) -> Any:
 
 
 def _query_one_by(model_class: Any, **filters: Any) -> Any | None:
-    """Run bounded one_or_none query by filter_by."""
+    """Run one_or_none query by supported filters."""
+    if model_class is None:
+        return None
+
+    supported_filters = {
+        key: value
+        for key, value in filters.items()
+        if value is not None and _model_supports_column(model_class, key)
+    }
+
+    if not supported_filters:
+        return None
+
     try:
-        return model_class.query.filter_by(**filters).one_or_none()
+        query = model_class.query
+        for key, value in supported_filters.items():
+            query = query.filter(getattr(model_class, key) == value)
+        return query.one_or_none()
     except Exception as exc:
         raise RuntimeError(
-            f"Could not query {getattr(model_class, '__name__', model_class)} by {filters}: "
-            f"{_safe_exception_message(exc)}"
+            f"Could not query {getattr(model_class, '__name__', model_class)} by "
+            f"{supported_filters}: {_safe_exception_message(exc)}"
         ) from exc
+
+
+def _query_first_by(model_class: Any, **filters: Any) -> Any | None:
+    """Run first query by supported filters."""
+    if model_class is None:
+        return None
+
+    supported_filters = {
+        key: value
+        for key, value in filters.items()
+        if value is not None and _model_supports_column(model_class, key)
+    }
+
+    if not supported_filters:
+        return None
+
+    try:
+        query = model_class.query
+        for key, value in supported_filters.items():
+            query = query.filter(getattr(model_class, key) == value)
+        return query.first()
+    except Exception:
+        try:
+            return model_class.query.filter_by(**supported_filters).first()
+        except Exception:
+            return None
 
 
 def _exists_by(model_class: Any, **filters: Any) -> bool:
     """Return whether a row exists for filter."""
     try:
-        return _query_one_by(model_class, **filters) is not None
+        return _query_first_by(model_class, **filters) is not None
     except Exception:
         return False
 
@@ -662,116 +811,321 @@ def load_seed_model_classes() -> dict[str, Any]:
     """Load required model classes lazily from model registry."""
     try:
         from models import require_model_class, require_models_ready
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not import model registry helpers: {_safe_exception_message(exc)}"
-        ) from exc
 
-    try:
-        require_models_ready()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Model registry is not ready: {_safe_exception_message(exc)}"
-        ) from exc
-
-    model_names = (
-        "Project",
-        "Universe",
-        "WorldInstance",
-        "BlockRegistry",
-        "BlockType",
-    )
-
-    result: dict[str, Any] = {}
-
-    for model_name in model_names:
         try:
-            result[model_name] = require_model_class(model_name)
+            require_models_ready()
         except Exception as exc:
             raise RuntimeError(
-                f"Required seed model class is unavailable: {model_name}: "
-                f"{_safe_exception_message(exc)}"
+                f"Model registry is not ready: {_safe_exception_message(exc)}"
             ) from exc
 
-    return result
+        model_names = (
+            "Project",
+            "Universe",
+            "WorldInstance",
+            "BlockRegistry",
+            "BlockType",
+        )
+
+        result: dict[str, Any] = {}
+
+        for model_name in model_names:
+            try:
+                result[model_name] = require_model_class(model_name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Required seed model class is unavailable: {model_name}: "
+                    f"{_safe_exception_message(exc)}"
+                ) from exc
+
+        return result
+
+    except Exception:
+        try:
+            from models import BlockRegistry, BlockType, Project, Universe, WorldInstance
+
+            return {
+                "Project": Project,
+                "Universe": Universe,
+                "WorldInstance": WorldInstance,
+                "BlockRegistry": BlockRegistry,
+                "BlockType": BlockType,
+            }
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not import seed model classes: {_safe_exception_message(exc)}"
+            ) from exc
 
 
 # -----------------------------------------------------------------------------
-# Settings resolution
+# Settings/default resolution
 # -----------------------------------------------------------------------------
 
-def _fallback_world_defaults() -> Any:
+def _config_get(app: Any, key: str, default: Any = None) -> Any:
+    """Read app.config robustly."""
+    try:
+        return app.config.get(key, default)
+    except Exception:
+        return default
+
+
+def _first_attr(obj: Any, names: Sequence[str], default: Any = None) -> Any:
+    """Return first non-empty attribute from object."""
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            value = None
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _provider_like_id(value: Any, *, template_id: str, provider_id: str, provider_world_id: str) -> bool:
+    """Return whether value looks like provider/template id."""
+    text = _safe_str(value, "").lower()
+    if not text:
+        return False
+
+    return text in {
+        DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+        template_id.lower(),
+        provider_id.lower(),
+        provider_world_id.lower(),
+    }
+
+
+def _resolve_template_id(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            ("template_id", "world_template_id", "default_template_id", "templateId"),
+            DEFAULT_TEMPLATE_ID,
+        ),
+        DEFAULT_TEMPLATE_ID,
+    )
+
+
+def _resolve_provider_id(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            ("provider_id", "default_provider_id", "providerId"),
+            DEFAULT_PROVIDER_ID,
+        ),
+        DEFAULT_PROVIDER_ID,
+    )
+
+
+def _resolve_provider_world_id(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            ("provider_world_id", "default_provider_world_id", "providerWorldId"),
+            DEFAULT_PROVIDER_WORLD_ID,
+        ),
+        DEFAULT_PROVIDER_WORLD_ID,
+    )
+
+
+def _resolve_world_id(world_defaults: Any) -> str:
+    """Resolve concrete editable default world id."""
+    template_id = _resolve_template_id(world_defaults)
+    provider_id = _resolve_provider_id(world_defaults)
+    provider_world_id = _resolve_provider_world_id(world_defaults)
+
+    candidate = _first_attr(
+        world_defaults,
+        (
+            "world_id",
+            "default_world_id",
+            "instance_world_id",
+            "default_instance_world_id",
+            "spawn_world_id",
+            "worldId",
+            "defaultWorldId",
+        ),
+        DEFAULT_WORLD_ID,
+    )
+    resolved = _safe_str(candidate, DEFAULT_WORLD_ID)
+
+    if _provider_like_id(
+        resolved,
+        template_id=template_id,
+        provider_id=provider_id,
+        provider_world_id=provider_world_id,
+    ):
+        return DEFAULT_WORLD_ID
+
+    return resolved or DEFAULT_WORLD_ID
+
+
+def _resolve_project_id(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("project_id", "default_project_id", "projectId"), DEFAULT_PROJECT_ID),
+        DEFAULT_PROJECT_ID,
+    )
+
+
+def _resolve_project_slug(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("project_slug", "default_project_slug", "projectSlug"), DEFAULT_PROJECT_SLUG),
+        DEFAULT_PROJECT_SLUG,
+    )
+
+
+def _resolve_project_name(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("project_name", "default_project_name", "projectName"), DEFAULT_PROJECT_NAME),
+        DEFAULT_PROJECT_NAME,
+    )
+
+
+def _resolve_universe_id(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("universe_id", "default_universe_id", "universeId"), DEFAULT_UNIVERSE_ID),
+        DEFAULT_UNIVERSE_ID,
+    )
+
+
+def _resolve_universe_slug(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("universe_slug", "default_universe_slug", "universeSlug"), DEFAULT_UNIVERSE_SLUG),
+        DEFAULT_UNIVERSE_SLUG,
+    )
+
+
+def _resolve_universe_name(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("universe_name", "default_universe_name", "universeName"), DEFAULT_UNIVERSE_NAME),
+        DEFAULT_UNIVERSE_NAME,
+    )
+
+
+def _resolve_world_slug(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("world_slug", "default_world_slug", "worldSlug"), DEFAULT_WORLD_SLUG),
+        DEFAULT_WORLD_SLUG,
+    )
+
+
+def _resolve_world_name(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(world_defaults, ("world_name", "default_world_name", "worldName"), DEFAULT_WORLD_NAME),
+        DEFAULT_WORLD_NAME,
+    )
+
+
+def _resolve_block_registry_id_from_world(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            ("block_registry_id", "default_block_registry_id", "blockRegistryId"),
+            DEFAULT_BLOCK_REGISTRY_ID,
+        ),
+        DEFAULT_BLOCK_REGISTRY_ID,
+    )
+
+
+def _resolve_block_registry_version_from_world(world_defaults: Any) -> str:
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            ("block_registry_version", "default_block_registry_version", "blockRegistryVersion"),
+            DEFAULT_BLOCK_REGISTRY_VERSION,
+        ),
+        DEFAULT_BLOCK_REGISTRY_VERSION,
+    )
+
+
+def _fallback_world_defaults(app: Any = None) -> Any:
     """Create fallback world defaults object."""
 
     class FallbackWorldDefaults:
-        project_id = DEFAULT_PROJECT_ID
-        project_slug = DEFAULT_PROJECT_SLUG
-        project_name = DEFAULT_PROJECT_NAME
+        project_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
+        project_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG", project_id), project_id)
+        project_name = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_NAME", DEFAULT_PROJECT_NAME), DEFAULT_PROJECT_NAME)
 
-        universe_id = DEFAULT_UNIVERSE_ID
-        universe_slug = DEFAULT_UNIVERSE_SLUG
-        universe_name = DEFAULT_UNIVERSE_NAME
+        universe_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
+        universe_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG", universe_id), universe_id)
+        universe_name = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_NAME", DEFAULT_UNIVERSE_NAME), DEFAULT_UNIVERSE_NAME)
 
-        world_id = DEFAULT_WORLD_ID
-        world_slug = DEFAULT_WORLD_SLUG
-        world_name = DEFAULT_WORLD_NAME
+        template_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", DEFAULT_TEMPLATE_ID), DEFAULT_TEMPLATE_ID)
+        provider_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", DEFAULT_PROVIDER_ID), DEFAULT_PROVIDER_ID)
+        provider_world_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", DEFAULT_PROVIDER_WORLD_ID), DEFAULT_PROVIDER_WORLD_ID)
 
-        template_id = DEFAULT_TEMPLATE_ID
-        provider_id = DEFAULT_PROVIDER_ID
-        provider_world_id = DEFAULT_PROVIDER_WORLD_ID
+        raw_world_id = _safe_str(
+            _config_get(
+                app,
+                "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
+                _config_get(app, "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID", DEFAULT_WORLD_ID),
+            ),
+            DEFAULT_WORLD_ID,
+        )
+        world_id = DEFAULT_WORLD_ID if _provider_like_id(
+            raw_world_id,
+            template_id=template_id,
+            provider_id=provider_id,
+            provider_world_id=provider_world_id,
+        ) else raw_world_id
 
-        world_type = "runtime-world"
-        world_role = "default_spawn"
-        world_scope = "project"
-        world_owner_type = "project"
+        world_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG", DEFAULT_WORLD_SLUG), DEFAULT_WORLD_SLUG)
+        world_name = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_NAME", DEFAULT_WORLD_NAME), DEFAULT_WORLD_NAME)
 
-        generator_type = DEFAULT_GENERATOR_TYPE
-        generator_version = DEFAULT_GENERATOR_VERSION
-        projection_type = DEFAULT_PROJECTION_TYPE
-        topology_type = DEFAULT_TOPOLOGY_TYPE
-        coordinate_system = DEFAULT_COORDINATE_SYSTEM
+        world_type = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_WORLD_TYPE", "runtime-world"), "runtime-world")
+        world_role = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_WORLD_ROLE", "default_spawn"), "default_spawn")
+        world_scope = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_WORLD_SCOPE", "project"), "project")
+        world_owner_type = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_WORLD_OWNER_TYPE", "project"), "project")
 
-        chunk_size = DEFAULT_CHUNK_SIZE
-        cell_size = DEFAULT_CELL_SIZE
-        surface_y = DEFAULT_SURFACE_Y
-        min_y = DEFAULT_MIN_Y
-        max_y = DEFAULT_MAX_Y
-        seed = DEFAULT_SEED
+        generator_type = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_TYPE", DEFAULT_GENERATOR_TYPE), DEFAULT_GENERATOR_TYPE)
+        generator_version = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_VERSION", DEFAULT_GENERATOR_VERSION), DEFAULT_GENERATOR_VERSION)
+        projection_type = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECTION_TYPE", DEFAULT_PROJECTION_TYPE), DEFAULT_PROJECTION_TYPE)
+        topology_type = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_TOPOLOGY_TYPE", DEFAULT_TOPOLOGY_TYPE), DEFAULT_TOPOLOGY_TYPE)
+        coordinate_system = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_COORDINATE_SYSTEM", DEFAULT_COORDINATE_SYSTEM), DEFAULT_COORDINATE_SYSTEM)
 
-        block_registry_id = DEFAULT_BLOCK_REGISTRY_ID
-        block_registry_version = DEFAULT_BLOCK_REGISTRY_VERSION
+        chunk_size = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_CHUNK_SIZE", DEFAULT_CHUNK_SIZE), DEFAULT_CHUNK_SIZE, minimum=1)
+        cell_size = _safe_float(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_CELL_SIZE", DEFAULT_CELL_SIZE), DEFAULT_CELL_SIZE, minimum=0.000001)
+        surface_y = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SURFACE_Y", DEFAULT_SURFACE_Y), DEFAULT_SURFACE_Y)
+        min_y = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_MIN_Y", DEFAULT_MIN_Y), DEFAULT_MIN_Y)
+        max_y = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_MAX_Y", DEFAULT_MAX_Y), DEFAULT_MAX_Y)
+        seed = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SEED", DEFAULT_SEED), DEFAULT_SEED)
 
-        spawn_x = 0
-        spawn_y = 2
-        spawn_z = 0
-        spawn_yaw = 0.0
-        spawn_pitch = 0.0
+        block_registry_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+        block_registry_version = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", DEFAULT_BLOCK_REGISTRY_VERSION), DEFAULT_BLOCK_REGISTRY_VERSION)
+
+        spawn_x = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", DEFAULT_SPAWN_X), DEFAULT_SPAWN_X)
+        spawn_y = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", DEFAULT_SPAWN_Y), DEFAULT_SPAWN_Y)
+        spawn_z = _safe_int(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", DEFAULT_SPAWN_Z), DEFAULT_SPAWN_Z)
+        spawn_yaw = _safe_float(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", DEFAULT_SPAWN_YAW), DEFAULT_SPAWN_YAW)
+        spawn_pitch = _safe_float(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", DEFAULT_SPAWN_PITCH), DEFAULT_SPAWN_PITCH)
 
     return FallbackWorldDefaults()
 
 
-def _fallback_block_defaults() -> Any:
+def _fallback_block_defaults(app: Any = None) -> Any:
     """Create fallback block defaults object."""
 
     class FallbackBlockDefaults:
-        registry_id = DEFAULT_BLOCK_REGISTRY_ID
-        registry_version = DEFAULT_BLOCK_REGISTRY_VERSION
+        registry_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+        registry_version = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", DEFAULT_BLOCK_REGISTRY_VERSION), DEFAULT_BLOCK_REGISTRY_VERSION)
         seed_debug_grass = True
         seed_debug_dirt = True
 
     return FallbackBlockDefaults()
 
 
-def _fallback_seed_settings() -> Any:
+def _fallback_seed_settings(app: Any = None) -> Any:
     """Create fallback seed settings object."""
 
     class FallbackSeedSettings:
-        seed_defaults = False
-        seed_debug_blocks = False
-        seed_dev_project = False
-        seed_on_empty_only = True
-        advisory_lock_enabled = True
-        fail_on_error = True
+        seed_defaults = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", False), False)
+        seed_debug_blocks = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", seed_defaults), seed_defaults)
+        seed_dev_project = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_DEV_PROJECT", seed_defaults), seed_defaults)
+        seed_on_empty_only = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY", True), True)
+        advisory_lock_enabled = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK", True), True)
+        fail_on_error = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR", True), True)
 
     return FallbackSeedSettings()
 
@@ -796,7 +1150,7 @@ def resolve_world_defaults(app: Any = None, world_defaults: WorldDefaultsSetting
     except Exception:
         pass
 
-    return _fallback_world_defaults()
+    return _fallback_world_defaults(app)
 
 
 def resolve_block_defaults(app: Any = None, block_defaults: BlockDefaultsSettings | None = None) -> Any:
@@ -819,7 +1173,7 @@ def resolve_block_defaults(app: Any = None, block_defaults: BlockDefaultsSetting
     except Exception:
         pass
 
-    return _fallback_block_defaults()
+    return _fallback_block_defaults(app)
 
 
 def resolve_seed_settings(app: Any = None, seed_settings: SeedBootstrapSettings | None = None) -> Any:
@@ -842,7 +1196,7 @@ def resolve_seed_settings(app: Any = None, seed_settings: SeedBootstrapSettings 
     except Exception:
         pass
 
-    return _fallback_seed_settings()
+    return _fallback_seed_settings(app)
 
 
 # -----------------------------------------------------------------------------
@@ -865,11 +1219,15 @@ def find_default_block_registry(
         DEFAULT_BLOCK_REGISTRY_VERSION,
     )
 
-    return _query_one_by(
+    registry = _query_first_by(
         BlockRegistry,
         registry_id=registry_id,
         registry_version=registry_version,
     )
+    if registry is not None:
+        return registry
+
+    return _query_first_by(BlockRegistry, registry_id=registry_id)
 
 
 def find_default_project(
@@ -878,11 +1236,8 @@ def find_default_project(
 ) -> Any | None:
     """Find default project by stable project_id."""
     Project = models["Project"]
-    project_id = _safe_str(
-        getattr(world_defaults, "project_id", DEFAULT_PROJECT_ID),
-        DEFAULT_PROJECT_ID,
-    )
-    return _query_one_by(Project, project_id=project_id)
+    project_id = _resolve_project_id(world_defaults)
+    return _query_first_by(Project, project_id=project_id)
 
 
 def find_default_universe(
@@ -892,20 +1247,21 @@ def find_default_universe(
 ) -> Any | None:
     """Find default universe by project_db_id + universe_id."""
     Universe = models["Universe"]
-    project_id = _safe_model_id(project)
-    universe_id = _safe_str(
-        getattr(world_defaults, "universe_id", DEFAULT_UNIVERSE_ID),
-        DEFAULT_UNIVERSE_ID,
-    )
+    project_db_id = _safe_model_id(project)
+    universe_id = _resolve_universe_id(world_defaults)
 
-    if project_id is None:
+    if project_db_id is None:
         return None
 
-    return _query_one_by(
+    universe = _query_first_by(
         Universe,
-        project_db_id=project_id,
+        project_db_id=project_db_id,
         universe_id=universe_id,
     )
+    if universe is not None:
+        return universe
+
+    return _query_first_by(Universe, universe_id=universe_id)
 
 
 def find_default_world(
@@ -915,20 +1271,21 @@ def find_default_world(
 ) -> Any | None:
     """Find default world by universe_db_id + world_id."""
     WorldInstance = models["WorldInstance"]
-    universe_id = _safe_model_id(universe)
-    world_id = _safe_str(
-        getattr(world_defaults, "world_id", DEFAULT_WORLD_ID),
-        DEFAULT_WORLD_ID,
-    )
+    universe_db_id = _safe_model_id(universe)
+    world_id = _resolve_world_id(world_defaults)
 
-    if universe_id is None:
+    if universe_db_id is None:
         return None
 
-    return _query_one_by(
+    world = _query_first_by(
         WorldInstance,
-        universe_db_id=universe_id,
+        universe_db_id=universe_db_id,
         world_id=world_id,
     )
+    if world is not None:
+        return world
+
+    return _query_first_by(WorldInstance, world_id=world_id)
 
 
 def default_debug_blocks_exist(
@@ -941,10 +1298,10 @@ def default_debug_blocks_exist(
         return False
 
     BlockType = models["BlockType"]
-    registry_id = _safe_model_id(registry)
+    registry_db_id = _safe_model_id(registry)
 
-    if registry_id is None:
-        return False
+    registry_id = _safe_str(getattr(registry, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+    registry_version = _safe_str(getattr(registry, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION), DEFAULT_BLOCK_REGISTRY_VERSION)
 
     expected_blocks: list[str] = []
 
@@ -954,12 +1311,22 @@ def default_debug_blocks_exist(
         expected_blocks.append("debug_dirt")
 
     for block_type_id in expected_blocks:
-        if not _exists_by(
+        if registry_db_id is not None and _exists_by(
             BlockType,
-            registry_db_id=registry_id,
+            registry_db_id=registry_db_id,
             block_type_id=block_type_id,
         ):
-            return False
+            continue
+
+        if _exists_by(
+            BlockType,
+            registry_id=registry_id,
+            registry_version=registry_version,
+            block_type_id=block_type_id,
+        ):
+            continue
+
+        return False
 
     return True
 
@@ -1000,34 +1367,70 @@ def is_default_seed_complete(
 
 
 # -----------------------------------------------------------------------------
-# Creation helpers
+# Creation/update helpers
 # -----------------------------------------------------------------------------
 
 def create_project_object(model_class: Any, world_defaults: Any) -> Any:
     """Create Project instance using model factory if available."""
-    project_id = _safe_str(getattr(world_defaults, "project_id", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
-    project_slug = _safe_str(getattr(world_defaults, "project_slug", DEFAULT_PROJECT_SLUG), DEFAULT_PROJECT_SLUG)
-    project_name = _safe_str(getattr(world_defaults, "project_name", DEFAULT_PROJECT_NAME), DEFAULT_PROJECT_NAME)
-    universe_id = _safe_str(getattr(world_defaults, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
+    project_id = _resolve_project_id(world_defaults)
+    project_slug = _resolve_project_slug(world_defaults)
+    project_name = _resolve_project_name(world_defaults)
+    universe_id = _resolve_universe_id(world_defaults)
+    world_id = _resolve_world_id(world_defaults)
 
     metadata_json = {
         "seededBy": "vectoplan-chunk.default_seed",
         "seededAt": _utc_now_iso(),
+        "defaultUniverseId": universe_id,
+        "defaultWorldId": world_id,
+        "spawnWorldId": world_id,
     }
 
-    create_method = getattr(model_class, "create", None)
+    for method_name in ("create_dev_project", "create"):
+        create_method = getattr(model_class, method_name, None)
+        if not callable(create_method):
+            continue
 
-    if callable(create_method):
-        try:
-            return create_method(
-                project_id=project_id,
-                slug=project_slug,
-                name=project_name,
-                default_universe_id=universe_id,
-                metadata_json=metadata_json,
-            )
-        except Exception:
-            pass
+        attempts = (
+            {
+                "project_id": project_id,
+                "slug": project_slug,
+                "name": project_name,
+                "default_universe_id": universe_id,
+                "default_world_id": world_id,
+                "spawn_world_id": world_id,
+                "created_by_user_id": "bootstrap",
+                "metadata_json": metadata_json,
+            },
+            {
+                "project_id": project_id,
+                "slug": project_slug,
+                "name": project_name,
+                "default_universe_id": universe_id,
+                "metadata_json": metadata_json,
+            },
+            {
+                "project_id": project_id,
+                "default_universe_id": universe_id,
+                "default_world_id": world_id,
+                "created_by_user_id": "bootstrap",
+            },
+            {
+                "project_id": project_id,
+                "default_universe_id": universe_id,
+                "created_by_user_id": "bootstrap",
+            },
+        )
+
+        for kwargs in attempts:
+            try:
+                obj = create_method(**kwargs)
+                apply_project_defaults_to_object(obj, world_defaults)
+                return obj
+            except TypeError:
+                continue
+            except Exception:
+                break
 
     values = {
         "project_id": project_id,
@@ -1035,46 +1438,116 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
         "name": project_name,
         "description": "Default development project for VECTOPLAN Chunk Service.",
         "status": "active",
-        "schema_version": "1",
+        "schema_version": "project.schema.v2",
         "revision": 1,
         "default_universe_id": universe_id,
+        "default_world_id": world_id,
+        "spawn_world_id": world_id,
         "owner_type": "system",
         "owner_id": "vectoplan-chunk",
+        "created_by_user_id": "bootstrap",
+        "updated_by_user_id": "bootstrap",
         "metadata_json": metadata_json,
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
     }
-    return _instantiate_model(model_class, values)
+    obj = _instantiate_model(model_class, values)
+    apply_project_defaults_to_object(obj, world_defaults)
+    return obj
+
+
+def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
+    """Apply config-driven project defaults to Project object."""
+    changed = False
+    universe_id = _resolve_universe_id(world_defaults)
+    world_id = _resolve_world_id(world_defaults)
+
+    if _call_if_available(
+        project,
+        "set_world_refs",
+        default_universe_id=universe_id,
+        default_world_id=world_id,
+        spawn_world_id=world_id,
+        updated_by_user_id="bootstrap",
+    ):
+        changed = True
+    else:
+        changed = _set_attr_if_supported(project, "default_universe_id", universe_id, overwrite=True) or changed
+        changed = _set_attr_if_supported(project, "default_world_id", world_id, overwrite=True) or changed
+        changed = _set_attr_if_supported(project, "spawn_world_id", world_id, overwrite=True) or changed
+
+    changed = _set_attr_if_supported(project, "status", "active", overwrite=False) or changed
+    changed = _set_attr_if_supported(project, "updated_by_user_id", "bootstrap", overwrite=True) or changed
+    changed = _merge_metadata_json(
+        project,
+        {
+            "seededBy": "vectoplan-chunk.default_seed",
+            "defaultUniverseId": universe_id,
+            "defaultWorldId": world_id,
+            "spawnWorldId": world_id,
+        },
+    ) or changed
+
+    return changed
 
 
 def create_universe_object(model_class: Any, project: Any, world_defaults: Any) -> Any:
     """Create Universe instance using model factory if available."""
     project_db_id = _safe_model_id(project)
-    universe_id = _safe_str(getattr(world_defaults, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
-    universe_slug = _safe_str(getattr(world_defaults, "universe_slug", DEFAULT_UNIVERSE_SLUG), DEFAULT_UNIVERSE_SLUG)
-    universe_name = _safe_str(getattr(world_defaults, "universe_name", DEFAULT_UNIVERSE_NAME), DEFAULT_UNIVERSE_NAME)
-    world_id = _safe_str(getattr(world_defaults, "world_id", DEFAULT_WORLD_ID), DEFAULT_WORLD_ID)
+    universe_id = _resolve_universe_id(world_defaults)
+    universe_slug = _resolve_universe_slug(world_defaults)
+    universe_name = _resolve_universe_name(world_defaults)
+    world_id = _resolve_world_id(world_defaults)
 
     metadata_json = {
         "seededBy": "vectoplan-chunk.default_seed",
         "seededAt": _utc_now_iso(),
+        "defaultWorldId": world_id,
+        "spawnWorldId": world_id,
     }
 
-    create_method = getattr(model_class, "create", None)
+    for method_name in ("create_for_project", "create"):
+        create_method = getattr(model_class, method_name, None)
+        if not callable(create_method):
+            continue
 
-    if callable(create_method):
-        try:
-            return create_method(
-                project_db_id=project_db_id,
-                universe_id=universe_id,
-                slug=universe_slug,
-                name=universe_name,
-                default_world_id=world_id,
-                spawn_world_id=world_id,
-                metadata_json=metadata_json,
-            )
-        except Exception:
-            pass
+        attempts = (
+            {
+                "project": project,
+                "universe_id": universe_id,
+                "slug": universe_slug,
+                "name": universe_name,
+                "default_world_id": world_id,
+                "spawn_world_id": world_id,
+                "created_by_user_id": "bootstrap",
+                "metadata_json": metadata_json,
+            },
+            {
+                "project_db_id": project_db_id,
+                "universe_id": universe_id,
+                "slug": universe_slug,
+                "name": universe_name,
+                "default_world_id": world_id,
+                "spawn_world_id": world_id,
+                "metadata_json": metadata_json,
+            },
+            {
+                "project_db_id": project_db_id,
+                "universe_id": universe_id,
+                "name": universe_name,
+                "default_world_id": world_id,
+            },
+        )
+
+        for kwargs in attempts:
+            try:
+                obj = create_method(**kwargs)
+                apply_universe_defaults_to_object(obj, project, world_defaults)
+                return obj
+            except TypeError:
+                continue
+            except Exception:
+                break
 
     values = {
         "project_db_id": project_db_id,
@@ -1083,15 +1556,55 @@ def create_universe_object(model_class: Any, project: Any, world_defaults: Any) 
         "name": universe_name,
         "description": "Default development universe for VECTOPLAN Chunk Service.",
         "status": "active",
-        "schema_version": "1",
+        "schema_version": "universe.schema.v2",
         "revision": 1,
+        "universe_role": "default",
+        "universe_scope": "project",
         "default_world_id": world_id,
         "spawn_world_id": world_id,
+        "created_by_user_id": "bootstrap",
+        "updated_by_user_id": "bootstrap",
         "metadata_json": metadata_json,
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
     }
-    return _instantiate_model(model_class, values)
+    obj = _instantiate_model(model_class, values)
+    apply_universe_defaults_to_object(obj, project, world_defaults)
+    return obj
+
+
+def apply_universe_defaults_to_object(universe: Any, project: Any, world_defaults: Any) -> bool:
+    """Apply config-driven universe defaults to Universe object."""
+    changed = False
+    project_db_id = _safe_model_id(project)
+    world_id = _resolve_world_id(world_defaults)
+
+    changed = _set_attr_if_supported(universe, "project_db_id", project_db_id, overwrite=True) or changed
+
+    if _call_if_available(
+        universe,
+        "set_world_defaults",
+        default_world_id=world_id,
+        spawn_world_id=world_id,
+        updated_by_user_id="bootstrap",
+    ):
+        changed = True
+    else:
+        changed = _set_attr_if_supported(universe, "default_world_id", world_id, overwrite=True) or changed
+        changed = _set_attr_if_supported(universe, "spawn_world_id", world_id, overwrite=True) or changed
+
+    changed = _set_attr_if_supported(universe, "status", "active", overwrite=False) or changed
+    changed = _set_attr_if_supported(universe, "updated_by_user_id", "bootstrap", overwrite=True) or changed
+    changed = _merge_metadata_json(
+        universe,
+        {
+            "seededBy": "vectoplan-chunk.default_seed",
+            "defaultWorldId": world_id,
+            "spawnWorldId": world_id,
+        },
+    ) or changed
+
+    return changed
 
 
 def create_world_object(model_class: Any, project: Any, universe: Any, world_defaults: Any) -> Any:
@@ -1099,40 +1612,71 @@ def create_world_object(model_class: Any, project: Any, universe: Any, world_def
     project_db_id = _safe_model_id(project)
     universe_db_id = _safe_model_id(universe)
 
-    world_id = _safe_str(getattr(world_defaults, "world_id", DEFAULT_WORLD_ID), DEFAULT_WORLD_ID)
-    world_slug = _safe_str(getattr(world_defaults, "world_slug", DEFAULT_WORLD_SLUG), DEFAULT_WORLD_SLUG)
-    world_name = _safe_str(getattr(world_defaults, "world_name", DEFAULT_WORLD_NAME), DEFAULT_WORLD_NAME)
+    world_id = _resolve_world_id(world_defaults)
+    world_slug = _resolve_world_slug(world_defaults)
+    world_name = _resolve_world_name(world_defaults)
 
-    template_id = _safe_str(getattr(world_defaults, "template_id", DEFAULT_TEMPLATE_ID), DEFAULT_TEMPLATE_ID)
-    provider_id = _safe_str(getattr(world_defaults, "provider_id", DEFAULT_PROVIDER_ID), DEFAULT_PROVIDER_ID)
-    provider_world_id = _safe_str(
-        getattr(world_defaults, "provider_world_id", DEFAULT_PROVIDER_WORLD_ID),
-        DEFAULT_PROVIDER_WORLD_ID,
-    )
+    template_id = _resolve_template_id(world_defaults)
+    provider_id = _resolve_provider_id(world_defaults)
+    provider_world_id = _resolve_provider_world_id(world_defaults)
 
     metadata_json = {
         "seededBy": "vectoplan-chunk.default_seed",
         "seededAt": _utc_now_iso(),
+        "chunkProjectId": _safe_str(getattr(project, "project_id", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID),
+        "chunkUniverseId": _safe_str(getattr(universe, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID),
+        "chunkWorldId": world_id,
         "templateId": template_id,
+        "providerId": provider_id,
         "providerWorldId": provider_world_id,
     }
 
     create_flat_spawn = getattr(model_class, "create_flat_spawn", None)
 
     if callable(create_flat_spawn):
-        try:
-            world = create_flat_spawn(
-                project_db_id=project_db_id,
-                universe_db_id=universe_db_id,
-                world_id=world_id,
-                slug=world_slug,
-                name=world_name,
-                metadata_json=metadata_json,
-            )
-            apply_world_defaults_to_object(world, world_defaults)
-            return world
-        except Exception:
-            pass
+        attempts = (
+            {
+                "project_db_id": project_db_id,
+                "universe_db_id": universe_db_id,
+                "world_id": world_id,
+                "slug": world_slug,
+                "name": world_name,
+                "created_by_user_id": "bootstrap",
+                "metadata_json": metadata_json,
+                "source_service": "vectoplan-chunk-default-seed",
+                "external_ref": world_id,
+            },
+            {
+                "project": project,
+                "universe": universe,
+                "world_id": world_id,
+                "slug": world_slug,
+                "name": world_name,
+                "created_by_user_id": "bootstrap",
+                "metadata_json": metadata_json,
+                "source_service": "vectoplan-chunk-default-seed",
+                "external_ref": world_id,
+            },
+            {
+                "project_db_id": project_db_id,
+                "universe_db_id": universe_db_id,
+                "world_id": world_id,
+                "slug": world_slug,
+                "name": world_name,
+                "created_by_user_id": "bootstrap",
+                "metadata_json": metadata_json,
+            },
+        )
+
+        for kwargs in attempts:
+            try:
+                world = create_flat_spawn(**kwargs)
+                apply_world_defaults_to_object(world, world_defaults)
+                return world
+            except TypeError:
+                continue
+            except Exception:
+                break
 
     values = {
         "project_db_id": project_db_id,
@@ -1142,7 +1686,7 @@ def create_world_object(model_class: Any, project: Any, universe: Any, world_def
         "name": world_name,
         "description": "Default flat spawn world for VECTOPLAN Chunk Service.",
         "status": "active",
-        "schema_version": "1",
+        "schema_version": "world-instance.schema.v2",
         "revision": 1,
         "template_id": template_id,
         "provider_id": provider_id,
@@ -1162,16 +1706,17 @@ def create_world_object(model_class: Any, project: Any, universe: Any, world_def
         "min_y": _safe_int(getattr(world_defaults, "min_y", DEFAULT_MIN_Y), DEFAULT_MIN_Y),
         "max_y": _safe_int(getattr(world_defaults, "max_y", DEFAULT_MAX_Y), DEFAULT_MAX_Y),
         "seed": _safe_str(getattr(world_defaults, "seed", DEFAULT_SEED), DEFAULT_SEED),
-        "block_registry_id": _safe_str(getattr(world_defaults, "block_registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID),
-        "block_registry_version": _safe_str(
-            getattr(world_defaults, "block_registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
-            DEFAULT_BLOCK_REGISTRY_VERSION,
-        ),
-        "spawn_x": _safe_int(getattr(world_defaults, "spawn_x", 0), 0),
-        "spawn_y": _safe_int(getattr(world_defaults, "spawn_y", 2), 2),
-        "spawn_z": _safe_int(getattr(world_defaults, "spawn_z", 0), 0),
-        "spawn_yaw": _safe_float(getattr(world_defaults, "spawn_yaw", 0.0), 0.0),
-        "spawn_pitch": _safe_float(getattr(world_defaults, "spawn_pitch", 0.0), 0.0),
+        "block_registry_id": _resolve_block_registry_id_from_world(world_defaults),
+        "block_registry_version": _resolve_block_registry_version_from_world(world_defaults),
+        "spawn_x": _safe_int(getattr(world_defaults, "spawn_x", DEFAULT_SPAWN_X), DEFAULT_SPAWN_X),
+        "spawn_y": _safe_int(getattr(world_defaults, "spawn_y", DEFAULT_SPAWN_Y), DEFAULT_SPAWN_Y),
+        "spawn_z": _safe_int(getattr(world_defaults, "spawn_z", DEFAULT_SPAWN_Z), DEFAULT_SPAWN_Z),
+        "spawn_yaw": _safe_float(getattr(world_defaults, "spawn_yaw", DEFAULT_SPAWN_YAW), DEFAULT_SPAWN_YAW),
+        "spawn_pitch": _safe_float(getattr(world_defaults, "spawn_pitch", DEFAULT_SPAWN_PITCH), DEFAULT_SPAWN_PITCH),
+        "source_service": "vectoplan-chunk-default-seed",
+        "external_ref": world_id,
+        "created_by_user_id": "bootstrap",
+        "updated_by_user_id": "bootstrap",
         "metadata_json": metadata_json,
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
@@ -1181,15 +1726,17 @@ def create_world_object(model_class: Any, project: Any, universe: Any, world_def
     return world
 
 
-def apply_world_defaults_to_object(world: Any, world_defaults: Any) -> None:
+def apply_world_defaults_to_object(world: Any, world_defaults: Any) -> bool:
     """Apply config-driven world defaults to an existing/new WorldInstance object."""
+    template_id = _resolve_template_id(world_defaults)
+    provider_id = _resolve_provider_id(world_defaults)
+    provider_world_id = _resolve_provider_world_id(world_defaults)
+    world_id = _resolve_world_id(world_defaults)
+
     assignments = {
-        "template_id": _safe_str(getattr(world_defaults, "template_id", DEFAULT_TEMPLATE_ID), DEFAULT_TEMPLATE_ID),
-        "provider_id": _safe_str(getattr(world_defaults, "provider_id", DEFAULT_PROVIDER_ID), DEFAULT_PROVIDER_ID),
-        "provider_world_id": _safe_str(
-            getattr(world_defaults, "provider_world_id", DEFAULT_PROVIDER_WORLD_ID),
-            DEFAULT_PROVIDER_WORLD_ID,
-        ),
+        "template_id": template_id,
+        "provider_id": provider_id,
+        "provider_world_id": provider_world_id,
         "generator_type": _safe_str(getattr(world_defaults, "generator_type", DEFAULT_GENERATOR_TYPE), DEFAULT_GENERATOR_TYPE),
         "generator_version": _safe_str(getattr(world_defaults, "generator_version", DEFAULT_GENERATOR_VERSION), DEFAULT_GENERATOR_VERSION),
         "projection_type": _safe_str(getattr(world_defaults, "projection_type", DEFAULT_PROJECTION_TYPE), DEFAULT_PROJECTION_TYPE),
@@ -1201,20 +1748,36 @@ def apply_world_defaults_to_object(world: Any, world_defaults: Any) -> None:
         "min_y": _safe_int(getattr(world_defaults, "min_y", DEFAULT_MIN_Y), DEFAULT_MIN_Y),
         "max_y": _safe_int(getattr(world_defaults, "max_y", DEFAULT_MAX_Y), DEFAULT_MAX_Y),
         "seed": _safe_str(getattr(world_defaults, "seed", DEFAULT_SEED), DEFAULT_SEED),
-        "block_registry_id": _safe_str(getattr(world_defaults, "block_registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID),
-        "block_registry_version": _safe_str(
-            getattr(world_defaults, "block_registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
-            DEFAULT_BLOCK_REGISTRY_VERSION,
-        ),
-        "spawn_x": _safe_int(getattr(world_defaults, "spawn_x", 0), 0),
-        "spawn_y": _safe_int(getattr(world_defaults, "spawn_y", 2), 2),
-        "spawn_z": _safe_int(getattr(world_defaults, "spawn_z", 0), 0),
-        "spawn_yaw": _safe_float(getattr(world_defaults, "spawn_yaw", 0.0), 0.0),
-        "spawn_pitch": _safe_float(getattr(world_defaults, "spawn_pitch", 0.0), 0.0),
+        "block_registry_id": _resolve_block_registry_id_from_world(world_defaults),
+        "block_registry_version": _resolve_block_registry_version_from_world(world_defaults),
+        "spawn_x": _safe_int(getattr(world_defaults, "spawn_x", DEFAULT_SPAWN_X), DEFAULT_SPAWN_X),
+        "spawn_y": _safe_int(getattr(world_defaults, "spawn_y", DEFAULT_SPAWN_Y), DEFAULT_SPAWN_Y),
+        "spawn_z": _safe_int(getattr(world_defaults, "spawn_z", DEFAULT_SPAWN_Z), DEFAULT_SPAWN_Z),
+        "spawn_yaw": _safe_float(getattr(world_defaults, "spawn_yaw", DEFAULT_SPAWN_YAW), DEFAULT_SPAWN_YAW),
+        "spawn_pitch": _safe_float(getattr(world_defaults, "spawn_pitch", DEFAULT_SPAWN_PITCH), DEFAULT_SPAWN_PITCH),
+        "source_service": "vectoplan-chunk-default-seed",
+        "external_ref": world_id,
+        "updated_by_user_id": "bootstrap",
     }
 
+    changed = False
     for name, value in assignments.items():
-        _set_attr_if_supported(world, name, value, overwrite=True)
+        changed = _set_attr_if_supported(world, name, value, overwrite=True) or changed
+
+    changed = _merge_metadata_json(
+        world,
+        {
+            "seededBy": "vectoplan-chunk.default_seed",
+            "chunkWorldId": world_id,
+            "templateId": template_id,
+            "providerId": provider_id,
+            "providerWorldId": provider_world_id,
+            "blockRegistryId": assignments["block_registry_id"],
+            "blockRegistryVersion": assignments["block_registry_version"],
+        },
+    ) or changed
+
+    return changed
 
 
 def create_block_registry_object(model_class: Any, block_defaults: Any) -> Any:
@@ -1227,9 +1790,11 @@ def create_block_registry_object(model_class: Any, block_defaults: Any) -> Any:
 
     create_debug_registry = getattr(model_class, "create_debug_registry", None)
 
-    if callable(create_debug_registry) and registry_id == "debug-blocks" and registry_version == "1":
+    if callable(create_debug_registry) and registry_id == DEFAULT_BLOCK_REGISTRY_ID and registry_version == DEFAULT_BLOCK_REGISTRY_VERSION:
         try:
-            return create_debug_registry(is_default=True)
+            registry = create_debug_registry(is_default=True)
+            apply_block_registry_defaults_to_object(registry, block_defaults)
+            return registry
         except Exception:
             pass
 
@@ -1237,12 +1802,14 @@ def create_block_registry_object(model_class: Any, block_defaults: Any) -> Any:
 
     if callable(create_method):
         try:
-            return create_method(
+            registry = create_method(
                 registry_id=registry_id,
                 registry_version=registry_version,
                 label=f"{registry_id} {registry_version}",
                 is_default=True,
             )
+            apply_block_registry_defaults_to_object(registry, block_defaults)
+            return registry
         except Exception:
             pass
 
@@ -1253,15 +1820,44 @@ def create_block_registry_object(model_class: Any, block_defaults: Any) -> Any:
         "description": "Default debug block registry for VECTOPLAN Chunk Service.",
         "status": "active",
         "is_default": True,
-        "schema_version": "1",
+        "schema_version": "block-registry.schema.v1",
+        "revision": 1,
         "metadata_json": {
             "seededBy": "vectoplan-chunk.default_seed",
             "seededAt": _utc_now_iso(),
         },
+        "created_by_user_id": "bootstrap",
+        "updated_by_user_id": "bootstrap",
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
     }
-    return _instantiate_model(model_class, values)
+    registry = _instantiate_model(model_class, values)
+    apply_block_registry_defaults_to_object(registry, block_defaults)
+    return registry
+
+
+def apply_block_registry_defaults_to_object(registry: Any, block_defaults: Any) -> bool:
+    """Apply default registry values."""
+    changed = False
+    registry_id = _safe_str(getattr(block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+    registry_version = _safe_str(getattr(block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION), DEFAULT_BLOCK_REGISTRY_VERSION)
+
+    changed = _set_attr_if_supported(registry, "registry_id", registry_id, overwrite=True) or changed
+    changed = _set_attr_if_supported(registry, "registry_version", registry_version, overwrite=True) or changed
+    changed = _set_attr_if_supported(registry, "label", f"{registry_id} {registry_version}", overwrite=False) or changed
+    changed = _set_attr_if_supported(registry, "status", "active", overwrite=False) or changed
+    changed = _set_attr_if_supported(registry, "is_default", True, overwrite=True) or changed
+    changed = _set_attr_if_supported(registry, "updated_by_user_id", "bootstrap", overwrite=True) or changed
+    changed = _merge_metadata_json(
+        registry,
+        {
+            "seededBy": "vectoplan-chunk.default_seed",
+            "registryId": registry_id,
+            "registryVersion": registry_version,
+        },
+    ) or changed
+
+    return changed
 
 
 def create_debug_block_object(model_class: Any, registry: Any, block_type_id: str) -> Any:
@@ -1272,7 +1868,9 @@ def create_debug_block_object(model_class: Any, registry: Any, block_type_id: st
         factory = getattr(model_class, "create_debug_grass", None)
         if callable(factory):
             try:
-                return factory(registry)
+                block = factory(registry)
+                apply_debug_block_defaults_to_object(block, registry, block_type_id)
+                return block
             except Exception:
                 pass
 
@@ -1283,7 +1881,9 @@ def create_debug_block_object(model_class: Any, registry: Any, block_type_id: st
         factory = getattr(model_class, "create_debug_dirt", None)
         if callable(factory):
             try:
-                return factory(registry)
+                block = factory(registry)
+                apply_debug_block_defaults_to_object(block, registry, block_type_id)
+                return block
             except Exception:
                 pass
 
@@ -1305,7 +1905,7 @@ def create_debug_block_object(model_class: Any, registry: Any, block_type_id: st
 
     if callable(create_method):
         try:
-            return create_method(
+            block = create_method(
                 registry=registry,
                 block_type_id=block_type_id,
                 label=label,
@@ -1319,6 +1919,8 @@ def create_debug_block_object(model_class: Any, registry: Any, block_type_id: st
                     "seededAt": _utc_now_iso(),
                 },
             )
+            apply_debug_block_defaults_to_object(block, registry, block_type_id)
+            return block
         except Exception:
             pass
 
@@ -1339,10 +1941,55 @@ def create_debug_block_object(model_class: Any, registry: Any, block_type_id: st
             "seededBy": "vectoplan-chunk.default_seed",
             "seededAt": _utc_now_iso(),
         },
+        "created_by_user_id": "bootstrap",
+        "updated_by_user_id": "bootstrap",
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
     }
-    return _instantiate_model(model_class, values)
+    block = _instantiate_model(model_class, values)
+    apply_debug_block_defaults_to_object(block, registry, block_type_id)
+    return block
+
+
+def apply_debug_block_defaults_to_object(block: Any, registry: Any, block_type_id: str) -> bool:
+    """Apply debug block default values."""
+    changed = False
+    block_type_id = _safe_str(block_type_id, "")
+    registry_db_id = _safe_model_id(registry)
+    registry_id = _safe_str(getattr(registry, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+    registry_version = _safe_str(getattr(registry, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION), DEFAULT_BLOCK_REGISTRY_VERSION)
+
+    if block_type_id == "debug_grass":
+        label = "Debug Grass"
+        color = "#54b948"
+    elif block_type_id == "debug_dirt":
+        label = "Debug Dirt"
+        color = "#8b5a2b"
+    else:
+        label = block_type_id.replace("_", " ").title()
+        color = "#cccccc"
+
+    changed = _set_attr_if_supported(block, "registry_db_id", registry_db_id, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "registry_id", registry_id, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "registry_version", registry_version, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "block_type_id", block_type_id, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "label", label, overwrite=False) or changed
+    changed = _set_attr_if_supported(block, "name", label, overwrite=False) or changed
+    changed = _set_attr_if_supported(block, "status", "active", overwrite=False) or changed
+    changed = _set_attr_if_supported(block, "solid", True, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "placeable", True, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "breakable", True, overwrite=True) or changed
+    changed = _set_attr_if_supported(block, "updated_by_user_id", "bootstrap", overwrite=True) or changed
+    changed = _merge_metadata_json(
+        block,
+        {
+            "debug": True,
+            "color": color,
+            "seededBy": "vectoplan-chunk.default_seed",
+        },
+    ) or changed
+
+    return changed
 
 
 # -----------------------------------------------------------------------------
@@ -1369,11 +2016,7 @@ def seed_debug_blocks(
     )
 
     started_at = _utc_now_iso()
-    registry = _query_one_by(
-        BlockRegistry,
-        registry_id=registry_id,
-        registry_version=registry_version,
-    )
+    registry = find_default_block_registry(models, block_defaults)
 
     if registry is None:
         registry = create_block_registry_object(BlockRegistry, block_defaults)
@@ -1396,13 +2039,18 @@ def seed_debug_blocks(
             )
         )
     else:
+        updated = apply_block_registry_defaults_to_object(registry, block_defaults)
+        if updated:
+            _flush_session(db_extension)
+
         operations.append(
             _make_operation(
                 name="block_registry",
                 ok=True,
-                status=OP_STATUS_SKIPPED,
-                skipped=True,
-                message="Block registry already exists.",
+                status=OP_STATUS_OK if updated else OP_STATUS_SKIPPED,
+                updated=updated,
+                skipped=not updated,
+                message="Block registry updated." if updated else "Block registry already exists.",
                 started_at=started_at,
                 data={
                     "registryId": registry_id,
@@ -1424,11 +2072,18 @@ def seed_debug_blocks(
 
     for block_type_id in expected_block_ids:
         op_started = _utc_now_iso()
-        block = _query_one_by(
+        block = _query_first_by(
             BlockType,
             registry_db_id=registry_db_id,
             block_type_id=block_type_id,
         )
+        if block is None:
+            block = _query_first_by(
+                BlockType,
+                registry_id=registry_id,
+                registry_version=registry_version,
+                block_type_id=block_type_id,
+            )
 
         if block is None:
             block = create_debug_block_object(BlockType, registry, block_type_id)
@@ -1452,13 +2107,18 @@ def seed_debug_blocks(
                 )
             )
         else:
+            updated = apply_debug_block_defaults_to_object(block, registry, block_type_id)
+            if updated:
+                _flush_session(db_extension)
+
             operations.append(
                 _make_operation(
                     name=f"block_type:{block_type_id}",
                     ok=True,
-                    status=OP_STATUS_SKIPPED,
-                    skipped=True,
-                    message="Debug block type already exists.",
+                    status=OP_STATUS_OK if updated else OP_STATUS_SKIPPED,
+                    updated=updated,
+                    skipped=not updated,
+                    message="Debug block type updated." if updated else "Debug block type already exists.",
                     started_at=op_started,
                     data={
                         "blockTypeId": block_type_id,
@@ -1486,13 +2146,13 @@ def seed_dev_project_universe_world(
     Universe = models["Universe"]
     WorldInstance = models["WorldInstance"]
 
-    project_id = _safe_str(getattr(world_defaults, "project_id", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
-    universe_id = _safe_str(getattr(world_defaults, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
-    world_id = _safe_str(getattr(world_defaults, "world_id", DEFAULT_WORLD_ID), DEFAULT_WORLD_ID)
+    project_id = _resolve_project_id(world_defaults)
+    universe_id = _resolve_universe_id(world_defaults)
+    world_id = _resolve_world_id(world_defaults)
 
     # Project
     started_at = _utc_now_iso()
-    project = _query_one_by(Project, project_id=project_id)
+    project = _query_first_by(Project, project_id=project_id)
 
     if project is None:
         project = create_project_object(Project, world_defaults)
@@ -1510,22 +2170,15 @@ def seed_dev_project_universe_world(
                 data={
                     "projectId": project_id,
                     "projectDbId": _safe_model_id(project),
+                    "defaultUniverseId": universe_id,
+                    "defaultWorldId": world_id,
                 },
             )
         )
     else:
-        updated = False
-
-        if not _safe_str(getattr(project, "default_universe_id", ""), ""):
-            if not _call_if_available(project, "set_default_universe_id", universe_id):
-                updated = _set_attr_if_supported(
-                    project,
-                    "default_universe_id",
-                    universe_id,
-                    overwrite=True,
-                )
-            else:
-                updated = True
+        updated = apply_project_defaults_to_object(project, world_defaults)
+        if updated:
+            _flush_session(db_extension)
 
         operations.append(
             _make_operation(
@@ -1539,6 +2192,8 @@ def seed_dev_project_universe_world(
                 data={
                     "projectId": project_id,
                     "projectDbId": _safe_model_id(project),
+                    "defaultUniverseId": universe_id,
+                    "defaultWorldId": world_id,
                 },
             )
         )
@@ -1549,11 +2204,13 @@ def seed_dev_project_universe_world(
 
     # Universe
     started_at = _utc_now_iso()
-    universe = _query_one_by(
+    universe = _query_first_by(
         Universe,
         project_db_id=project_db_id,
         universe_id=universe_id,
     )
+    if universe is None:
+        universe = _query_first_by(Universe, universe_id=universe_id)
 
     if universe is None:
         universe = create_universe_object(Universe, project, world_defaults)
@@ -1572,33 +2229,14 @@ def seed_dev_project_universe_world(
                     "projectId": project_id,
                     "universeId": universe_id,
                     "universeDbId": _safe_model_id(universe),
+                    "defaultWorldId": world_id,
                 },
             )
         )
     else:
-        updated = False
-
-        if not _safe_str(getattr(universe, "default_world_id", ""), ""):
-            if not _call_if_available(universe, "set_default_world_id", world_id):
-                updated = _set_attr_if_supported(
-                    universe,
-                    "default_world_id",
-                    world_id,
-                    overwrite=True,
-                )
-            else:
-                updated = True
-
-        if not _safe_str(getattr(universe, "spawn_world_id", ""), ""):
-            if not _call_if_available(universe, "set_spawn_world_id", world_id):
-                updated = _set_attr_if_supported(
-                    universe,
-                    "spawn_world_id",
-                    world_id,
-                    overwrite=True,
-                ) or updated
-            else:
-                updated = True
+        updated = apply_universe_defaults_to_object(universe, project, world_defaults)
+        if updated:
+            _flush_session(db_extension)
 
         operations.append(
             _make_operation(
@@ -1613,6 +2251,7 @@ def seed_dev_project_universe_world(
                     "projectId": project_id,
                     "universeId": universe_id,
                     "universeDbId": _safe_model_id(universe),
+                    "defaultWorldId": world_id,
                 },
             )
         )
@@ -1623,11 +2262,13 @@ def seed_dev_project_universe_world(
 
     # World
     started_at = _utc_now_iso()
-    world = _query_one_by(
+    world = _query_first_by(
         WorldInstance,
         universe_db_id=universe_db_id,
         world_id=world_id,
     )
+    if world is None:
+        world = _query_first_by(WorldInstance, world_id=world_id)
 
     if world is None:
         world = create_world_object(WorldInstance, project, universe, world_defaults)
@@ -1653,16 +2294,22 @@ def seed_dev_project_universe_world(
             )
         )
     else:
-        # Keep existing world aligned with config-driven runtime constants.
-        apply_world_defaults_to_object(world, world_defaults)
+        updated = False
+        updated = _set_attr_if_supported(world, "project_db_id", project_db_id, overwrite=True) or updated
+        updated = _set_attr_if_supported(world, "universe_db_id", universe_db_id, overwrite=True) or updated
+        updated = apply_world_defaults_to_object(world, world_defaults) or updated
+
+        if updated:
+            _flush_session(db_extension)
 
         operations.append(
             _make_operation(
                 name="world",
                 ok=True,
-                status=OP_STATUS_SKIPPED,
-                skipped=True,
-                message="World already exists.",
+                status=OP_STATUS_OK if updated else OP_STATUS_SKIPPED,
+                updated=updated,
+                skipped=not updated,
+                message="World updated." if updated else "World already exists.",
                 started_at=started_at,
                 data={
                     "projectId": project_id,
@@ -1718,261 +2365,328 @@ def run_default_seed(
         )
         return _finish_result(result)
 
-    db_obj = _get_db_extension(db_extension)
-    if db_obj is None:
-        result.errors.append(
-            _make_message(
-                code="db_extension_unavailable",
-                message="SQLAlchemy db extension is unavailable.",
+    with _app_context(app):
+        db_obj = _get_db_extension(db_extension)
+        if db_obj is None:
+            result.errors.append(
+                _make_message(
+                    code="db_extension_unavailable",
+                    message="SQLAlchemy db extension is unavailable.",
+                )
+            )
+            return _finish_or_raise(app, result, True)
+
+        resolved_seed_settings = resolve_seed_settings(app, seed_settings)
+        resolved_world_defaults = resolve_world_defaults(app, world_defaults)
+        resolved_block_defaults = resolve_block_defaults(app, block_defaults)
+
+        resolved_enabled = bool(
+            enabled
+            if enabled is not None
+            else _safe_bool(getattr(resolved_seed_settings, "seed_defaults", False), False)
+        )
+        resolved_seed_blocks = bool(
+            seed_debug_blocks_enabled
+            if seed_debug_blocks_enabled is not None
+            else _safe_bool(
+                getattr(resolved_seed_settings, "seed_debug_blocks", resolved_enabled),
+                resolved_enabled,
             )
         )
-        return _finish_or_raise(app, result, True)
-
-    resolved_seed_settings = resolve_seed_settings(app, seed_settings)
-    resolved_world_defaults = resolve_world_defaults(app, world_defaults)
-    resolved_block_defaults = resolve_block_defaults(app, block_defaults)
-
-    resolved_enabled = bool(
-        enabled
-        if enabled is not None
-        else getattr(resolved_seed_settings, "seed_defaults", False)
-    )
-    resolved_seed_blocks = bool(
-        seed_debug_blocks_enabled
-        if seed_debug_blocks_enabled is not None
-        else getattr(resolved_seed_settings, "seed_debug_blocks", False)
-    )
-    resolved_seed_project = bool(
-        seed_dev_project_enabled
-        if seed_dev_project_enabled is not None
-        else getattr(resolved_seed_settings, "seed_dev_project", False)
-    )
-    resolved_seed_on_empty_only = bool(
-        seed_on_empty_only
-        if seed_on_empty_only is not None
-        else getattr(resolved_seed_settings, "seed_on_empty_only", True)
-    )
-    resolved_fail_on_error = bool(
-        fail_on_error
-        if fail_on_error is not None
-        else getattr(resolved_seed_settings, "fail_on_error", True)
-    )
-    advisory_lock_enabled = bool(getattr(resolved_seed_settings, "advisory_lock_enabled", True))
-
-    result.enabled = resolved_enabled
-    result.seed_defaults_requested = resolved_enabled
-    result.seed_debug_blocks_requested = resolved_seed_blocks
-    result.seed_dev_project_requested = resolved_seed_project
-    result.seed_on_empty_only = resolved_seed_on_empty_only
-
-    result.project_id = _safe_str(getattr(resolved_world_defaults, "project_id", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
-    result.universe_id = _safe_str(getattr(resolved_world_defaults, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
-    result.world_id = _safe_str(getattr(resolved_world_defaults, "world_id", DEFAULT_WORLD_ID), DEFAULT_WORLD_ID)
-    result.block_registry_id = _safe_str(
-        getattr(resolved_block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID),
-        DEFAULT_BLOCK_REGISTRY_ID,
-    )
-    result.block_registry_version = _safe_str(
-        getattr(resolved_block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
-        DEFAULT_BLOCK_REGISTRY_VERSION,
-    )
-
-    result.metadata["advisoryLockEnabled"] = advisory_lock_enabled
-    result.metadata["failOnError"] = resolved_fail_on_error
-
-    try:
-        if build_lock_diagnostics is not None:
-            result.metadata["lockDiagnostics"] = build_lock_diagnostics(app, db_extension)
-    except Exception:
-        pass
-
-    if not resolved_enabled:
-        result.operations.append(
-            _make_operation(
-                name="default_seed",
-                ok=True,
-                status=OP_STATUS_SKIPPED,
-                skipped=True,
-                message="Default seed disabled by settings.",
+        resolved_seed_project = bool(
+            seed_dev_project_enabled
+            if seed_dev_project_enabled is not None
+            else _safe_bool(
+                getattr(resolved_seed_settings, "seed_dev_project", resolved_enabled),
+                resolved_enabled,
             )
         )
-        result.ok = True
-        result.status = STATUS_SKIPPED
-        return _finish_result(result)
-
-    if not resolved_seed_blocks and not resolved_seed_project:
-        result.operations.append(
-            _make_operation(
-                name="default_seed",
-                ok=True,
-                status=OP_STATUS_SKIPPED,
-                skipped=True,
-                message="Default seed enabled, but no seed group is enabled.",
-            )
+        resolved_seed_on_empty_only = bool(
+            seed_on_empty_only
+            if seed_on_empty_only is not None
+            else _safe_bool(getattr(resolved_seed_settings, "seed_on_empty_only", True), True)
         )
-        result.ok = True
-        result.status = STATUS_SKIPPED
-        return _finish_result(result)
-
-    _safe_log_info(app, "Default seed bootstrap started.")
-
-    try:
-        models = load_seed_model_classes()
-    except Exception as exc:
-        message = _safe_exception_message(exc)
-        result.errors.append(
-            _make_message(
-                code="model_registry_failed",
-                message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
-            )
+        resolved_fail_on_error = bool(
+            fail_on_error
+            if fail_on_error is not None
+            else _safe_bool(getattr(resolved_seed_settings, "fail_on_error", True), True)
         )
-        result.operations.append(
-            _make_operation(
-                name="model_registry",
-                ok=False,
-                status=OP_STATUS_FAILED,
-                message=message,
-            )
+        advisory_lock_enabled = _safe_bool(
+            getattr(resolved_seed_settings, "advisory_lock_enabled", True),
+            True,
         )
-        return _finish_or_raise(app, result, resolved_fail_on_error)
 
-    def run_seed_body() -> None:
-        if resolved_seed_on_empty_only and is_default_seed_complete(
-            models,
-            resolved_world_defaults,
-            resolved_block_defaults,
-            require_blocks=resolved_seed_blocks,
-            require_project=resolved_seed_project,
-        ):
-            result.seed_skipped_because_complete = True
+        result.enabled = resolved_enabled
+        result.seed_defaults_requested = resolved_enabled
+        result.seed_debug_blocks_requested = resolved_seed_blocks
+        result.seed_dev_project_requested = resolved_seed_project
+        result.seed_on_empty_only = resolved_seed_on_empty_only
+
+        result.project_id = _resolve_project_id(resolved_world_defaults)
+        result.universe_id = _resolve_universe_id(resolved_world_defaults)
+        result.world_id = _resolve_world_id(resolved_world_defaults)
+        result.template_id = _resolve_template_id(resolved_world_defaults)
+        result.provider_id = _resolve_provider_id(resolved_world_defaults)
+        result.provider_world_id = _resolve_provider_world_id(resolved_world_defaults)
+        result.block_registry_id = _safe_str(
+            getattr(resolved_block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID),
+            DEFAULT_BLOCK_REGISTRY_ID,
+        )
+        result.block_registry_version = _safe_str(
+            getattr(resolved_block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
+            DEFAULT_BLOCK_REGISTRY_VERSION,
+        )
+
+        result.metadata["advisoryLockEnabled"] = advisory_lock_enabled
+        result.metadata["failOnError"] = resolved_fail_on_error
+        result.metadata["defaults"] = {
+            "projectId": result.project_id,
+            "universeId": result.universe_id,
+            "worldId": result.world_id,
+            "templateId": result.template_id,
+            "providerId": result.provider_id,
+            "providerWorldId": result.provider_world_id,
+            "blockRegistryId": result.block_registry_id,
+            "blockRegistryVersion": result.block_registry_version,
+        }
+
+        try:
+            if build_lock_diagnostics is not None:
+                result.metadata["lockDiagnostics"] = build_lock_diagnostics(app, db_extension)
+        except Exception:
+            pass
+
+        if not resolved_enabled:
             result.operations.append(
                 _make_operation(
                     name="default_seed",
                     ok=True,
                     status=OP_STATUS_SKIPPED,
                     skipped=True,
-                    message="Default seed skipped because seed-on-empty-only is enabled and target defaults already exist.",
-                    data={
-                        "seedOnEmptyOnly": True,
-                        "seedDebugBlocks": resolved_seed_blocks,
-                        "seedDevProject": resolved_seed_project,
+                    message="Default seed disabled by settings.",
+                )
+            )
+            result.ok = True
+            result.status = STATUS_SKIPPED
+            return _finish_result(result)
+
+        if not resolved_seed_blocks and not resolved_seed_project:
+            result.operations.append(
+                _make_operation(
+                    name="default_seed",
+                    ok=True,
+                    status=OP_STATUS_SKIPPED,
+                    skipped=True,
+                    message="Default seed enabled, but no seed group is enabled.",
+                )
+            )
+            result.ok = True
+            result.status = STATUS_SKIPPED
+            return _finish_result(result)
+
+        _safe_log_info(app, "Default seed bootstrap started.")
+
+        try:
+            models = load_seed_model_classes()
+        except Exception as exc:
+            message = _safe_exception_message(exc)
+            result.errors.append(
+                _make_message(
+                    code="model_registry_failed",
+                    message=message,
+                    details={
+                        "exceptionType": exc.__class__.__name__,
                     },
                 )
             )
-            return
-
-        if resolved_seed_blocks:
-            result.operations.extend(
-                seed_debug_blocks(
-                    app,
-                    models,
-                    resolved_block_defaults,
-                    db_extension=db_extension,
-                )
-            )
-        else:
             result.operations.append(
                 _make_operation(
-                    name="debug_blocks",
-                    ok=True,
-                    status=OP_STATUS_SKIPPED,
-                    skipped=True,
-                    message="Debug block seeding disabled.",
+                    name="model_registry",
+                    ok=False,
+                    status=OP_STATUS_FAILED,
+                    message=message,
                 )
             )
+            return _finish_or_raise(app, result, resolved_fail_on_error)
 
-        if resolved_seed_project:
-            result.operations.extend(
-                seed_dev_project_universe_world(
-                    app,
-                    models,
-                    resolved_world_defaults,
-                    db_extension=db_extension,
-                )
-            )
-        else:
-            result.operations.append(
-                _make_operation(
-                    name="dev_project",
-                    ok=True,
-                    status=OP_STATUS_SKIPPED,
-                    skipped=True,
-                    message="Dev project seeding disabled.",
-                )
-            )
+        try:
+            result.pre_status = build_default_seed_status(app, db_extension=db_extension)
+        except Exception:
+            result.pre_status = {}
 
-    try:
-        if seed_bootstrap_lock is None:
-            run_seed_body()
-        else:
-            with seed_bootstrap_lock(
-                app,
-                enabled=advisory_lock_enabled,
-                db_extension=db_extension,
-                fail_if_not_acquired=True,
-            ) as lock_result:
-                result.lock_used = bool(not getattr(lock_result, "skipped", False))
-
-                if advisory_lock_result_to_dict is not None:
-                    lock_data = advisory_lock_result_to_dict(lock_result)
-                else:
-                    lock_data = asdict(lock_result)
-
+        def run_seed_body() -> None:
+            if resolved_seed_on_empty_only and is_default_seed_complete(
+                models,
+                resolved_world_defaults,
+                resolved_block_defaults,
+                require_blocks=resolved_seed_blocks,
+                require_project=resolved_seed_project,
+            ):
+                result.seed_skipped_because_complete = True
                 result.operations.append(
                     _make_operation(
-                        name="seed_bootstrap_lock",
-                        ok=bool(lock_result.ok),
-                        status=OP_STATUS_OK if lock_result.ok else OP_STATUS_FAILED,
-                        skipped=bool(getattr(lock_result, "skipped", False)),
-                        message="Seed bootstrap advisory lock acquired or skipped.",
-                        data=lock_data,
+                        name="default_seed",
+                        ok=True,
+                        status=OP_STATUS_SKIPPED,
+                        skipped=True,
+                        message="Default seed skipped because seed-on-empty-only is enabled and target defaults already exist.",
+                        data={
+                            "seedOnEmptyOnly": True,
+                            "seedDebugBlocks": resolved_seed_blocks,
+                            "seedDevProject": resolved_seed_project,
+                        },
+                    )
+                )
+                return
+
+            if resolved_seed_blocks:
+                result.operations.extend(
+                    seed_debug_blocks(
+                        app,
+                        models,
+                        resolved_block_defaults,
+                        db_extension=db_extension,
+                    )
+                )
+            else:
+                result.operations.append(
+                    _make_operation(
+                        name="debug_blocks",
+                        ok=True,
+                        status=OP_STATUS_SKIPPED,
+                        skipped=True,
+                        message="Debug block seeding disabled.",
                     )
                 )
 
-                run_seed_body()
+            if resolved_seed_project:
+                result.operations.extend(
+                    seed_dev_project_universe_world(
+                        app,
+                        models,
+                        resolved_world_defaults,
+                        db_extension=db_extension,
+                    )
+                )
+            else:
+                result.operations.append(
+                    _make_operation(
+                        name="dev_project",
+                        ok=True,
+                        status=OP_STATUS_SKIPPED,
+                        skipped=True,
+                        message="Dev project seeding disabled.",
+                    )
+                )
 
-        if result.errors:
+        try:
+            if seed_bootstrap_lock is None:
+                run_seed_body()
+            else:
+                with seed_bootstrap_lock(
+                    app,
+                    enabled=advisory_lock_enabled,
+                    db_extension=db_extension,
+                    fail_if_not_acquired=True,
+                ) as lock_result:
+                    result.lock_used = bool(not getattr(lock_result, "skipped", False))
+
+                    if advisory_lock_result_to_dict is not None:
+                        lock_data = advisory_lock_result_to_dict(lock_result)
+                    else:
+                        lock_data = asdict(lock_result)
+
+                    result.operations.append(
+                        _make_operation(
+                            name="seed_bootstrap_lock",
+                            ok=bool(lock_result.ok),
+                            status=OP_STATUS_OK if lock_result.ok else OP_STATUS_FAILED,
+                            skipped=bool(getattr(lock_result, "skipped", False)),
+                            message="Seed bootstrap advisory lock acquired or skipped.",
+                            data=lock_data,
+                        )
+                    )
+
+                    run_seed_body()
+
+            if result.errors:
+                _cleanup_db_session(rollback=True, db_extension=db_extension)
+                return _finish_or_raise(app, result, resolved_fail_on_error)
+
+            _commit_session(db_extension)
+
+            result.post_status = build_default_seed_status(app, db_extension=db_extension)
+            _apply_status_to_result(result, result.post_status)
+
+            if resolved_seed_project and not result.default_world_ready:
+                result.errors.append(
+                    _make_message(
+                        code="default_world_not_ready_after_seed",
+                        message="Default concrete world is not ready after seed.",
+                        details=result.post_status,
+                    )
+                )
+
+            if resolved_seed_blocks and not result.debug_blocks_ready:
+                result.errors.append(
+                    _make_message(
+                        code="debug_blocks_not_ready_after_seed",
+                        message="Default debug blocks are not ready after seed.",
+                        details=result.post_status,
+                    )
+                )
+
+            if result.errors:
+                result.ok = False
+                result.status = STATUS_FAILED
+                return _finish_or_raise(app, result, resolved_fail_on_error)
+
+            result.ok = True
+            result.status = STATUS_SKIPPED if result.seed_skipped_because_complete else STATUS_COMPLETED
+            _safe_log_info(app, "Default seed bootstrap completed successfully.")
+            return _finish_result(result)
+
+        except Exception as exc:
             _cleanup_db_session(rollback=True, db_extension=db_extension)
+
+            message = _safe_exception_message(exc)
+            result.errors.append(
+                _make_message(
+                    code="default_seed_exception",
+                    message=message,
+                    details={
+                        "exceptionType": exc.__class__.__name__,
+                    },
+                )
+            )
+            result.operations.append(
+                _make_operation(
+                    name="default_seed",
+                    ok=False,
+                    status=OP_STATUS_FAILED,
+                    message=message,
+                    data={
+                        "exceptionType": exc.__class__.__name__,
+                    },
+                )
+            )
+
             return _finish_or_raise(app, result, resolved_fail_on_error)
 
-        _commit_session(db_extension)
-        result.ok = True
-        result.status = STATUS_SKIPPED if result.seed_skipped_because_complete else STATUS_COMPLETED
-        _safe_log_info(app, "Default seed bootstrap completed successfully.")
-        return _finish_result(result)
+        finally:
+            _cleanup_db_session(rollback=False, db_extension=db_extension)
 
-    except Exception as exc:
-        _cleanup_db_session(rollback=True, db_extension=db_extension)
 
-        message = _safe_exception_message(exc)
-        result.errors.append(
-            _make_message(
-                code="default_seed_exception",
-                message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
-            )
-        )
-        result.operations.append(
-            _make_operation(
-                name="default_seed",
-                ok=False,
-                status=OP_STATUS_FAILED,
-                message=message,
-                data={
-                    "exceptionType": exc.__class__.__name__,
-                },
-            )
-        )
-
-        return _finish_or_raise(app, result, resolved_fail_on_error)
-
-    finally:
-        _cleanup_db_session(rollback=False, db_extension=db_extension)
+def _apply_status_to_result(result: DefaultSeedResult, status: Mapping[str, Any]) -> None:
+    """Apply readiness fields from status payload."""
+    try:
+        result.default_project_ready = _safe_bool((status.get("project") or {}).get("exists"), False)
+        result.default_universe_ready = _safe_bool((status.get("universe") or {}).get("exists"), False)
+        result.default_world_ready = _safe_bool((status.get("world") or {}).get("exists"), False)
+        result.block_registry_ready = _safe_bool((status.get("blockRegistry") or {}).get("exists"), False)
+        result.debug_blocks_ready = _safe_bool((status.get("debugBlocks") or {}).get("complete"), False)
+    except Exception:
+        pass
 
 
 def _finish_result(result: DefaultSeedResult) -> DefaultSeedResult:
@@ -2048,68 +2762,110 @@ def build_default_seed_status(
     """
     started_at = _utc_now_iso()
 
-    try:
-        models = load_seed_model_classes()
-        world_defaults = resolve_world_defaults(app, None)
-        block_defaults = resolve_block_defaults(app, None)
+    with _app_context(app):
+        try:
+            models = load_seed_model_classes()
+            world_defaults = resolve_world_defaults(app, None)
+            block_defaults = resolve_block_defaults(app, None)
 
-        registry = find_default_block_registry(models, block_defaults)
-        project = find_default_project(models, world_defaults)
-        universe = find_default_universe(models, project, world_defaults) if project is not None else None
-        world = find_default_world(models, universe, world_defaults) if universe is not None else None
+            registry = find_default_block_registry(models, block_defaults)
+            project = find_default_project(models, world_defaults)
+            universe = find_default_universe(models, project, world_defaults) if project is not None else None
+            world = find_default_world(models, universe, world_defaults) if universe is not None else None
 
-        debug_blocks_ok = default_debug_blocks_exist(models, registry, block_defaults)
-        complete = bool(registry and debug_blocks_ok and project and universe and world)
+            debug_blocks_ok = default_debug_blocks_exist(models, registry, block_defaults)
+            project_exists = project is not None
+            universe_exists = universe is not None
+            world_exists = world is not None
+            registry_exists = registry is not None
 
-        completed_at = _utc_now_iso()
+            complete = bool(registry_exists and debug_blocks_ok and project_exists and universe_exists and world_exists)
 
-        return {
-            "ok": complete,
-            "status": STATUS_COMPLETED if complete else STATUS_PARTIAL,
-            "startedAt": started_at,
-            "completedAt": completed_at,
-            "durationMs": _duration_ms(started_at, completed_at),
-            "project": {
-                "exists": project is not None,
-                "projectId": _safe_str(getattr(world_defaults, "project_id", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID),
-                "dbId": _safe_model_id(project),
-            },
-            "universe": {
-                "exists": universe is not None,
-                "universeId": _safe_str(getattr(world_defaults, "universe_id", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID),
-                "dbId": _safe_model_id(universe),
-            },
-            "world": {
-                "exists": world is not None,
-                "worldId": _safe_str(getattr(world_defaults, "world_id", DEFAULT_WORLD_ID), DEFAULT_WORLD_ID),
-                "dbId": _safe_model_id(world),
-            },
-            "blockRegistry": {
-                "exists": registry is not None,
-                "registryId": _safe_str(getattr(block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID),
-                "registryVersion": _safe_str(
-                    getattr(block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
-                    DEFAULT_BLOCK_REGISTRY_VERSION,
-                ),
-                "dbId": _safe_model_id(registry),
-            },
-            "debugBlocks": {
-                "complete": debug_blocks_ok,
-            },
-        }
+            completed_at = _utc_now_iso()
 
-    except Exception as exc:
-        completed_at = _utc_now_iso()
+            project_id = _resolve_project_id(world_defaults)
+            universe_id = _resolve_universe_id(world_defaults)
+            world_id = _resolve_world_id(world_defaults)
+            template_id = _resolve_template_id(world_defaults)
+            provider_id = _resolve_provider_id(world_defaults)
+            provider_world_id = _resolve_provider_world_id(world_defaults)
+            registry_id = _safe_str(getattr(block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+            registry_version = _safe_str(
+                getattr(block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
+                DEFAULT_BLOCK_REGISTRY_VERSION,
+            )
 
-        return {
-            "ok": False,
-            "status": STATUS_FAILED,
-            "startedAt": started_at,
-            "completedAt": completed_at,
-            "durationMs": _duration_ms(started_at, completed_at),
-            "error": _safe_exception_message(exc),
-            "exceptionType": exc.__class__.__name__,
-        }
+            return {
+                "ok": complete,
+                "status": STATUS_READY if complete else STATUS_PARTIAL,
+                "startedAt": started_at,
+                "completedAt": completed_at,
+                "durationMs": _duration_ms(started_at, completed_at),
+                "defaults": {
+                    "projectId": project_id,
+                    "universeId": universe_id,
+                    "worldId": world_id,
+                    "templateId": template_id,
+                    "providerId": provider_id,
+                    "providerWorldId": provider_world_id,
+                    "blockRegistryId": registry_id,
+                    "blockRegistryVersion": registry_version,
+                },
+                "project": {
+                    "exists": project_exists,
+                    "projectId": project_id,
+                    "dbId": _safe_model_id(project),
+                    "defaultUniverseId": _safe_str(getattr(project, "default_universe_id", ""), "") if project is not None else None,
+                    "defaultWorldId": _safe_str(getattr(project, "default_world_id", ""), "") if project is not None else None,
+                    "spawnWorldId": _safe_str(getattr(project, "spawn_world_id", ""), "") if project is not None else None,
+                },
+                "universe": {
+                    "exists": universe_exists,
+                    "universeId": universe_id,
+                    "dbId": _safe_model_id(universe),
+                    "defaultWorldId": _safe_str(getattr(universe, "default_world_id", ""), "") if universe is not None else None,
+                    "spawnWorldId": _safe_str(getattr(universe, "spawn_world_id", ""), "") if universe is not None else None,
+                },
+                "world": {
+                    "exists": world_exists,
+                    "worldId": world_id,
+                    "dbId": _safe_model_id(world),
+                    "templateId": _safe_str(getattr(world, "template_id", ""), "") if world is not None else None,
+                    "providerId": _safe_str(getattr(world, "provider_id", ""), "") if world is not None else None,
+                    "providerWorldId": _safe_str(getattr(world, "provider_world_id", ""), "") if world is not None else None,
+                    "blockRegistryId": _safe_str(getattr(world, "block_registry_id", ""), "") if world is not None else None,
+                    "blockRegistryVersion": _safe_str(getattr(world, "block_registry_version", ""), "") if world is not None else None,
+                },
+                "blockRegistry": {
+                    "exists": registry_exists,
+                    "registryId": registry_id,
+                    "registryVersion": registry_version,
+                    "dbId": _safe_model_id(registry),
+                },
+                "debugBlocks": {
+                    "complete": debug_blocks_ok,
+                },
+                "ready": {
+                    "project": project_exists,
+                    "universe": universe_exists,
+                    "world": world_exists,
+                    "blockRegistry": registry_exists,
+                    "debugBlocks": debug_blocks_ok,
+                },
+            }
+
+        except Exception as exc:
+            completed_at = _utc_now_iso()
+
+            return {
+                "ok": False,
+                "status": STATUS_FAILED,
+                "startedAt": started_at,
+                "completedAt": completed_at,
+                "durationMs": _duration_ms(started_at, completed_at),
+                "error": _safe_exception_message(exc),
+                "exceptionType": exc.__class__.__name__,
+            }
 
 
 def default_seed_result_to_dict(
@@ -2125,7 +2881,7 @@ def default_seed_result_to_dict(
         except Exception:
             return {}
 
-    return {}
+    return _safe_dict(result)
 
 
 def build_default_seed_summary(
@@ -2159,8 +2915,16 @@ def build_default_seed_summary(
         "projectId": data.get("project_id"),
         "universeId": data.get("universe_id"),
         "worldId": data.get("world_id"),
+        "templateId": data.get("template_id"),
+        "providerId": data.get("provider_id"),
+        "providerWorldId": data.get("provider_world_id"),
         "blockRegistryId": data.get("block_registry_id"),
         "blockRegistryVersion": data.get("block_registry_version"),
+        "defaultProjectReady": data.get("default_project_ready"),
+        "defaultUniverseReady": data.get("default_universe_ready"),
+        "defaultWorldReady": data.get("default_world_ready"),
+        "blockRegistryReady": data.get("block_registry_ready"),
+        "debugBlocksReady": data.get("debug_blocks_ready"),
         "operationCount": len(operations),
         "createdCount": created_count,
         "updatedCount": updated_count,
@@ -2184,10 +2948,15 @@ __all__ = [
     "STATUS_COMPLETED",
     "STATUS_FAILED",
     "STATUS_PARTIAL",
+    "STATUS_READY",
     "STATUS_SKIPPED",
     "DefaultSeedMessage",
     "DefaultSeedOperation",
     "DefaultSeedResult",
+    "apply_block_registry_defaults_to_object",
+    "apply_debug_block_defaults_to_object",
+    "apply_project_defaults_to_object",
+    "apply_universe_defaults_to_object",
     "apply_world_defaults_to_object",
     "build_default_seed_status",
     "build_default_seed_summary",
