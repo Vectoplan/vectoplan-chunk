@@ -1,9 +1,9 @@
 # services/vectoplan-chunk/models/universe.py
 """
-SQLAlchemy model for VECTOPLAN universes.
+SQLAlchemy model for VECTOPLAN Chunk universes.
 
-A Universe is a persistent container inside a Project. It groups one or more
-concrete editable world instances.
+A Universe is a persistent container inside a chunk Project. It groups one or
+more concrete editable WorldInstance rows.
 
 Current intended hierarchy:
 
@@ -14,15 +14,21 @@ Current intended hierarchy:
               -> WorldCommandLog
               -> ChunkEvent
 
+Service boundary:
+- Project.external_app_project_id links the chunk project to vectoplan-app.
+- Universe remains internal to vectoplan-chunk.
+- Universe ids are stable public/API identifiers inside one chunk project.
+- Universe ids are not required to be globally unique.
+
 Important design rules:
 - `id` is the internal database primary key.
 - `project_db_id` references `projects.id`.
-- `universe_id` is the stable public/API identifier inside one project.
-- `universe_id` is only unique per project, not globally.
-- The first default universe usually contains a `world_spawn` world.
-- Deletion is soft-delete by default.
-- This model does not perform commits.
-- Repository/service layers are responsible for database transactions.
+- `universe_id` is unique per chunk project.
+- `default_world_id` and `spawn_world_id` are public chunk world ids.
+- the first provisioned universe normally contains one editable spawn world.
+- deletion is soft-delete by default.
+- this model does not perform commits.
+- repository/service/route layers own database transactions.
 """
 
 from __future__ import annotations
@@ -57,10 +63,17 @@ except Exception:  # pragma: no cover - fallback is useful for tests/non-postgre
     JSONB = None  # type: ignore[assignment]
 
 
-JSON_COLUMN_TYPE = JSONB if JSONB is not None else db.JSON
+try:
+    JSON_COLUMN_TYPE = (
+        JSONB()
+        .with_variant(db.JSON(), "sqlite")
+        .with_variant(db.JSON(), "mysql")
+    ) if JSONB is not None else db.JSON
+except Exception:  # pragma: no cover
+    JSON_COLUMN_TYPE = db.JSON
 
 
-UNIVERSE_SCHEMA_VERSION = "universe.schema.v1"
+UNIVERSE_SCHEMA_VERSION = "universe.schema.v2"
 
 UNIVERSE_STATUS_ACTIVE = "active"
 UNIVERSE_STATUS_ARCHIVED = "archived"
@@ -99,7 +112,7 @@ UNIVERSE_SCOPE_MAX_LENGTH = 64
 UNIVERSE_WORLD_ID_MAX_LENGTH = 96
 UNIVERSE_USER_ID_MAX_LENGTH = 128
 
-PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -166,7 +179,11 @@ def normalize_optional_text(
     if value is None:
         return None
 
-    text = str(value).strip()
+    try:
+        text = str(value).strip()
+    except Exception as exc:
+        raise ValueError(f"{field_name} must be text-like.") from exc
+
     if not text:
         return None
 
@@ -211,6 +228,8 @@ def normalize_public_id(
     - numbers
     - underscore
     - dash
+    - dot
+    - colon
 
     The first character must be alphanumeric.
     """
@@ -222,8 +241,8 @@ def normalize_public_id(
 
     if not PUBLIC_ID_PATTERN.match(text):
         raise ValueError(
-            f"{field_name} may only contain letters, numbers, underscores "
-            "and dashes, and must start with a letter or number."
+            f"{field_name} may only contain letters, numbers, underscores, "
+            "dashes, dots and colons, and must start with a letter or number."
         )
 
     return text
@@ -275,7 +294,10 @@ def normalize_status(value: Any) -> str:
     if value is None:
         return UNIVERSE_STATUS_ACTIVE
 
-    status = str(value).strip().lower()
+    try:
+        status = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("status must be text-like.") from exc
 
     if status not in VALID_UNIVERSE_STATUSES:
         allowed = ", ".join(sorted(VALID_UNIVERSE_STATUSES))
@@ -289,7 +311,10 @@ def normalize_universe_role(value: Any) -> str:
     if value is None:
         return UNIVERSE_ROLE_DEFAULT
 
-    role = str(value).strip().lower()
+    try:
+        role = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("universe_role must be text-like.") from exc
 
     if role not in VALID_UNIVERSE_ROLES:
         allowed = ", ".join(sorted(VALID_UNIVERSE_ROLES))
@@ -303,7 +328,10 @@ def normalize_universe_scope(value: Any) -> str:
     if value is None:
         return UNIVERSE_SCOPE_PROJECT
 
-    scope = str(value).strip().lower()
+    try:
+        scope = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("universe_scope must be text-like.") from exc
 
     if scope != UNIVERSE_SCOPE_PROJECT:
         raise ValueError(
@@ -362,17 +390,32 @@ def generate_universe_id(prefix: str = "univ") -> str:
     return f"{normalized_prefix}_{uuid4().hex}"
 
 
+def _payload_metadata_value(payload: Mapping[str, Any]) -> Any:
+    """Read metadata payload from several compatible keys."""
+    if "metadataJson" in payload:
+        return payload.get("metadataJson")
+    if "metadata_json" in payload:
+        return payload.get("metadata_json")
+    if "metadata" in payload:
+        return payload.get("metadata")
+    if "universeMetadata" in payload:
+        return payload.get("universeMetadata")
+    if "universe_metadata" in payload:
+        return payload.get("universe_metadata")
+    return None
+
+
 class Universe(db.Model):
     """
-    Persistent VECTOPLAN universe.
+    Persistent Chunk universe.
 
-    A universe groups one or more world instances inside a project.
+    A universe groups one or more world instances inside a chunk project.
 
-    The first development flow usually creates:
+    The default app-integrated flow creates:
 
-        Project(project_id="...")
-          -> Universe(universe_id="dev-universe" or generated id)
-              -> WorldInstance(world_id="world_spawn", provider_world_id="flat")
+        Project(external_app_project_id="prj_...")
+          -> Universe(universe_id="chk_uni_...")
+              -> WorldInstance(world_id="chk_wld_..." or "world_spawn")
 
     This model intentionally does not create worlds itself. Repository/service
     code should create project + universe + spawn world atomically.
@@ -719,8 +762,8 @@ class Universe(db.Model):
         Create a Universe instance from an API-style payload.
 
         Supported keys:
-        - universeId / universe_id
-        - name
+        - universeId / universe_id / chunkUniverseId / chunk_universe_id
+        - name / universeName
         - slug
         - description
         - universeRole / universe_role
@@ -731,23 +774,40 @@ class Universe(db.Model):
         if not isinstance(payload, Mapping):
             raise ValueError("Universe create payload must be a JSON object.")
 
-        metadata_value = (
-            payload.get("metadataJson")
-            if "metadataJson" in payload
-            else payload.get("metadata_json")
-            if "metadata_json" in payload
-            else payload.get("metadata")
-        )
+        metadata_value = _payload_metadata_value(payload)
 
         return cls.create(
             project_db_id=project_db_id,
-            universe_id=payload.get("universeId") or payload.get("universe_id"),
-            name=payload.get("name"),
-            slug=payload.get("slug"),
+            universe_id=(
+                payload.get("chunkUniverseId")
+                or payload.get("chunk_universe_id")
+                or payload.get("universeId")
+                or payload.get("universe_id")
+            ),
+            name=(
+                payload.get("universeName")
+                or payload.get("universe_name")
+                or payload.get("name")
+            ),
+            slug=payload.get("slug") or payload.get("universeSlug") or payload.get("universe_slug"),
             description=payload.get("description"),
             universe_role=payload.get("universeRole") or payload.get("universe_role") or UNIVERSE_ROLE_DEFAULT,
-            default_world_id=payload.get("defaultWorldId") or payload.get("default_world_id"),
-            spawn_world_id=payload.get("spawnWorldId") or payload.get("spawn_world_id"),
+            default_world_id=(
+                payload.get("defaultWorldId")
+                or payload.get("default_world_id")
+                or payload.get("worldId")
+                or payload.get("world_id")
+                or payload.get("chunkWorldId")
+                or payload.get("chunk_world_id")
+            ),
+            spawn_world_id=(
+                payload.get("spawnWorldId")
+                or payload.get("spawn_world_id")
+                or payload.get("worldId")
+                or payload.get("world_id")
+                or payload.get("chunkWorldId")
+                or payload.get("chunk_world_id")
+            ),
             created_by_user_id=created_by_user_id,
             metadata_json=metadata_value,
         )
@@ -777,6 +837,26 @@ class Universe(db.Model):
             return getattr(project, "project_id", None)
         except Exception:
             return None
+
+    @property
+    def chunk_project_id(self) -> Optional[str]:
+        """Compatibility alias for parent Project.project_id."""
+        return self.project_public_id
+
+    @property
+    def chunk_universe_id(self) -> str:
+        """Compatibility alias for universe_id."""
+        return self.universe_id
+
+    @property
+    def effective_default_world_id(self) -> Optional[str]:
+        """Return default world id with spawn fallback."""
+        return self.default_world_id or self.spawn_world_id
+
+    @property
+    def effective_spawn_world_id(self) -> Optional[str]:
+        """Return spawn world id with default fallback."""
+        return self.spawn_world_id or self.default_world_id
 
     def touch(self, *, updated_by_user_id: Optional[str] = None) -> None:
         """Mark the universe as updated and increment its optimistic revision."""
@@ -999,6 +1079,27 @@ class Universe(db.Model):
         self.metadata_json = current
         self.touch(updated_by_user_id=updated_by_user_id)
 
+    def merge_provisioning_metadata(
+        self,
+        *,
+        chunk_project_id: Optional[str] = None,
+        chunk_world_id: Optional[str] = None,
+        external_app_project_id: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Merge standard provisioning metadata."""
+        self.update_metadata(
+            {
+                "schemaVersion": UNIVERSE_SCHEMA_VERSION,
+                "chunkProjectId": chunk_project_id or self.project_public_id,
+                "chunkUniverseId": self.universe_id,
+                "chunkWorldId": chunk_world_id or self.effective_spawn_world_id,
+                "externalAppProjectId": external_app_project_id,
+                "provisionedAt": datetime_to_iso(utc_now()),
+            },
+            updated_by_user_id=updated_by_user_id,
+        )
+
     def get_metadata_value(self, key: str, default: Any = None) -> Any:
         """Read one metadata value safely."""
         try:
@@ -1213,7 +1314,9 @@ class Universe(db.Model):
 
         result: Dict[str, Any] = {
             "projectId": resolved_project_id,
+            "chunkProjectId": resolved_project_id,
             "universeId": self.universe_id,
+            "chunkUniverseId": self.universe_id,
             "slug": self.slug,
             "name": self.name,
             "description": self.description,
@@ -1224,6 +1327,8 @@ class Universe(db.Model):
             "universeScope": self.universe_scope,
             "defaultWorldId": self.default_world_id,
             "spawnWorldId": self.spawn_world_id,
+            "effectiveDefaultWorldId": self.effective_default_world_id,
+            "effectiveSpawnWorldId": self.effective_spawn_world_id,
             "createdByUserId": self.created_by_user_id,
             "updatedByUserId": self.updated_by_user_id,
             "createdAt": datetime_to_iso(self.created_at),
@@ -1234,6 +1339,8 @@ class Universe(db.Model):
                 "active": self.is_active,
                 "archived": self.is_archived,
                 "deleted": self.is_deleted,
+                "hasDefaultWorld": bool(self.default_world_id),
+                "hasSpawnWorld": bool(self.spawn_world_id),
             },
         }
 

@@ -2,37 +2,54 @@
 """
 Central configuration for the `vectoplan-chunk` service.
 
-This configuration supports the current transition from the copied editor shell
-to a PostgreSQL-backed chunk/world service.
+This file is configuration only.
 
-Core semantics:
+It deliberately does not:
+- open database connections,
+- create tables,
+- seed default data,
+- run migrations,
+- create projects,
+- create worlds,
+- call other services.
 
-    projectId       = dev-project
-    universeId      = dev-universe
-    worldId         = world_spawn
-    templateId      = flat
-    providerWorldId = flat
+Core runtime semantics:
 
-Meaning:
+    App Project     = owned by vectoplan-app
+    Chunk Project   = owned by vectoplan-chunk
+    Universe        = container for one or more chunk worlds
+    WorldInstance   = concrete editable runtime world
+    Provider World  = template/generator source, e.g. flat
 
-    Project        = top-level container
-    Universe       = container for one or more concrete worlds
-    world_spawn    = concrete editable world instance
-    flat           = provider/template world
-    PostgreSQL     = persistence for projects, universes, worlds, snapshots,
-                     commands, events and later multi-block objects
+Default local/dev seed semantics:
 
-Important:
-- This file contains configuration and defensive helpers only.
-- No business logic.
-- No database connection is opened here.
-- No tables are created here.
-- No migrations are run here.
+    appProjectId      = optional external app project id
+    chunkProjectId    = dev-project
+    universeId        = dev-universe
+    worldId           = world_spawn
+    templateId        = flat
+    providerWorldId   = flat
+
+Production/runtime rule:
+
+    Runtime startup is read-only.
+    db.create_all() and default seeding are not part of normal Gunicorn startup.
+    Schema/bootstrap/seeding must run through explicit bootstrap paths.
+
+Future app integration rule:
+
+    vectoplan-app creates the app project.
+    vectoplan-app calls vectoplan-chunk via INTERNAL_URL.
+    vectoplan-chunk creates or returns a chunk project by external app project id.
+    vectoplan-app stores only returned references such as chunk_project_id,
+    chunk_universe_id and chunk_world_id.
 """
 
 from __future__ import annotations
 
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import quote_plus
@@ -42,8 +59,59 @@ from urllib.parse import quote_plus
 # Internal constants
 # -----------------------------------------------------------------------------
 
-_TRUE_VALUES: Final[set[str]] = {"1", "true", "t", "yes", "y", "on", "enabled"}
-_FALSE_VALUES: Final[set[str]] = {"0", "false", "f", "no", "n", "off", "disabled"}
+_TRUE_VALUES: Final[set[str]] = {
+    "1",
+    "true",
+    "t",
+    "yes",
+    "y",
+    "on",
+    "enabled",
+    "enable",
+}
+
+_FALSE_VALUES: Final[set[str]] = {
+    "0",
+    "false",
+    "f",
+    "no",
+    "n",
+    "off",
+    "disabled",
+    "disable",
+}
+
+_BOOTSTRAP_MODE_ALIASES: Final[set[str]] = {
+    "bootstrap",
+    "db-bootstrap",
+    "db_bootstrap",
+    "db-init",
+    "db_init",
+    "init",
+    "database-bootstrap",
+    "database_bootstrap",
+}
+
+_CHECK_ONLY_MODE_ALIASES: Final[set[str]] = {
+    "check",
+    "check-only",
+    "check_only",
+    "db-check",
+    "db_check",
+    "schema-check",
+    "schema_check",
+    "readiness-check",
+    "readiness_check",
+}
+
+_RUNTIME_MODE_ALIASES: Final[set[str]] = {
+    "runtime",
+    "gunicorn",
+    "server",
+    "serve",
+    "wsgi",
+    "app",
+}
 
 DEFAULT_SERVICE_NAME: Final[str] = "vectoplan-chunk"
 DEFAULT_APP_DISPLAY_NAME: Final[str] = "VECTOPLAN Chunk Service"
@@ -51,7 +119,11 @@ DEFAULT_EXTENSION_NAMESPACE: Final[str] = "vectoplan_chunk"
 
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
 DEFAULT_UNIVERSE_ID: Final[str] = "dev-universe"
+
+# Concrete editable default world.
 DEFAULT_INSTANCE_WORLD_ID: Final[str] = "world_spawn"
+
+# Template/provider source.
 DEFAULT_WORLD_TEMPLATE_ID: Final[str] = "flat"
 DEFAULT_PROVIDER_WORLD_ID: Final[str] = "flat"
 DEFAULT_PROVIDER_ID: Final[str] = "flat"
@@ -67,6 +139,7 @@ DEFAULT_GENERATOR_VERSION: Final[str] = "1"
 DEFAULT_PROJECTION_TYPE: Final[str] = "flat-local-v1"
 DEFAULT_TOPOLOGY_TYPE: Final[str] = "flat-unbounded-v1"
 DEFAULT_COORDINATE_SYSTEM: Final[str] = "vectoplan-world-y-up-v1"
+
 DEFAULT_BLOCK_REGISTRY_ID: Final[str] = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION: Final[str] = "1"
 
@@ -76,6 +149,14 @@ DEFAULT_DATABASE_PORT: Final[int] = 5432
 DEFAULT_DATABASE_NAME: Final[str] = "vectoplan_chunk"
 DEFAULT_DATABASE_USER: Final[str] = "vectoplan_chunk"
 DEFAULT_DATABASE_PASSWORD: Final[str] = "vectoplan_chunk"
+
+DEFAULT_PROVISIONING_SOURCE_SERVICE: Final[str] = "vectoplan-app"
+DEFAULT_PROVISIONING_PROJECT_PREFIX: Final[str] = "chk_prj_"
+DEFAULT_PROVISIONING_UNIVERSE_PREFIX: Final[str] = "chk_uni_"
+DEFAULT_PROVISIONING_WORLD_PREFIX: Final[str] = "chk_wld_"
+
+_SAFE_ID_RE: Final[re.Pattern[str]] = re.compile(r"[^a-zA-Z0-9_\-:.]+")
+_MULTI_DASH_RE: Final[re.Pattern[str]] = re.compile(r"-+")
 
 
 # -----------------------------------------------------------------------------
@@ -103,6 +184,48 @@ def _normalize_text(value: Any) -> str | None:
     return normalized or None
 
 
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    """Convert value to bool."""
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return bool(value)
+
+    text = _normalize_text(value)
+    if text is None:
+        return default
+
+    lowered = text.lower()
+    if lowered in _TRUE_VALUES:
+        return True
+
+    if lowered in _FALSE_VALUES:
+        return False
+
+    return default
+
+
+def _safe_identifier(value: Any, default: str) -> str:
+    """
+    Normalize a service identifier.
+
+    This does not replace model validation. It avoids accidental whitespace and
+    obvious path/URL characters in generated defaults.
+    """
+    normalized = _normalize_text(value)
+    if normalized is None:
+        return default
+
+    try:
+        cleaned = _SAFE_ID_RE.sub("-", normalized)
+        cleaned = _MULTI_DASH_RE.sub("-", cleaned).strip("-")
+    except Exception:
+        return default
+
+    return cleaned or default
+
+
 def _read_str_env(name: str, default: str) -> str:
     """Read string env var with fallback."""
     value = _normalize_text(_safe_getenv(name))
@@ -117,19 +240,7 @@ def _read_optional_str_env(name: str, default: str | None = None) -> str | None:
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
     """Read boolean env var with fallback."""
-    raw_value = _normalize_text(_safe_getenv(name))
-    if raw_value is None:
-        return default
-
-    normalized = raw_value.lower()
-
-    if normalized in _TRUE_VALUES:
-        return True
-
-    if normalized in _FALSE_VALUES:
-        return False
-
-    return default
+    return _safe_bool(_safe_getenv(name), default)
 
 
 def _read_int_env(
@@ -214,15 +325,7 @@ def _read_bool_env_any(names: tuple[str, ...], default: bool = False) -> bool:
         if raw_value is None:
             continue
 
-        normalized = raw_value.lower()
-
-        if normalized in _TRUE_VALUES:
-            return True
-
-        if normalized in _FALSE_VALUES:
-            return False
-
-        return default
+        return _safe_bool(raw_value, default)
 
     return default
 
@@ -287,6 +390,60 @@ def _read_float_env_any(
     return value
 
 
+def _normalize_mode(value: Any, default: str = "runtime") -> str:
+    """Normalize startup/run mode."""
+    normalized = _normalize_text(value)
+    if normalized is None:
+        return default
+
+    key = normalized.lower().replace("_", "-")
+
+    if key in _BOOTSTRAP_MODE_ALIASES:
+        return "db-bootstrap"
+
+    if key in _CHECK_ONLY_MODE_ALIASES:
+        return "check-only"
+
+    if key in _RUNTIME_MODE_ALIASES:
+        return "runtime"
+
+    return key or default
+
+
+def _current_startup_mode(default: str = "runtime") -> str:
+    """Read current startup mode from env aliases."""
+    return _normalize_mode(
+        _read_optional_str_env_any(
+            (
+                "VECTOPLAN_CHUNK_MODE",
+                "VECTOPLAN_CHUNK_STARTUP_MODE",
+                "VECTOPLAN_CHUNK_RUNTIME_MODE",
+                "SERVICE_STARTUP_MODE",
+                "APP_STARTUP_MODE",
+                "STARTUP_MODE",
+            ),
+            default,
+        ),
+        default,
+    )
+
+
+def _is_bootstrap_mode(value: Any) -> bool:
+    """Return whether the mode is a bootstrap/init mode."""
+    return _normalize_mode(value) == "db-bootstrap"
+
+
+def _is_check_only_mode(value: Any) -> bool:
+    """Return whether the mode is check-only."""
+    return _normalize_mode(value) == "check-only"
+
+
+def _is_runtime_mode(value: Any) -> bool:
+    """Return whether the mode is normal runtime."""
+    return _normalize_mode(value) == "runtime"
+
+
+@lru_cache(maxsize=1)
 def _resolve_service_root() -> Path:
     """Resolve service root directory defensively."""
     try:
@@ -318,8 +475,8 @@ def _build_postgres_uri_from_parts() -> str:
     """
     Build PostgreSQL URI from individual env values.
 
-    Priority for complete URI is handled elsewhere. This function only builds
-    a fallback URI from host/user/password/db parts.
+    Complete URI env vars are resolved elsewhere. This only builds a fallback
+    URI from host/user/password/db parts.
     """
     driver = _read_str_env_any(
         (
@@ -394,15 +551,17 @@ def _resolve_database_uri(*, testing: bool = False) -> str:
 
     Priority:
     1. VECTOPLAN_CHUNK_DATABASE_URL
-    2. VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI
-    3. DATABASE_URL
-    4. SQLALCHEMY_DATABASE_URI
-    5. Testing sqlite fallback if testing and explicitly enabled
-    6. PostgreSQL URI built from individual parts
+    2. VECTOPLAN_CHUNK_DATABASE_URI
+    3. VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI
+    4. DATABASE_URL
+    5. SQLALCHEMY_DATABASE_URI
+    6. Testing sqlite fallback if explicitly enabled
+    7. PostgreSQL URI built from individual parts
     """
     explicit_uri = _read_optional_str_env_any(
         (
             "VECTOPLAN_CHUNK_DATABASE_URL",
+            "VECTOPLAN_CHUNK_DATABASE_URI",
             "VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI",
             "DATABASE_URL",
             "SQLALCHEMY_DATABASE_URI",
@@ -444,8 +603,39 @@ def _build_sqlalchemy_engine_options() -> dict[str, Any]:
     """
     Build SQLAlchemy engine options.
 
-    These are conservative defaults for PostgreSQL-backed local/container usage.
+    Defaults are conservative for a local/containerized PostgreSQL service.
     """
+    database_uri = _resolve_database_uri(testing=False)
+    is_sqlite = database_uri.startswith("sqlite:")
+
+    pool_pre_ping = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_POOL_PRE_PING",
+        default=True,
+    )
+
+    pool_recycle = _read_int_env(
+        "VECTOPLAN_CHUNK_DB_POOL_RECYCLE",
+        default=1800,
+        minimum=30,
+        maximum=86400,
+    )
+
+    pool_timeout = _read_int_env(
+        "VECTOPLAN_CHUNK_DB_POOL_TIMEOUT",
+        default=30,
+        minimum=1,
+        maximum=300,
+    )
+
+    options: dict[str, Any] = {
+        "pool_pre_ping": pool_pre_ping,
+        "pool_recycle": pool_recycle,
+        "pool_timeout": pool_timeout,
+    }
+
+    if is_sqlite:
+        return options
+
     pool_size = _read_int_env(
         "VECTOPLAN_CHUNK_DB_POOL_SIZE",
         default=5,
@@ -460,53 +650,147 @@ def _build_sqlalchemy_engine_options() -> dict[str, Any]:
         maximum=200,
     )
 
-    pool_timeout = _read_int_env(
-        "VECTOPLAN_CHUNK_DB_POOL_TIMEOUT",
-        default=30,
-        minimum=1,
-        maximum=300,
-    )
-
-    pool_recycle = _read_int_env(
-        "VECTOPLAN_CHUNK_DB_POOL_RECYCLE",
-        default=1800,
-        minimum=30,
-        maximum=86400,
-    )
-
-    pool_pre_ping = _read_bool_env(
-        "VECTOPLAN_CHUNK_DB_POOL_PRE_PING",
-        default=True,
-    )
-
-    connect_timeout = _read_int_env(
-        "VECTOPLAN_CHUNK_DB_CONNECT_TIMEOUT",
+    connect_timeout = _read_int_env_any(
+        (
+            "VECTOPLAN_CHUNK_DB_CONNECT_TIMEOUT",
+            "VECTOPLAN_CHUNK_DATABASE_CONNECT_TIMEOUT",
+        ),
         default=10,
         minimum=1,
         maximum=300,
     )
 
-    options: dict[str, Any] = {
-        "pool_pre_ping": pool_pre_ping,
-        "pool_recycle": pool_recycle,
-        "pool_timeout": pool_timeout,
-    }
-
-    database_uri = _resolve_database_uri(testing=False)
-    is_sqlite = database_uri.startswith("sqlite:")
-
-    if not is_sqlite:
-        options.update(
-            {
-                "pool_size": pool_size,
-                "max_overflow": max_overflow,
-                "connect_args": {
-                    "connect_timeout": connect_timeout,
-                },
-            }
-        )
+    options.update(
+        {
+            "pool_size": pool_size,
+            "max_overflow": max_overflow,
+            "connect_args": {
+                "connect_timeout": connect_timeout,
+            },
+        }
+    )
 
     return options
+
+
+def _resolve_template_id() -> str:
+    """Resolve default template id."""
+    return _safe_identifier(
+        _read_str_env_any(
+            (
+                "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID",
+                "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID",
+                "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID",
+            ),
+            DEFAULT_WORLD_TEMPLATE_ID,
+        ),
+        DEFAULT_WORLD_TEMPLATE_ID,
+    )
+
+
+def _resolve_provider_world_id() -> str:
+    """Resolve provider world id."""
+    return _safe_identifier(
+        _read_str_env_any(
+            (
+                "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
+                "VECTOPLAN_CHUNK_PROVIDER_WORLD_ID",
+                "VECTOPLAN_CHUNK_LEGACY_PROVIDER_WORLD_ID",
+            ),
+            DEFAULT_PROVIDER_WORLD_ID,
+        ),
+        DEFAULT_PROVIDER_WORLD_ID,
+    )
+
+
+def _looks_like_provider_or_template_world_id(value: str | None) -> bool:
+    """Return true if value looks like a provider/template id instead of instance world id."""
+    if not value:
+        return False
+
+    cleaned = _safe_identifier(value, "").lower()
+    if not cleaned:
+        return False
+
+    template_id = _resolve_template_id().lower()
+    provider_world_id = _resolve_provider_world_id().lower()
+    provider_id = _safe_identifier(
+        _read_str_env("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID", DEFAULT_PROVIDER_ID),
+        DEFAULT_PROVIDER_ID,
+    ).lower()
+
+    return cleaned in {
+        template_id,
+        provider_world_id,
+        provider_id,
+        DEFAULT_WORLD_TEMPLATE_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+        DEFAULT_PROVIDER_ID,
+    }
+
+
+def _resolve_instance_world_id() -> str:
+    """
+    Resolve the concrete editable default world id.
+
+    Canonical rule:
+        VECTOPLAN_CHUNK_DEFAULT_WORLD_ID points to the concrete editable world.
+
+    Defensive compatibility rule:
+        If only old/default env says DEFAULT_WORLD_ID=flat, treat it as legacy
+        provider/template drift and fall back to world_spawn. This prevents the
+        bootstrap from creating/expecting a concrete world named "flat".
+    """
+    explicit_instance_value = _read_optional_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_INSTANCE_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_SPAWN_WORLD_ID",
+        ),
+        None,
+    )
+
+    if explicit_instance_value:
+        return _safe_identifier(explicit_instance_value, DEFAULT_INSTANCE_WORLD_ID)
+
+    default_world_value = _read_optional_str_env("VECTOPLAN_CHUNK_DEFAULT_WORLD_ID", None)
+    if default_world_value:
+        candidate = _safe_identifier(default_world_value, DEFAULT_INSTANCE_WORLD_ID)
+        if not _looks_like_provider_or_template_world_id(candidate):
+            return candidate
+
+    return DEFAULT_INSTANCE_WORLD_ID
+
+
+def _resolve_provisioning_world_id(default_world_id: str) -> str:
+    """Resolve app-project provisioning default world id defensively."""
+    raw_value = _read_optional_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID",
+        None,
+    )
+
+    if raw_value is None:
+        return default_world_id
+
+    candidate = _safe_identifier(raw_value, default_world_id)
+
+    if _looks_like_provider_or_template_world_id(candidate):
+        return default_world_id
+
+    return candidate
+
+
+def refresh_env_cache() -> None:
+    """
+    Clear small internal caches.
+
+    Config class attributes are evaluated at import time. This helper exists for
+    diagnostics/tests that reload the module or call path helpers repeatedly.
+    """
+    try:
+        _resolve_service_root.cache_clear()
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -516,6 +800,9 @@ def _build_sqlalchemy_engine_options() -> dict[str, Any]:
 class BaseConfig:
     """
     Shared configuration for all environments.
+
+    Runtime defaults are intentionally read-only. Bootstrap modes override the
+    relevant flags explicitly.
     """
 
     # -------------------------------------------------------------------------
@@ -553,7 +840,6 @@ class BaseConfig:
     APP_ENV = _read_str_env_any(
         (
             "VECTOPLAN_CHUNK_ENV",
-            "VECTOPLAN_EDITOR_ENV",
             "APP_ENV",
             "FLASK_ENV",
         ),
@@ -581,7 +867,45 @@ class BaseConfig:
             "SERVICE_VERSION",
             "APP_VERSION",
         ),
-        "0.1.0",
+        "0.3.0",
+    )
+
+    # -------------------------------------------------------------------------
+    # Runtime/startup mode
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_MODE = _current_startup_mode("runtime")
+    VECTOPLAN_CHUNK_STARTUP_MODE = VECTOPLAN_CHUNK_MODE
+
+    VECTOPLAN_CHUNK_RUNTIME_MODE = _normalize_mode(
+        _read_optional_str_env(
+            "VECTOPLAN_CHUNK_RUNTIME_MODE",
+            VECTOPLAN_CHUNK_STARTUP_MODE,
+        ),
+        VECTOPLAN_CHUNK_STARTUP_MODE,
+    )
+
+    VECTOPLAN_CHUNK_RUN_MODE = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_RUN_MODE",
+            "RUN_MODE",
+        ),
+        "gunicorn",
+    )
+
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS",
+        True,
     )
 
     # -------------------------------------------------------------------------
@@ -591,7 +915,6 @@ class BaseConfig:
     SECRET_KEY = _read_str_env_any(
         (
             "VECTOPLAN_CHUNK_SECRET_KEY",
-            "VECTOPLAN_EDITOR_SECRET_KEY",
             "SECRET_KEY",
         ),
         "dev-secret-key-change-me",
@@ -600,7 +923,6 @@ class BaseConfig:
     DEBUG = _read_bool_env_any(
         (
             "VECTOPLAN_CHUNK_DEBUG",
-            "VECTOPLAN_EDITOR_DEBUG",
             "DEBUG",
             "FLASK_DEBUG",
         ),
@@ -610,66 +932,44 @@ class BaseConfig:
     TESTING = _read_bool_env_any(
         (
             "VECTOPLAN_CHUNK_TESTING",
-            "VECTOPLAN_EDITOR_TESTING",
             "TESTING",
         ),
         False,
     )
 
-    TEMPLATES_AUTO_RELOAD = _read_bool_env_any(
-        (
-            "VECTOPLAN_CHUNK_TEMPLATES_AUTO_RELOAD",
-            "VECTOPLAN_EDITOR_TEMPLATES_AUTO_RELOAD",
-        ),
+    TEMPLATES_AUTO_RELOAD = _read_bool_env(
+        "VECTOPLAN_CHUNK_TEMPLATES_AUTO_RELOAD",
         True,
     )
 
-    EXPLAIN_TEMPLATE_LOADING = _read_bool_env_any(
-        (
-            "VECTOPLAN_CHUNK_EXPLAIN_TEMPLATE_LOADING",
-            "VECTOPLAN_EDITOR_EXPLAIN_TEMPLATE_LOADING",
-        ),
+    EXPLAIN_TEMPLATE_LOADING = _read_bool_env(
+        "VECTOPLAN_CHUNK_EXPLAIN_TEMPLATE_LOADING",
         False,
     )
 
-    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env_any(
-        (
-            "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
-            "VECTOPLAN_EDITOR_SEND_FILE_MAX_AGE_DEFAULT",
-        ),
+    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env(
+        "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
         default=0,
         minimum=0,
     )
 
-    PREFERRED_URL_SCHEME = _read_str_env_any(
-        (
-            "VECTOPLAN_CHUNK_PREFERRED_URL_SCHEME",
-            "VECTOPLAN_EDITOR_PREFERRED_URL_SCHEME",
-        ),
+    PREFERRED_URL_SCHEME = _read_str_env(
+        "VECTOPLAN_CHUNK_PREFERRED_URL_SCHEME",
         "http",
     )
 
-    SERVER_NAME = _read_optional_str_env_any(
-        (
-            "VECTOPLAN_CHUNK_SERVER_NAME",
-            "VECTOPLAN_EDITOR_SERVER_NAME",
-        ),
+    SERVER_NAME = _read_optional_str_env(
+        "VECTOPLAN_CHUNK_SERVER_NAME",
         None,
     )
 
-    APPLICATION_ROOT = _read_str_env_any(
-        (
-            "VECTOPLAN_CHUNK_APPLICATION_ROOT",
-            "VECTOPLAN_EDITOR_APPLICATION_ROOT",
-        ),
+    APPLICATION_ROOT = _read_str_env(
+        "VECTOPLAN_CHUNK_APPLICATION_ROOT",
         "/",
     )
 
-    MAX_CONTENT_LENGTH = _read_int_env_any(
-        (
-            "VECTOPLAN_CHUNK_MAX_CONTENT_LENGTH",
-            "VECTOPLAN_EDITOR_MAX_CONTENT_LENGTH",
-        ),
+    MAX_CONTENT_LENGTH = _read_int_env(
+        "VECTOPLAN_CHUNK_MAX_CONTENT_LENGTH",
         default=32 * 1024 * 1024,
         minimum=1024,
     )
@@ -679,12 +979,36 @@ class BaseConfig:
 
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
-    SESSION_COOKIE_SECURE = _read_bool_env_any(
-        (
-            "VECTOPLAN_CHUNK_SESSION_COOKIE_SECURE",
-            "VECTOPLAN_EDITOR_SESSION_COOKIE_SECURE",
-        ),
+    SESSION_COOKIE_SECURE = _read_bool_env(
+        "VECTOPLAN_CHUNK_SESSION_COOKIE_SECURE",
         False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Service URLs
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_PUBLIC_URL = _read_str_env(
+        "VECTOPLAN_CHUNK_PUBLIC_URL",
+        "http://localhost:5102",
+    )
+
+    VECTOPLAN_CHUNK_PUBLIC_BASE_URL = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_PUBLIC_BASE_URL",
+            "VECTOPLAN_CHUNK_PUBLIC_URL",
+        ),
+        "http://localhost:5102",
+    )
+
+    VECTOPLAN_APP_PUBLIC_URL = _read_str_env(
+        "VECTOPLAN_APP_PUBLIC_URL",
+        "http://localhost:5103",
+    )
+
+    VECTOPLAN_APP_INTERNAL_URL = _read_optional_str_env(
+        "VECTOPLAN_APP_INTERNAL_URL",
+        None,
     )
 
     # -------------------------------------------------------------------------
@@ -705,6 +1029,7 @@ class BaseConfig:
     WORLD_SRC_ROOT = _build_path("src", "world")
     WORLD_STATE_SRC_ROOT = _build_path("src", "world_state")
     FLAT_WORLD_ROOT = _build_path("src", "world", "flat")
+    BOOTSTRAP_SCRIPT = _build_path("scripts", "bootstrap_db.py")
 
     # -------------------------------------------------------------------------
     # Database / SQLAlchemy / Migration config
@@ -721,10 +1046,54 @@ class BaseConfig:
     SQLALCHEMY_ENGINE_OPTIONS = _build_sqlalchemy_engine_options()
 
     VECTOPLAN_CHUNK_DATABASE_URL_MASKED = _mask_database_uri(DATABASE_URL)
+
+    VECTOPLAN_CHUNK_DB_HOST = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_DB_HOST",
+            "VECTOPLAN_CHUNK_POSTGRES_HOST",
+            "POSTGRES_HOST",
+            "DB_HOST",
+        ),
+        DEFAULT_DATABASE_HOST,
+    )
+
+    VECTOPLAN_CHUNK_DB_PORT = _read_int_env_any(
+        (
+            "VECTOPLAN_CHUNK_DB_PORT",
+            "VECTOPLAN_CHUNK_POSTGRES_PORT",
+            "POSTGRES_PORT",
+            "DB_PORT",
+        ),
+        DEFAULT_DATABASE_PORT,
+        minimum=1,
+        maximum=65535,
+    )
+
+    VECTOPLAN_CHUNK_DB_NAME = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_DB_NAME",
+            "VECTOPLAN_CHUNK_POSTGRES_DB",
+            "POSTGRES_DB",
+            "DB_NAME",
+        ),
+        DEFAULT_DATABASE_NAME,
+    )
+
+    VECTOPLAN_CHUNK_DB_USER = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_DB_USER",
+            "VECTOPLAN_CHUNK_POSTGRES_USER",
+            "POSTGRES_USER",
+            "DB_USER",
+        ),
+        DEFAULT_DATABASE_USER,
+    )
+
     VECTOPLAN_CHUNK_DB_CHECK_ON_STARTUP = _read_bool_env(
         "VECTOPLAN_CHUNK_DB_CHECK_ON_STARTUP",
         False,
     )
+
     VECTOPLAN_CHUNK_DB_REQUIRE_ON_STARTUP = _read_bool_env(
         "VECTOPLAN_CHUNK_DB_REQUIRE_ON_STARTUP",
         True,
@@ -734,31 +1103,128 @@ class BaseConfig:
         "VECTOPLAN_CHUNK_REQUIRE_MIGRATIONS",
         False,
     )
+
+    VECTOPLAN_CHUNK_MIGRATIONS_DIRECTORY = _read_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_MIGRATIONS_DIRECTORY",
+            "ALEMBIC_MIGRATIONS_DIRECTORY",
+            "MIGRATIONS_DIRECTORY",
+        ),
+        "migrations",
+    )
+
+    # Runtime defaults are deliberately non-mutating.
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
+        False,
+    )
+
     VECTOPLAN_CHUNK_AUTO_CREATE_ALL = _read_bool_env(
         "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
         False,
     )
+
     VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS = _read_bool_env(
         "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
-        True,
+        False,
     )
+
     VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS = _read_bool_env(
         "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
-        True,
+        False,
     )
+
     VECTOPLAN_CHUNK_SEED_DEV_PROJECT = _read_bool_env(
         "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
+        VECTOPLAN_CHUNK_AUTO_CREATE_ALL,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
+        VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+        VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+        VECTOPLAN_CHUNK_SEED_DEV_PROJECT,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS = _read_bool_env(
+        "VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
         True,
     )
 
+    VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK = _read_bool_env_any(
+        (
+            "VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS",
+        ),
+        True,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_ADVISORY_LOCK_KEY = _read_int_env(
+        "VECTOPLAN_CHUNK_BOOTSTRAP_ADVISORY_LOCK_KEY",
+        default=5102001,
+        minimum=1,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_MAX_ATTEMPTS = _read_int_env_any(
+        (
+            "VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_MAX_ATTEMPTS",
+            "VECTOPLAN_CHUNK_INIT_MAX_ATTEMPTS",
+        ),
+        default=20,
+        minimum=1,
+        maximum=500,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_RETRY_SECONDS = _read_int_env_any(
+        (
+            "VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_RETRY_SECONDS",
+            "VECTOPLAN_CHUNK_INIT_RETRY_SECONDS",
+        ),
+        default=2,
+        minimum=1,
+        maximum=300,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_TIMEOUT_SECONDS = _read_int_env_any(
+        (
+            "VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_TIMEOUT_SECONDS",
+            "VECTOPLAN_CHUNK_INIT_CONNECT_TIMEOUT_SECONDS",
+        ),
+        default=10,
+        minimum=1,
+        maximum=300,
+    )
+
     # -------------------------------------------------------------------------
-    # Chunk-service flags
+    # Chunk-service route flags
     # -------------------------------------------------------------------------
 
     VECTOPLAN_CHUNK_CONFIG = _read_str_env_any(
         (
             "VECTOPLAN_CHUNK_CONFIG",
-            "VECTOPLAN_EDITOR_CONFIG",
             "APP_CONFIG",
         ),
         "development",
@@ -828,14 +1294,20 @@ class BaseConfig:
     # World-state defaults
     # -------------------------------------------------------------------------
 
-    VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID",
+    VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID",
+            DEFAULT_PROJECT_ID,
+        ),
         DEFAULT_PROJECT_ID,
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG",
-        DEFAULT_PROJECT_ID,
+    VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG",
+            VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID,
+        ),
+        VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID,
     )
 
     VECTOPLAN_CHUNK_DEFAULT_PROJECT_NAME = _read_str_env(
@@ -843,14 +1315,20 @@ class BaseConfig:
         "Dev Project",
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID",
+    VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID",
+            DEFAULT_UNIVERSE_ID,
+        ),
         DEFAULT_UNIVERSE_ID,
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG",
-        DEFAULT_UNIVERSE_ID,
+    VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG",
+            VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID,
+        ),
+        VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID,
     )
 
     VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_NAME = _read_str_env(
@@ -858,13 +1336,16 @@ class BaseConfig:
         "Dev Universe",
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
-        DEFAULT_INSTANCE_WORLD_ID,
-    )
+    VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID = _resolve_instance_world_id()
 
-    VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG",
+    # Canonical alias: default world id = concrete editable world id.
+    VECTOPLAN_CHUNK_DEFAULT_WORLD_ID = VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID
+
+    VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG",
+            "spawn",
+        ),
         "spawn",
     )
 
@@ -873,24 +1354,20 @@ class BaseConfig:
         "Flat Spawn World",
     )
 
-    # Legacy provider default for /world-test and provider layer.
-    VECTOPLAN_CHUNK_DEFAULT_WORLD_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID",
-        DEFAULT_PROVIDER_WORLD_ID,
+    VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID = _resolve_template_id()
+    VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID = VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID
+
+    VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID = _resolve_provider_world_id()
+
+    VECTOPLAN_CHUNK_LEGACY_DEFAULT_PROVIDER_WORLD_ID = (
+        VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID",
-        DEFAULT_WORLD_TEMPLATE_ID,
-    )
-
-    VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
-        DEFAULT_PROVIDER_WORLD_ID,
-    )
-
-    VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID",
+    VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID",
+            DEFAULT_PROVIDER_ID,
+        ),
         DEFAULT_PROVIDER_ID,
     )
 
@@ -976,8 +1453,11 @@ class BaseConfig:
         "dev-seed",
     )
 
-    VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID = _read_str_env(
-        "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID",
+    VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID",
+            DEFAULT_BLOCK_REGISTRY_ID,
+        ),
         DEFAULT_BLOCK_REGISTRY_ID,
     )
 
@@ -1016,12 +1496,126 @@ class BaseConfig:
     )
 
     # -------------------------------------------------------------------------
+    # App-project provisioning config
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_IDEMPOTENT = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_IDEMPOTENT",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SOURCE_SERVICE = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SOURCE_SERVICE",
+        DEFAULT_PROVISIONING_SOURCE_SERVICE,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EXTERNAL_APP_PROJECT_ID = (
+        _read_bool_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EXTERNAL_APP_PROJECT_ID",
+            True,
+        )
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_EXISTING_BY_EXTERNAL_ID = (
+        _read_bool_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_EXISTING_BY_EXTERNAL_ID",
+            True,
+        )
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_NAME_UPDATE = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_NAME_UPDATE",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_METADATA_UPDATE = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_METADATA_UPDATE",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_UNIVERSE = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_UNIVERSE",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_WORLD = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_WORLD",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_BLOCK_REGISTRY_REF = (
+        _read_bool_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_BLOCK_REGISTRY_REF",
+            True,
+        )
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PROJECT_ID_PREFIX = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PROJECT_ID_PREFIX",
+        DEFAULT_PROVISIONING_PROJECT_PREFIX,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_UNIVERSE_ID_PREFIX = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_UNIVERSE_ID_PREFIX",
+        DEFAULT_PROVISIONING_UNIVERSE_PREFIX,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_WORLD_ID_PREFIX = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_WORLD_ID_PREFIX",
+        DEFAULT_PROVISIONING_WORLD_PREFIX,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID",
+            VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID,
+        ),
+        VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID = (
+        _resolve_provisioning_world_id(VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID)
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_NAME = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_NAME",
+        "Spawn World",
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_UNIVERSE_NAME = _read_str_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_UNIVERSE_NAME",
+        "Project Universe",
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_BY_APP_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_BY_APP_ENABLED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_ENSURE_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_ENSURE_ENABLED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES = _read_int_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES",
+        default=64 * 1024,
+        minimum=1024,
+        maximum=1024 * 1024,
+    )
+
+    # -------------------------------------------------------------------------
     # Bootstrap/provider options
     # -------------------------------------------------------------------------
 
     VECTOPLAN_CHUNK_BOOTSTRAP_ALLOW_DEFAULT_PROJECT = _read_bool_env(
         "VECTOPLAN_CHUNK_BOOTSTRAP_ALLOW_DEFAULT_PROJECT",
-        False,
+        True,
     )
 
     VECTOPLAN_CHUNK_BOOTSTRAP_INCLUDE_PROVIDER_CHECKS = _read_bool_env(
@@ -1037,6 +1631,35 @@ class BaseConfig:
     VECTOPLAN_CHUNK_DISABLE_PROVIDER_ENRICHMENT = _read_bool_env(
         "VECTOPLAN_CHUNK_DISABLE_PROVIDER_ENRICHMENT",
         False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Health/readiness options
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_HEALTHCHECK_PATH = _read_str_env(
+        "VECTOPLAN_CHUNK_HEALTHCHECK_PATH",
+        "/projects/_status",
+    )
+
+    VECTOPLAN_CHUNK_HEALTHCHECK_REQUIRE_OK = _read_bool_env(
+        "VECTOPLAN_CHUNK_HEALTHCHECK_REQUIRE_OK",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SCHEMA_READY_REQUIRED = _read_bool_env(
+        "VECTOPLAN_CHUNK_SCHEMA_READY_REQUIRED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SEED_READY_REQUIRED = _read_bool_env(
+        "VECTOPLAN_CHUNK_SEED_READY_REQUIRED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_DEFAULT_WORLD_READY_REQUIRED = _read_bool_env(
+        "VECTOPLAN_CHUNK_DEFAULT_WORLD_READY_REQUIRED",
+        True,
     )
 
     # -------------------------------------------------------------------------
@@ -1141,32 +1764,53 @@ class BaseConfig:
     @classmethod
     def build_database_config(cls) -> dict[str, Any]:
         """Build database config metadata for status/debug output."""
+        engine_options = getattr(cls, "SQLALCHEMY_ENGINE_OPTIONS", {}) or {}
+        connect_args = engine_options.get("connect_args", {}) or {}
+
         return {
             "databaseUrlMasked": _mask_database_uri(getattr(cls, "DATABASE_URL", None)),
             "sqlalchemyDatabaseUriMasked": _mask_database_uri(
                 getattr(cls, "SQLALCHEMY_DATABASE_URI", None)
             ),
+            "host": getattr(cls, "VECTOPLAN_CHUNK_DB_HOST", None),
+            "port": getattr(cls, "VECTOPLAN_CHUNK_DB_PORT", None),
+            "name": getattr(cls, "VECTOPLAN_CHUNK_DB_NAME", None),
+            "user": getattr(cls, "VECTOPLAN_CHUNK_DB_USER", None),
             "trackModifications": getattr(cls, "SQLALCHEMY_TRACK_MODIFICATIONS", False),
             "echo": getattr(cls, "SQLALCHEMY_ECHO", False),
             "recordQueries": getattr(cls, "SQLALCHEMY_RECORD_QUERIES", False),
             "engineOptions": {
                 key: value
-                for key, value in getattr(cls, "SQLALCHEMY_ENGINE_OPTIONS", {}).items()
+                for key, value in engine_options.items()
                 if key != "connect_args"
             },
-            "connectArgs": {
-                key: value
-                for key, value in getattr(cls, "SQLALCHEMY_ENGINE_OPTIONS", {})
-                .get("connect_args", {})
-                .items()
-            },
+            "connectArgs": dict(connect_args),
             "checkOnStartup": cls.VECTOPLAN_CHUNK_DB_CHECK_ON_STARTUP,
             "requireOnStartup": cls.VECTOPLAN_CHUNK_DB_REQUIRE_ON_STARTUP,
             "requireMigrations": cls.VECTOPLAN_CHUNK_REQUIRE_MIGRATIONS,
+            "bootstrapEnabled": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED,
+            "bootstrapCreateAll": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL,
+            "bootstrapSeedDefaults": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS,
+            "bootstrapSeedDebugBlocks": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS,
+            "bootstrapSeedDevProject": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT,
+            "bootstrapRepairMissingColumns": (
+                cls.VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS
+            ),
+            "bootstrapFailOnError": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR,
+            "seedOnEmptyOnly": cls.VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY,
+            "allowRuntimeDbMutations": cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS,
+            "runtimeIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY,
             "autoCreateAll": cls.VECTOPLAN_CHUNK_AUTO_CREATE_ALL,
             "autoSeedDefaults": cls.VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS,
             "seedDebugBlocks": cls.VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS,
             "seedDevProject": cls.VECTOPLAN_CHUNK_SEED_DEV_PROJECT,
+            "useAdvisoryLock": cls.VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK,
+            "advisoryLockKey": cls.VECTOPLAN_CHUNK_BOOTSTRAP_ADVISORY_LOCK_KEY,
+            "connectMaxAttempts": cls.VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_MAX_ATTEMPTS,
+            "connectRetrySeconds": cls.VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_RETRY_SECONDS,
+            "connectTimeoutSeconds": (
+                cls.VECTOPLAN_CHUNK_BOOTSTRAP_CONNECT_TIMEOUT_SECONDS
+            ),
         }
 
     @classmethod
@@ -1180,15 +1824,19 @@ class BaseConfig:
             "universeSlug": cls.VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG,
             "universeName": cls.VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_NAME,
             "worldId": cls.VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID,
+            "defaultWorldId": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_ID,
+            "instanceWorldId": cls.VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID,
             "worldSlug": cls.VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG,
             "worldName": cls.VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_NAME,
-            "templateId": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID,
+            "templateId": cls.VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID,
+            "worldTemplateId": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID,
             "providerWorldId": cls.VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID,
+            "legacyProviderWorldId": cls.VECTOPLAN_CHUNK_LEGACY_DEFAULT_PROVIDER_WORLD_ID,
             "providerId": cls.VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID,
-            "legacyDefaultWorldId": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_ID,
             "worldType": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_TYPE,
             "worldRole": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_ROLE,
             "worldScope": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_SCOPE,
+            "worldOwnerType": cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_OWNER_TYPE,
             "generatorType": cls.VECTOPLAN_CHUNK_DEFAULT_GENERATOR_TYPE,
             "generatorVersion": cls.VECTOPLAN_CHUNK_DEFAULT_GENERATOR_VERSION,
             "projectionType": cls.VECTOPLAN_CHUNK_DEFAULT_PROJECTION_TYPE,
@@ -1216,6 +1864,61 @@ class BaseConfig:
         }
 
     @classmethod
+    def build_project_provisioning_config(cls) -> dict[str, Any]:
+        """Build project provisioning config for status/debug output."""
+        return {
+            "enabled": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED,
+            "idempotent": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_IDEMPOTENT,
+            "sourceService": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SOURCE_SERVICE,
+            "requireExternalAppProjectId": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EXTERNAL_APP_PROJECT_ID
+            ),
+            "allowExistingByExternalId": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_EXISTING_BY_EXTERNAL_ID
+            ),
+            "allowNameUpdate": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_NAME_UPDATE,
+            "allowMetadataUpdate": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_METADATA_UPDATE
+            ),
+            "createUniverse": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_UNIVERSE,
+            "createWorld": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_WORLD,
+            "createBlockRegistryRef": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_CREATE_BLOCK_REGISTRY_REF
+            ),
+            "projectIdPrefix": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PROJECT_ID_PREFIX,
+            "universeIdPrefix": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_UNIVERSE_ID_PREFIX,
+            "worldIdPrefix": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_WORLD_ID_PREFIX,
+            "defaultTemplateId": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID
+            ),
+            "defaultWorldId": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID,
+            "defaultWorldName": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_NAME,
+            "defaultUniverseName": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_UNIVERSE_NAME
+            ),
+            "routeByAppEnabled": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_BY_APP_ENABLED
+            ),
+            "routeEnsureEnabled": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_ENSURE_ENABLED
+            ),
+            "maxMetadataBytes": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES,
+        }
+
+    @classmethod
+    def build_readiness_config(cls) -> dict[str, Any]:
+        """Build readiness/health config."""
+        return {
+            "healthcheckPath": cls.VECTOPLAN_CHUNK_HEALTHCHECK_PATH,
+            "healthcheckRequireOk": cls.VECTOPLAN_CHUNK_HEALTHCHECK_REQUIRE_OK,
+            "schemaReadyRequired": cls.VECTOPLAN_CHUNK_SCHEMA_READY_REQUIRED,
+            "seedReadyRequired": cls.VECTOPLAN_CHUNK_SEED_READY_REQUIRED,
+            "defaultWorldReadyRequired": (
+                cls.VECTOPLAN_CHUNK_DEFAULT_WORLD_READY_REQUIRED
+            ),
+        }
+
+    @classmethod
     def build_service_status_context(cls) -> dict[str, Any]:
         """Build compact service/config metadata for health/status output."""
         return {
@@ -1227,11 +1930,20 @@ class BaseConfig:
             "extensionNamespace": cls.VECTOPLAN_EXTENSION_NAMESPACE,
             "debug": cls.DEBUG,
             "testing": cls.TESTING,
+            "mode": cls.VECTOPLAN_CHUNK_MODE,
+            "startupMode": cls.VECTOPLAN_CHUNK_STARTUP_MODE,
+            "runtimeMode": cls.VECTOPLAN_CHUNK_RUNTIME_MODE,
+            "runMode": cls.VECTOPLAN_CHUNK_RUN_MODE,
+            "runStartupHooks": cls.VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS,
+            "runtimeIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY,
+            "allowRuntimeDbMutations": cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS,
             "devRoutesEnabled": cls.VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES,
             "legacyRoutesEnabled": cls.VECTOPLAN_CHUNK_ENABLE_LEGACY_ROUTES,
             "projectScopedApiEnabled": True,
             "database": cls.build_database_config(),
             "worldStateDefaults": cls.build_world_state_defaults(),
+            "projectProvisioning": cls.build_project_provisioning_config(),
+            "readiness": cls.build_readiness_config(),
         }
 
     @classmethod
@@ -1239,8 +1951,8 @@ class BaseConfig:
         """
         Validate configuration.
 
-        This intentionally returns errors instead of raising so app startup can
-        decide whether to fail fast or only report status.
+        Returns errors instead of raising so app startup can decide whether to
+        fail fast or only report status.
         """
         errors: list[str] = []
 
@@ -1256,6 +1968,15 @@ class BaseConfig:
         if not isinstance(database_uri, str) or not database_uri:
             errors.append("SQLALCHEMY_DATABASE_URI or DATABASE_URL must be set.")
 
+        startup_mode = _normalize_mode(getattr(cls, "VECTOPLAN_CHUNK_STARTUP_MODE", None))
+        run_mode = _normalize_text(getattr(cls, "VECTOPLAN_CHUNK_RUN_MODE", None))
+
+        if not startup_mode:
+            errors.append("VECTOPLAN_CHUNK_STARTUP_MODE must be set.")
+
+        if not run_mode:
+            errors.append("VECTOPLAN_CHUNK_RUN_MODE must be set.")
+
         project_id = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", None)
         if not isinstance(project_id, str) or not project_id:
             errors.append("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID must be set.")
@@ -1268,19 +1989,32 @@ class BaseConfig:
         if not isinstance(instance_world_id, str) or not instance_world_id:
             errors.append("VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID must be set.")
 
-        template_id = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID", None)
+        default_world_id = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID", None)
+        if default_world_id != instance_world_id:
+            errors.append(
+                "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID should equal "
+                "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID for the concrete editable world."
+            )
+
+        template_id = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID", None)
         if not isinstance(template_id, str) or not template_id:
-            errors.append("VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID must be set.")
+            errors.append("VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID must be set.")
 
         provider_world_id = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", None)
         if not isinstance(provider_world_id, str) or not provider_world_id:
             errors.append("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID must be set.")
 
-        if instance_world_id == provider_world_id:
+        if isinstance(instance_world_id, str) and isinstance(provider_world_id, str):
+            if instance_world_id == provider_world_id:
+                errors.append(
+                    "Concrete instance world id must not equal provider world id. "
+                    "Use world_spawn for the concrete project world and flat for provider."
+                )
+
+        if isinstance(instance_world_id, str) and _looks_like_provider_or_template_world_id(instance_world_id):
             errors.append(
-                "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID should not equal "
-                "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID. Use world_spawn for "
-                "the concrete project world and flat for the provider world."
+                "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID looks like a provider/template id. "
+                "Use world_spawn for the concrete editable world."
             )
 
         chunk_size = getattr(cls, "VECTOPLAN_CHUNK_DEFAULT_CHUNK_SIZE", None)
@@ -1302,6 +2036,58 @@ class BaseConfig:
                 errors.append("VECTOPLAN_CHUNK_DEFAULT_MIN_Y must not be greater than MAX_Y.")
             if surface_y < min_y or surface_y > max_y:
                 errors.append("VECTOPLAN_CHUNK_DEFAULT_SURFACE_Y must be between MIN_Y and MAX_Y.")
+
+        if cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY and cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS:
+            errors.append(
+                "Runtime cannot be both read-only and allow runtime DB mutations. "
+                "Set VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS=false for runtime."
+            )
+
+        if _is_runtime_mode(startup_mode):
+            if cls.VECTOPLAN_CHUNK_AUTO_CREATE_ALL:
+                errors.append("Runtime startup must not enable VECTOPLAN_CHUNK_AUTO_CREATE_ALL.")
+            if cls.VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS:
+                errors.append("Runtime startup must not enable VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS.")
+            if cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL:
+                errors.append(
+                    "Runtime startup must not enable "
+                    "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL."
+                )
+            if cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS:
+                errors.append(
+                    "Runtime startup must not enable "
+                    "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS."
+                )
+
+        if _is_bootstrap_mode(startup_mode):
+            if cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY:
+                errors.append("Bootstrap mode must not be read-only.")
+            if not cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS:
+                errors.append("Bootstrap mode must allow DB mutations.")
+
+        if cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED:
+            if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PROJECT_ID_PREFIX:
+                errors.append("Provisioning project id prefix must not be empty.")
+            if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_UNIVERSE_ID_PREFIX:
+                errors.append("Provisioning universe id prefix must not be empty.")
+            if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_WORLD_ID_PREFIX:
+                errors.append("Provisioning world id prefix must not be empty.")
+            if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID:
+                errors.append("Provisioning default template id must not be empty.")
+            if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID:
+                errors.append("Provisioning default world id must not be empty.")
+
+        provisioning_world_id = getattr(
+            cls,
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID",
+            None,
+        )
+        if isinstance(provisioning_world_id, str):
+            if _looks_like_provider_or_template_world_id(provisioning_world_id):
+                errors.append(
+                    "Provisioning default world id looks like a provider/template id. "
+                    "Use world_spawn or a concrete project world id."
+                )
 
         route_path = getattr(cls, "EDITOR_ROUTE_PATH", None)
         if not isinstance(route_path, str) or not route_path.startswith("/"):
@@ -1347,34 +2133,31 @@ class Config(BaseConfig):
     APP_ENV = _read_str_env_any(
         (
             "VECTOPLAN_CHUNK_ENV",
-            "VECTOPLAN_EDITOR_ENV",
             "APP_ENV",
             "FLASK_ENV",
         ),
         "development",
     )
+
     DEBUG = _read_bool_env_any(
         (
             "VECTOPLAN_CHUNK_DEBUG",
-            "VECTOPLAN_EDITOR_DEBUG",
             "DEBUG",
             "FLASK_DEBUG",
         ),
         True,
     )
+
     TESTING = _read_bool_env_any(
         (
             "VECTOPLAN_CHUNK_TESTING",
-            "VECTOPLAN_EDITOR_TESTING",
             "TESTING",
         ),
         False,
     )
-    TEMPLATES_AUTO_RELOAD = _read_bool_env_any(
-        (
-            "VECTOPLAN_CHUNK_TEMPLATES_AUTO_RELOAD",
-            "VECTOPLAN_EDITOR_TEMPLATES_AUTO_RELOAD",
-        ),
+
+    TEMPLATES_AUTO_RELOAD = _read_bool_env(
+        "VECTOPLAN_CHUNK_TEMPLATES_AUTO_RELOAD",
         True,
     )
 
@@ -1386,17 +2169,100 @@ class DevelopmentConfig(BaseConfig):
     DEBUG = True
     TESTING = False
     TEMPLATES_AUTO_RELOAD = True
-    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env_any(
-        (
-            "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
-            "VECTOPLAN_EDITOR_SEND_FILE_MAX_AGE_DEFAULT",
-        ),
+
+    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env(
+        "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
         default=0,
         minimum=0,
     )
+
     VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES = True
     VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS = _read_bool_env(
         "VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS",
+        True,
+    )
+
+
+class BootstrapConfig(BaseConfig):
+    """
+    Explicit DB bootstrap configuration.
+
+    This class is used by bootstrap code paths. It allows DB mutations and
+    defaults create/seed switches to true unless explicitly overridden.
+    """
+
+    APP_ENV = "bootstrap"
+    DEBUG = _read_bool_env("VECTOPLAN_CHUNK_DEBUG", True)
+    TESTING = False
+
+    VECTOPLAN_CHUNK_MODE = "db-bootstrap"
+    VECTOPLAN_CHUNK_STARTUP_MODE = "db-bootstrap"
+    VECTOPLAN_CHUNK_RUNTIME_MODE = "db-bootstrap"
+    VECTOPLAN_CHUNK_RUN_MODE = "db-bootstrap"
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = False
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = True
+    VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_AUTO_CREATE_ALL = _read_bool_env(
+        "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS = _read_bool_env(
+        "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SEED_DEV_PROJECT = _read_bool_env(
+        "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
+        VECTOPLAN_CHUNK_AUTO_CREATE_ALL,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
+        VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+        VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+        VECTOPLAN_CHUNK_SEED_DEV_PROJECT,
+    )
+
+    VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS = _read_bool_env(
+        "VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR = _read_bool_env(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY",
         True,
     )
 
@@ -1407,14 +2273,15 @@ class TestingConfig(BaseConfig):
     APP_ENV = "testing"
     DEBUG = True
     TESTING = True
+
     SECRET_KEY = _read_str_env_any(
         (
             "VECTOPLAN_CHUNK_TEST_SECRET_KEY",
-            "VECTOPLAN_EDITOR_TEST_SECRET_KEY",
             "TEST_SECRET_KEY",
         ),
         "test-secret-key",
     )
+
     TEMPLATES_AUTO_RELOAD = True
     SEND_FILE_MAX_AGE_DEFAULT = 0
     VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES = True
@@ -1425,14 +2292,36 @@ class TestingConfig(BaseConfig):
     SQLALCHEMY_ENGINE_OPTIONS = {}
     VECTOPLAN_CHUNK_DATABASE_URL_MASKED = _mask_database_uri(DATABASE_URL)
 
+    VECTOPLAN_CHUNK_MODE = "testing"
+    VECTOPLAN_CHUNK_STARTUP_MODE = "testing"
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = False
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = True
+
     VECTOPLAN_CHUNK_AUTO_CREATE_ALL = _read_bool_env(
         "VECTOPLAN_CHUNK_TEST_AUTO_CREATE_ALL",
         True,
     )
+
     VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS = _read_bool_env(
         "VECTOPLAN_CHUNK_TEST_AUTO_SEED_DEFAULTS",
         True,
     )
+
+    VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS = _read_bool_env(
+        "VECTOPLAN_CHUNK_TEST_SEED_DEBUG_BLOCKS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SEED_DEV_PROJECT = _read_bool_env(
+        "VECTOPLAN_CHUNK_TEST_SEED_DEV_PROJECT",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL = VECTOPLAN_CHUNK_AUTO_CREATE_ALL
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS = VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS = VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT = VECTOPLAN_CHUNK_SEED_DEV_PROJECT
+    VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS = True
 
 
 class ProductionConfig(BaseConfig):
@@ -1442,35 +2331,41 @@ class ProductionConfig(BaseConfig):
     DEBUG = False
     TESTING = False
     TEMPLATES_AUTO_RELOAD = False
-    SESSION_COOKIE_SECURE = _read_bool_env_any(
-        (
-            "VECTOPLAN_CHUNK_SESSION_COOKIE_SECURE",
-            "VECTOPLAN_EDITOR_SESSION_COOKIE_SECURE",
-        ),
+
+    SESSION_COOKIE_SECURE = _read_bool_env(
+        "VECTOPLAN_CHUNK_SESSION_COOKIE_SECURE",
         True,
     )
-    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env_any(
-        (
-            "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
-            "VECTOPLAN_EDITOR_SEND_FILE_MAX_AGE_DEFAULT",
-        ),
+
+    SEND_FILE_MAX_AGE_DEFAULT = _read_int_env(
+        "VECTOPLAN_CHUNK_SEND_FILE_MAX_AGE_DEFAULT",
         default=3600,
         minimum=0,
     )
+
     VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS = False
     VECTOPLAN_CHUNK_BOOTSTRAP_REQUIRE_PROVIDER_WORLDS = True
 
-    VECTOPLAN_CHUNK_AUTO_CREATE_ALL = _read_bool_env(
-        "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
-        False,
-    )
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = True
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = False
+    VECTOPLAN_CHUNK_AUTO_CREATE_ALL = False
+    VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS = False
+    VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS = False
+    VECTOPLAN_CHUNK_SEED_DEV_PROJECT = False
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL = False
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS = False
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS = False
+    VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT = False
+    VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS = False
+
     VECTOPLAN_CHUNK_DB_REQUIRE_ON_STARTUP = _read_bool_env(
         "VECTOPLAN_CHUNK_DB_REQUIRE_ON_STARTUP",
         True,
     )
+
     VECTOPLAN_CHUNK_REQUIRE_MIGRATIONS = _read_bool_env(
         "VECTOPLAN_CHUNK_REQUIRE_MIGRATIONS",
-        True,
+        False,
     )
 
 
@@ -1480,6 +2375,14 @@ CONFIG_BY_NAME: Final[dict[str, type[BaseConfig]]] = {
     "development": DevelopmentConfig,
     "dev": DevelopmentConfig,
     "local": DevelopmentConfig,
+    "bootstrap": BootstrapConfig,
+    "db-bootstrap": BootstrapConfig,
+    "db_bootstrap": BootstrapConfig,
+    "db-init": BootstrapConfig,
+    "db_init": BootstrapConfig,
+    "init": BootstrapConfig,
+    "database-bootstrap": BootstrapConfig,
+    "database_bootstrap": BootstrapConfig,
     "testing": TestingConfig,
     "test": TestingConfig,
     "production": ProductionConfig,
@@ -1491,25 +2394,30 @@ def get_config_class(name: str | None = None) -> type[BaseConfig]:
     """
     Return config class.
 
-    Priority:
-    1. explicit name
-    2. VECTOPLAN_CHUNK_CONFIG
-    3. VECTOPLAN_EDITOR_CONFIG
-    4. APP_CONFIG
-    5. Config
+    Bootstrap mode has priority over a generic development config name because
+    bootstrap scripts often pass --config development while setting
+    VECTOPLAN_CHUNK_STARTUP_MODE=db-bootstrap.
     """
+    startup_mode = _current_startup_mode("runtime")
     requested_name = _normalize_text(name)
+
     if requested_name is None:
         requested_name = _read_str_env_any(
             (
                 "VECTOPLAN_CHUNK_CONFIG",
-                "VECTOPLAN_EDITOR_CONFIG",
                 "APP_CONFIG",
             ),
             "default",
         )
 
-    key = requested_name.lower()
+    key = requested_name.lower().replace("_", "-") if requested_name else "default"
+
+    if _is_bootstrap_mode(startup_mode) and key not in {"testing", "test"}:
+        return BootstrapConfig
+
+    if _is_check_only_mode(startup_mode) and key not in {"testing", "test", "production", "prod"}:
+        return Config
+
     return CONFIG_BY_NAME.get(key, Config)
 
 
@@ -1541,11 +2449,17 @@ __all__ = [
     "DEFAULT_DATABASE_NAME",
     "DEFAULT_DATABASE_USER",
     "DEFAULT_DATABASE_PASSWORD",
+    "DEFAULT_PROVISIONING_SOURCE_SERVICE",
+    "DEFAULT_PROVISIONING_PROJECT_PREFIX",
+    "DEFAULT_PROVISIONING_UNIVERSE_PREFIX",
+    "DEFAULT_PROVISIONING_WORLD_PREFIX",
     "BaseConfig",
     "Config",
     "DevelopmentConfig",
+    "BootstrapConfig",
     "TestingConfig",
     "ProductionConfig",
     "CONFIG_BY_NAME",
     "get_config_class",
+    "refresh_env_cache",
 ]

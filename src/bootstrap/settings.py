@@ -5,35 +5,40 @@ Central startup/bootstrap settings for the `vectoplan-chunk` service.
 This module is intentionally read-only.
 
 Responsibilities:
-- normalize Flask config and environment variables
-- provide stable runtime-startup settings
-- provide stable database-bootstrap settings
-- keep dangerous DB mutation flags out of normal Gunicorn runtime by default
-- centralize aliases and defaults for startup, schema bootstrap and seed bootstrap
-- expose compact serializable summaries for status/debug endpoints
+- normalize Flask config and environment variables,
+- provide stable runtime-startup settings,
+- provide stable database-bootstrap settings,
+- keep dangerous DB mutation flags out of normal Gunicorn runtime by default,
+- centralize aliases and defaults for startup, schema bootstrap and seed bootstrap,
+- expose compact serializable summaries for status/debug endpoints.
 
 Important boundaries:
-- no Flask app creation here
-- no DB queries here
-- no db.create_all() here
-- no seeding here
-- no model imports here
-- no chunk generation here
-- no ORM object traversal here
+- no Flask app creation here,
+- no DB queries here,
+- no db.create_all() here,
+- no seeding here,
+- no model imports here,
+- no chunk generation here,
+- no ORM object traversal here.
 
 Design rule:
 
     Runtime startup must be cheap and read-only.
     Database bootstrap must be explicit and controlled.
 
+World-id rule:
+
+    world_spawn = concrete editable WorldInstance.
+    flat        = template/provider id only.
+
 The service may still read old legacy flags like:
 
     VECTOPLAN_CHUNK_AUTO_CREATE_ALL
     VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS
 
-but runtime execution must only mutate the DB when the explicit runtime mutation
-guard is enabled:
+but runtime execution must only mutate the DB when both conditions are true:
 
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY=false
     VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS=true
 
 Default:
@@ -47,6 +52,7 @@ import os
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Final, Iterable, Mapping, MutableMapping, Sequence
+from urllib.parse import quote_plus
 
 
 # -----------------------------------------------------------------------------
@@ -135,18 +141,37 @@ RUNTIME_MODES: Final[set[str]] = {
     "gunicorn",
     "flask",
     "web",
+    "wsgi",
+    "python",
+    "serve",
 }
 
 DB_BOOTSTRAP_MODES: Final[set[str]] = {
     "db-bootstrap",
     "bootstrap-db",
+    "bootstrap",
     "schema-bootstrap",
+    "database-bootstrap",
     "init-db",
     "db-init",
+    "init",
     "migrate-dev",
 }
 
-ALL_KNOWN_MODES: Final[set[str]] = RUNTIME_MODES | DB_BOOTSTRAP_MODES
+CHECK_ONLY_MODES: Final[set[str]] = {
+    "check",
+    "check-only",
+    "db-check",
+    "database-check",
+    "schema-check",
+    "readiness-check",
+}
+
+ALL_KNOWN_MODES: Final[set[str]] = (
+    RUNTIME_MODES
+    | DB_BOOTSTRAP_MODES
+    | CHECK_ONLY_MODES
+)
 
 MISSING: Final[object] = object()
 
@@ -168,6 +193,7 @@ class ServiceIdentitySettings:
     mode: str
     is_runtime_mode: bool
     is_db_bootstrap_mode: bool
+    is_check_only_mode: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +222,7 @@ class RuntimeStartupSettings:
     startup_module: str
     print_startup_summary: bool
 
+    runtime_is_read_only: bool
     allow_runtime_db_mutations: bool
 
     auto_create_all_requested: bool
@@ -257,6 +284,7 @@ class SchemaBootstrapSettings:
 
     bootstrap_enabled: bool
     create_all: bool
+    repair_missing_columns: bool
     require_migrations: bool
     advisory_lock_enabled: bool
     advisory_lock_key: int
@@ -275,6 +303,7 @@ class SeedBootstrapSettings:
     seed_debug_blocks: bool
     seed_dev_project: bool
     seed_on_empty_only: bool
+    repair_seed_invariants: bool
 
     advisory_lock_enabled: bool
     advisory_lock_key: int
@@ -294,6 +323,8 @@ class WorldDefaultsSettings:
     universe_name: str
 
     world_id: str
+    default_world_id: str
+    instance_world_id: str
     world_slug: str
     world_name: str
 
@@ -345,6 +376,12 @@ class ApiSettings:
 
     api_prefix: str
     healthcheck_path: str
+    healthcheck_require_ok: bool
+
+    schema_ready_required: bool
+    seed_ready_required: bool
+    default_world_ready_required: bool
+
     max_batch_chunks: int
     route_max_batch_chunks: int
     max_command_affected_cells: int
@@ -550,6 +587,100 @@ def _safe_has_mapping_key(mapping: Mapping[str, Any] | MutableMapping[str, Any],
         return False
 
 
+def _quote_db_part(value: str) -> str:
+    """Quote a database URI component."""
+    try:
+        return quote_plus(value)
+    except Exception:
+        return value
+
+
+def _provider_like_world_id(
+    value: Any,
+    *,
+    template_id: str = DEFAULT_TEMPLATE_ID,
+    provider_id: str = DEFAULT_PROVIDER_ID,
+    provider_world_id: str = DEFAULT_PROVIDER_WORLD_ID,
+) -> bool:
+    """Return whether value looks like provider/template id."""
+    text = _safe_lower(value, "")
+    if not text:
+        return False
+
+    return text in {
+        DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+        _safe_lower(template_id, DEFAULT_TEMPLATE_ID),
+        _safe_lower(provider_id, DEFAULT_PROVIDER_ID),
+        _safe_lower(provider_world_id, DEFAULT_PROVIDER_WORLD_ID),
+    }
+
+
+def _normalize_concrete_world_id(
+    value: Any,
+    *,
+    template_id: str,
+    provider_id: str,
+    provider_world_id: str,
+    default: str = DEFAULT_WORLD_ID,
+) -> str:
+    """Normalize concrete editable world id and reject provider/template drift."""
+    candidate = _safe_str(value, default)
+    if _provider_like_world_id(
+        candidate,
+        template_id=template_id,
+        provider_id=provider_id,
+        provider_world_id=provider_world_id,
+    ):
+        return default
+    return candidate or default
+
+
+def _mask_uri(uri: str) -> str:
+    """Mask credentials in a URI-like string."""
+    text = _safe_str(uri, "")
+    if not text:
+        return ""
+
+    try:
+        if "://" not in text or "@" not in text:
+            return text
+
+        scheme, rest = text.split("://", 1)
+        credentials, host_part = rest.split("@", 1)
+
+        if ":" not in credentials:
+            return f"{scheme}://{credentials}@{host_part}"
+
+        username, _password = credentials.split(":", 1)
+        return f"{scheme}://{username}:***@{host_part}"
+    except Exception:
+        return "<masked>"
+
+
+def _mask_sensitive_value(key: str, value: Any) -> str:
+    """Mask password/secret/token/URI values for diagnostics."""
+    safe_key = _safe_lower(key, "")
+    safe_value = _safe_str(value, "")
+
+    if not safe_value:
+        return ""
+
+    if (
+        "password" in safe_key
+        or "secret" in safe_key
+        or "token" in safe_key
+        or "credential" in safe_key
+    ):
+        return "***"
+
+    if safe_key.endswith("url") or safe_key.endswith("uri") or "database_url" in safe_key or "database_uri" in safe_key:
+        return _mask_uri(safe_value)
+
+    return safe_value
+
+
 # -----------------------------------------------------------------------------
 # Config/env read helpers
 # -----------------------------------------------------------------------------
@@ -615,7 +746,7 @@ def get_raw_setting(
     Read a raw setting from environment and Flask config.
 
     Environment values are preferred by default because Docker Compose and local
-    PowerShell test sessions should be able to override stale config defaults.
+    shell sessions should be able to override stale config defaults.
     """
     keys = _dedupe_keys(key, aliases)
 
@@ -734,10 +865,14 @@ def build_database_uri_from_parts(
             return "sqlite:///:memory:"
         return f"sqlite:///{database}"
 
-    if password:
-        return f"{driver}://{user}:{password}@{host}:{port}/{database}"
+    safe_user = _quote_db_part(user)
+    safe_password = _quote_db_part(password)
+    safe_database = _quote_db_part(database)
 
-    return f"{driver}://{user}@{host}:{port}/{database}"
+    if safe_password:
+        return f"{driver}://{safe_user}:{safe_password}@{host}:{port}/{safe_database}"
+
+    return f"{driver}://{safe_user}@{host}:{port}/{safe_database}"
 
 
 def is_postgresql_uri(uri: str) -> bool:
@@ -761,6 +896,18 @@ def normalize_mode(value: Any, default: str = "runtime") -> str:
 
     mode = mode.replace("_", "-").strip()
 
+    if mode in {"dbbootstrap", "db-bootstrap"}:
+        return "db-bootstrap"
+
+    if mode in {"dbinit", "db-init"}:
+        return "db-init"
+
+    if mode in {"checkonly", "check-only"}:
+        return "check-only"
+
+    if mode in {"dbcheck", "db-check"}:
+        return "db-check"
+
     if mode in ALL_KNOWN_MODES:
         return mode
 
@@ -777,6 +924,11 @@ def is_db_bootstrap_mode(mode: str) -> bool:
     return normalize_mode(mode, "runtime") in DB_BOOTSTRAP_MODES
 
 
+def is_check_only_mode(mode: str) -> bool:
+    """Return whether mode is a read-only check mode."""
+    return normalize_mode(mode, "runtime") in CHECK_ONLY_MODES
+
+
 # -----------------------------------------------------------------------------
 # Settings builders
 # -----------------------------------------------------------------------------
@@ -789,8 +941,13 @@ def build_service_identity_settings(app: Any = None) -> ServiceIdentitySettings:
             "VECTOPLAN_CHUNK_MODE",
             "runtime",
             aliases=(
+                "VECTOPLAN_CHUNK_STARTUP_MODE",
+                "VECTOPLAN_CHUNK_RUNTIME_MODE",
                 "VECTOPLAN_CHUNK_RUN_MODE",
                 "VECTOPLAN_RUN_MODE",
+                "SERVICE_STARTUP_MODE",
+                "APP_STARTUP_MODE",
+                "STARTUP_MODE",
                 "RUN_MODE",
             ),
         ),
@@ -856,11 +1013,22 @@ def build_service_identity_settings(app: Any = None) -> ServiceIdentitySettings:
         mode=mode,
         is_runtime_mode=is_runtime_mode(mode),
         is_db_bootstrap_mode=is_db_bootstrap_mode(mode),
+        is_check_only_mode=is_check_only_mode(mode),
     )
 
 
 def build_runtime_startup_settings(app: Any = None) -> RuntimeStartupSettings:
     """Build read-only runtime startup settings."""
+    runtime_is_read_only = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY",
+        True,
+        aliases=(
+            "CHUNK_RUNTIME_IS_READ_ONLY",
+            "RUNTIME_IS_READ_ONLY",
+        ),
+    )
+
     allow_runtime_db_mutations = get_bool_setting(
         app,
         "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
@@ -899,17 +1067,26 @@ def build_runtime_startup_settings(app: Any = None) -> RuntimeStartupSettings:
         aliases=("CHUNK_SEED_DEV_PROJECT",),
     )
 
+    mutation_allowed_in_runtime = bool(
+        not runtime_is_read_only
+        and allow_runtime_db_mutations
+    )
+
     auto_create_all_in_runtime = bool(
-        allow_runtime_db_mutations and auto_create_all_requested
+        mutation_allowed_in_runtime
+        and auto_create_all_requested
     )
     auto_seed_defaults_in_runtime = bool(
-        allow_runtime_db_mutations and auto_seed_defaults_requested
+        mutation_allowed_in_runtime
+        and auto_seed_defaults_requested
     )
     seed_debug_blocks_in_runtime = bool(
-        auto_seed_defaults_in_runtime and seed_debug_blocks_requested
+        auto_seed_defaults_in_runtime
+        and seed_debug_blocks_requested
     )
     seed_dev_project_in_runtime = bool(
-        auto_seed_defaults_in_runtime and seed_dev_project_requested
+        auto_seed_defaults_in_runtime
+        and seed_dev_project_requested
     )
 
     return RuntimeStartupSettings(
@@ -1000,6 +1177,7 @@ def build_runtime_startup_settings(app: Any = None) -> RuntimeStartupSettings:
                 "VECTOPLAN_EDITOR_PRINT_STARTUP_SUMMARY",
             ),
         ),
+        runtime_is_read_only=runtime_is_read_only,
         allow_runtime_db_mutations=allow_runtime_db_mutations,
         auto_create_all_requested=auto_create_all_requested,
         auto_seed_defaults_requested=auto_seed_defaults_requested,
@@ -1024,13 +1202,23 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
         app,
         "VECTOPLAN_CHUNK_DB_HOST",
         DEFAULT_DB_HOST,
-        aliases=("CHUNK_DB_HOST",),
+        aliases=(
+            "VECTOPLAN_CHUNK_POSTGRES_HOST",
+            "POSTGRES_HOST",
+            "CHUNK_DB_HOST",
+            "DB_HOST",
+        ),
     )
     port = get_int_setting(
         app,
         "VECTOPLAN_CHUNK_DB_PORT",
         DEFAULT_DB_PORT,
-        aliases=("CHUNK_DB_PORT",),
+        aliases=(
+            "VECTOPLAN_CHUNK_POSTGRES_PORT",
+            "POSTGRES_PORT",
+            "CHUNK_DB_PORT",
+            "DB_PORT",
+        ),
         minimum=1,
         maximum=65535,
     )
@@ -1038,19 +1226,34 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
         app,
         "VECTOPLAN_CHUNK_DB_NAME",
         DEFAULT_DB_NAME,
-        aliases=("CHUNK_DB_NAME",),
+        aliases=(
+            "VECTOPLAN_CHUNK_POSTGRES_DB",
+            "POSTGRES_DB",
+            "CHUNK_DB_NAME",
+            "DB_NAME",
+        ),
     )
     user = get_str_setting(
         app,
         "VECTOPLAN_CHUNK_DB_USER",
         DEFAULT_DB_USER,
-        aliases=("CHUNK_DB_USER",),
+        aliases=(
+            "VECTOPLAN_CHUNK_POSTGRES_USER",
+            "POSTGRES_USER",
+            "CHUNK_DB_USER",
+            "DB_USER",
+        ),
     )
     password = get_str_setting(
         app,
         "VECTOPLAN_CHUNK_DB_PASSWORD",
         DEFAULT_DB_PASSWORD,
-        aliases=("CHUNK_DB_PASSWORD",),
+        aliases=(
+            "VECTOPLAN_CHUNK_POSTGRES_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "CHUNK_DB_PASSWORD",
+            "DB_PASSWORD",
+        ),
     )
 
     uri_from_parts = build_database_uri_from_parts(
@@ -1062,10 +1265,22 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
         database=name,
     )
 
+    database_uri = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DATABASE_URI",
+        uri_from_parts,
+        aliases=(
+            "VECTOPLAN_CHUNK_DATABASE_URL",
+            "VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI",
+            "DATABASE_URL",
+            "SQLALCHEMY_DATABASE_URI",
+        ),
+    )
+
     sqlalchemy_database_uri = get_str_setting(
         app,
         "SQLALCHEMY_DATABASE_URI",
-        uri_from_parts,
+        database_uri,
         aliases=(
             "VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI",
             "VECTOPLAN_CHUNK_DATABASE_URI",
@@ -1073,16 +1288,7 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
             "DATABASE_URL",
         ),
     )
-    database_uri = get_str_setting(
-        app,
-        "VECTOPLAN_CHUNK_DATABASE_URI",
-        sqlalchemy_database_uri,
-        aliases=(
-            "VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI",
-            "SQLALCHEMY_DATABASE_URI",
-            "DATABASE_URL",
-        ),
-    )
+
     database_url = get_str_setting(
         app,
         "DATABASE_URL",
@@ -1090,6 +1296,7 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
         aliases=(
             "VECTOPLAN_CHUNK_DATABASE_URL",
             "VECTOPLAN_CHUNK_DATABASE_URI",
+            "VECTOPLAN_CHUNK_SQLALCHEMY_DATABASE_URI",
             "SQLALCHEMY_DATABASE_URI",
         ),
     )
@@ -1160,7 +1367,10 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
             app,
             "VECTOPLAN_CHUNK_DB_CONNECT_TIMEOUT",
             15,
-            aliases=("DATABASE_CONNECT_TIMEOUT",),
+            aliases=(
+                "VECTOPLAN_CHUNK_DATABASE_CONNECT_TIMEOUT",
+                "DATABASE_CONNECT_TIMEOUT",
+            ),
             minimum=1,
         ),
         wait_for_ready=get_bool_setting(
@@ -1202,10 +1412,13 @@ def build_database_settings(app: Any = None) -> DatabaseSettings:
 
 def build_schema_bootstrap_settings(app: Any = None) -> SchemaBootstrapSettings:
     """Build explicit schema-bootstrap settings."""
+    identity = build_service_identity_settings(app)
+    bootstrap_default = bool(identity.is_db_bootstrap_mode)
+
     bootstrap_enabled = get_bool_setting(
         app,
         "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
-        False,
+        bootstrap_default,
         aliases=(
             "CHUNK_DB_BOOTSTRAP_ENABLED",
             "DB_BOOTSTRAP_ENABLED",
@@ -1217,14 +1430,28 @@ def build_schema_bootstrap_settings(app: Any = None) -> SchemaBootstrapSettings:
         "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
         bootstrap_enabled,
         aliases=(
+            "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
             "CHUNK_DB_BOOTSTRAP_CREATE_ALL",
             "DB_BOOTSTRAP_CREATE_ALL",
+            "CHUNK_AUTO_CREATE_ALL",
+        ),
+    )
+
+    repair_missing_columns = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+        bootstrap_enabled,
+        aliases=(
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+            "CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+            "DB_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
         ),
     )
 
     return SchemaBootstrapSettings(
         bootstrap_enabled=bootstrap_enabled,
         create_all=create_all,
+        repair_missing_columns=repair_missing_columns,
         require_migrations=get_bool_setting(
             app,
             "VECTOPLAN_CHUNK_REQUIRE_MIGRATIONS",
@@ -1236,6 +1463,7 @@ def build_schema_bootstrap_settings(app: Any = None) -> SchemaBootstrapSettings:
             "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS",
             True,
             aliases=(
+                "VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK",
                 "CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS",
                 "DB_BOOTSTRAP_ADVISORY_LOCKS",
             ),
@@ -1261,10 +1489,13 @@ def build_schema_bootstrap_settings(app: Any = None) -> SchemaBootstrapSettings:
 
 def build_seed_bootstrap_settings(app: Any = None) -> SeedBootstrapSettings:
     """Build explicit seed-bootstrap settings."""
+    identity = build_service_identity_settings(app)
+    bootstrap_default = bool(identity.is_db_bootstrap_mode)
+
     bootstrap_enabled = get_bool_setting(
         app,
         "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
-        False,
+        bootstrap_default,
         aliases=(
             "CHUNK_DB_BOOTSTRAP_ENABLED",
             "DB_BOOTSTRAP_ENABLED",
@@ -1276,42 +1507,66 @@ def build_seed_bootstrap_settings(app: Any = None) -> SeedBootstrapSettings:
         "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
         bootstrap_enabled,
         aliases=(
+            "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
             "CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
             "DB_BOOTSTRAP_SEED_DEFAULTS",
+            "CHUNK_AUTO_SEED_DEFAULTS",
+        ),
+    )
+
+    seed_debug_blocks = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+        seed_defaults,
+        aliases=(
+            "CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+            "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+            "CHUNK_SEED_DEBUG_BLOCKS",
+        ),
+    )
+
+    seed_dev_project = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+        seed_defaults,
+        aliases=(
+            "CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+            "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
+            "CHUNK_SEED_DEV_PROJECT",
+        ),
+    )
+
+    repair_seed_invariants = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
+        seed_defaults,
+        aliases=(
+            "VECTOPLAN_CHUNK_REPAIR_SEED_INVARIANTS",
+            "CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
+            "DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
         ),
     )
 
     return SeedBootstrapSettings(
         seed_defaults=seed_defaults,
-        seed_debug_blocks=get_bool_setting(
-            app,
-            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
-            seed_defaults,
-            aliases=(
-                "CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
-                "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
-            ),
-        ),
-        seed_dev_project=get_bool_setting(
-            app,
-            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
-            seed_defaults,
-            aliases=(
-                "CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
-                "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
-            ),
-        ),
+        seed_debug_blocks=seed_debug_blocks,
+        seed_dev_project=seed_dev_project,
         seed_on_empty_only=get_bool_setting(
             app,
             "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY",
             True,
-            aliases=("CHUNK_SEED_ON_EMPTY_ONLY",),
+            aliases=(
+                "CHUNK_SEED_ON_EMPTY_ONLY",
+                "DB_BOOTSTRAP_SEED_ON_EMPTY_ONLY",
+            ),
         ),
+        repair_seed_invariants=repair_seed_invariants,
         advisory_lock_enabled=get_bool_setting(
             app,
             "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS",
             True,
             aliases=(
+                "VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK",
                 "CHUNK_DB_BOOTSTRAP_ADVISORY_LOCKS",
                 "DB_BOOTSTRAP_ADVISORY_LOCKS",
             ),
@@ -1337,67 +1592,110 @@ def build_seed_bootstrap_settings(app: Any = None) -> SeedBootstrapSettings:
 
 def build_world_defaults_settings(app: Any = None) -> WorldDefaultsSettings:
     """Build world/project/universe default settings."""
-    return WorldDefaultsSettings(
-        project_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID",
-            DEFAULT_PROJECT_ID,
+    project_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID",
+        DEFAULT_PROJECT_ID,
+    )
+    universe_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID",
+        DEFAULT_UNIVERSE_ID,
+    )
+
+    template_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID",
+        DEFAULT_TEMPLATE_ID,
+        aliases=(
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID",
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID",
         ),
+    )
+
+    provider_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID",
+        DEFAULT_PROVIDER_ID,
+    )
+
+    provider_world_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
+        DEFAULT_PROVIDER_WORLD_ID,
+        aliases=(
+            "VECTOPLAN_CHUNK_PROVIDER_WORLD_ID",
+            "VECTOPLAN_CHUNK_LEGACY_PROVIDER_WORLD_ID",
+        ),
+    )
+
+    raw_world_id = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
+        DEFAULT_WORLD_ID,
+        aliases=(
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_INSTANCE_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_SPAWN_WORLD_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID",
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID",
+        ),
+    )
+
+    world_id = _normalize_concrete_world_id(
+        raw_world_id,
+        template_id=template_id,
+        provider_id=provider_id,
+        provider_world_id=provider_world_id,
+        default=DEFAULT_WORLD_ID,
+    )
+
+    return WorldDefaultsSettings(
+        project_id=project_id,
         project_slug=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG",
-            DEFAULT_PROJECT_SLUG,
+            project_id or DEFAULT_PROJECT_SLUG,
         ),
         project_name=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_PROJECT_NAME",
             DEFAULT_PROJECT_NAME,
         ),
-        universe_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID",
-            DEFAULT_UNIVERSE_ID,
-        ),
+        universe_id=universe_id,
         universe_slug=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG",
-            DEFAULT_UNIVERSE_SLUG,
+            universe_id or DEFAULT_UNIVERSE_SLUG,
         ),
         universe_name=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_NAME",
             DEFAULT_UNIVERSE_NAME,
         ),
-        world_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
-            DEFAULT_WORLD_ID,
-        ),
+        world_id=world_id,
+        default_world_id=world_id,
+        instance_world_id=world_id,
         world_slug=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_SLUG",
             DEFAULT_WORLD_SLUG,
+            aliases=(
+                "VECTOPLAN_CHUNK_DEFAULT_WORLD_SLUG",
+                "VECTOPLAN_CHUNK_DEFAULT_SPAWN_WORLD_SLUG",
+            ),
         ),
         world_name=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_NAME",
             DEFAULT_WORLD_NAME,
+            aliases=(
+                "VECTOPLAN_CHUNK_DEFAULT_WORLD_NAME",
+                "VECTOPLAN_CHUNK_DEFAULT_SPAWN_WORLD_NAME",
+            ),
         ),
-        template_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID",
-            DEFAULT_TEMPLATE_ID,
-        ),
-        provider_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_ID",
-            DEFAULT_PROVIDER_ID,
-        ),
-        provider_world_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
-            DEFAULT_PROVIDER_WORLD_ID,
-        ),
+        template_id=template_id,
+        provider_id=provider_id,
+        provider_world_id=provider_world_id,
         world_type=get_str_setting(
             app,
             "VECTOPLAN_CHUNK_DEFAULT_WORLD_TYPE",
@@ -1542,6 +1840,8 @@ def build_block_defaults_settings(app: Any = None) -> BlockDefaultsSettings:
 
 def build_api_settings(app: Any = None) -> ApiSettings:
     """Build API guard and route settings."""
+    world_defaults = build_world_defaults_settings(app)
+
     return ApiSettings(
         api_prefix=get_str_setting(
             app,
@@ -1552,6 +1852,26 @@ def build_api_settings(app: Any = None) -> ApiSettings:
             app,
             "VECTOPLAN_CHUNK_HEALTHCHECK_PATH",
             "/projects/_status",
+        ),
+        healthcheck_require_ok=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_HEALTHCHECK_REQUIRE_OK",
+            True,
+        ),
+        schema_ready_required=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_SCHEMA_READY_REQUIRED",
+            True,
+        ),
+        seed_ready_required=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_SEED_READY_REQUIRED",
+            True,
+        ),
+        default_world_ready_required=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_READY_REQUIRED",
+            True,
         ),
         max_batch_chunks=get_int_setting(
             app,
@@ -1596,11 +1916,7 @@ def build_api_settings(app: Any = None) -> ApiSettings:
             "VECTOPLAN_CHUNK_WORLD_TEST_ENABLED",
             True,
         ),
-        default_world_id=get_str_setting(
-            app,
-            "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID",
-            DEFAULT_TEMPLATE_ID,
-        ),
+        default_world_id=world_defaults.world_id,
     )
 
 
@@ -1617,7 +1933,13 @@ def build_bootstrap_settings(app: Any = None) -> BootstrapSettings:
 
     warnings: list[str] = []
 
-    if runtime.allow_runtime_db_mutations:
+    if runtime.runtime_is_read_only and runtime.allow_runtime_db_mutations:
+        warnings.append(
+            "Runtime is read-only but runtime DB mutations were requested. "
+            "Mutation flags will not be effective in normal runtime."
+        )
+
+    if runtime.allow_runtime_db_mutations and not runtime.runtime_is_read_only:
         warnings.append(
             "Runtime DB mutations are enabled. This should only be used for local one-worker development."
         )
@@ -1625,13 +1947,13 @@ def build_bootstrap_settings(app: Any = None) -> BootstrapSettings:
     if runtime.auto_create_all_requested and not runtime.auto_create_all_in_runtime:
         warnings.append(
             "VECTOPLAN_CHUNK_AUTO_CREATE_ALL was requested but ignored in runtime because "
-            "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS is false."
+            "runtime DB mutation guards are not both enabled."
         )
 
     if runtime.auto_seed_defaults_requested and not runtime.auto_seed_defaults_in_runtime:
         warnings.append(
             "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS was requested but ignored in runtime because "
-            "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS is false."
+            "runtime DB mutation guards are not both enabled."
         )
 
     if identity.is_runtime_mode and schema.bootstrap_enabled:
@@ -1644,9 +1966,29 @@ def build_bootstrap_settings(app: Any = None) -> BootstrapSettings:
             "Service mode indicates DB bootstrap, but VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED is false."
         )
 
+    if identity.is_check_only_mode and (
+        schema.bootstrap_enabled
+        or schema.create_all
+        or seed.seed_defaults
+        or seed.repair_seed_invariants
+    ):
+        warnings.append(
+            "Check-only mode should be read-only, but bootstrap/seed flags are enabled."
+        )
+
     if database.is_sqlite and schema.advisory_lock_enabled:
         warnings.append(
             "SQLite does not support PostgreSQL advisory locks; bootstrap lock will be a no-op."
+        )
+
+    if _provider_like_world_id(
+        world_defaults.world_id,
+        template_id=world_defaults.template_id,
+        provider_id=world_defaults.provider_id,
+        provider_world_id=world_defaults.provider_world_id,
+    ):
+        warnings.append(
+            "World default id looks like a provider/template id. The concrete world should be world_spawn."
         )
 
     return BootstrapSettings(
@@ -1726,7 +2068,7 @@ def should_run_db_bootstrap(app: Any = None) -> bool:
     """Return whether explicit DB bootstrap is enabled."""
     try:
         settings = build_bootstrap_settings(app)
-        return bool(settings.schema.bootstrap_enabled)
+        return bool(settings.schema.bootstrap_enabled or settings.seed.seed_defaults)
     except Exception:
         return False
 
@@ -1745,6 +2087,15 @@ def should_run_seed_bootstrap(app: Any = None) -> bool:
     try:
         settings = build_bootstrap_settings(app)
         return bool(settings.schema.bootstrap_enabled and settings.seed.seed_defaults)
+    except Exception:
+        return False
+
+
+def should_repair_seed_invariants(app: Any = None) -> bool:
+    """Return whether explicit bootstrap may repair partial seed invariants."""
+    try:
+        settings = build_bootstrap_settings(app)
+        return bool(settings.schema.bootstrap_enabled and settings.seed.repair_seed_invariants)
     except Exception:
         return False
 
@@ -1799,6 +2150,7 @@ def build_settings_summary(app: Any = None) -> dict[str, Any]:
             "mode": settings.identity.mode,
             "isRuntimeMode": settings.identity.is_runtime_mode,
             "isDbBootstrapMode": settings.identity.is_db_bootstrap_mode,
+            "isCheckOnlyMode": settings.identity.is_check_only_mode,
         },
         "runtime": {
             "runStartupHooks": settings.runtime.run_startup_hooks,
@@ -1809,11 +2161,16 @@ def build_settings_summary(app: Any = None) -> dict[str, Any]:
             "checkModels": settings.runtime.check_models,
             "checkDatabase": settings.runtime.check_database,
             "requireDatabase": settings.runtime.require_database,
+            "runtimeIsReadOnly": settings.runtime.runtime_is_read_only,
             "allowRuntimeDbMutations": settings.runtime.allow_runtime_db_mutations,
             "autoCreateAllRequested": settings.runtime.auto_create_all_requested,
             "autoSeedDefaultsRequested": settings.runtime.auto_seed_defaults_requested,
+            "seedDebugBlocksRequested": settings.runtime.seed_debug_blocks_requested,
+            "seedDevProjectRequested": settings.runtime.seed_dev_project_requested,
             "autoCreateAllInRuntime": settings.runtime.auto_create_all_in_runtime,
             "autoSeedDefaultsInRuntime": settings.runtime.auto_seed_defaults_in_runtime,
+            "seedDebugBlocksInRuntime": settings.runtime.seed_debug_blocks_in_runtime,
+            "seedDevProjectInRuntime": settings.runtime.seed_dev_project_in_runtime,
         },
         "database": {
             "driver": settings.database.driver,
@@ -1822,14 +2179,21 @@ def build_settings_summary(app: Any = None) -> dict[str, Any]:
             "name": settings.database.name,
             "user": settings.database.user,
             "passwordSet": settings.database.password_set,
+            "databaseUriMasked": _mask_uri(settings.database.database_uri),
+            "sqlalchemyDatabaseUriMasked": _mask_uri(settings.database.sqlalchemy_database_uri),
+            "databaseUrlMasked": _mask_uri(settings.database.database_url),
             "checkOnStartup": settings.database.check_on_startup,
             "requireOnStartup": settings.database.require_on_startup,
+            "waitForReady": settings.database.wait_for_ready,
+            "waitTimeout": settings.database.wait_timeout,
+            "waitInterval": settings.database.wait_interval,
             "isPostgresql": settings.database.is_postgresql,
             "isSqlite": settings.database.is_sqlite,
         },
         "schemaBootstrap": {
             "bootstrapEnabled": settings.schema.bootstrap_enabled,
             "createAll": settings.schema.create_all,
+            "repairMissingColumns": settings.schema.repair_missing_columns,
             "requireMigrations": settings.schema.require_migrations,
             "advisoryLockEnabled": settings.schema.advisory_lock_enabled,
             "advisoryLockKey": settings.schema.advisory_lock_key,
@@ -1840,14 +2204,23 @@ def build_settings_summary(app: Any = None) -> dict[str, Any]:
             "seedDebugBlocks": settings.seed.seed_debug_blocks,
             "seedDevProject": settings.seed.seed_dev_project,
             "seedOnEmptyOnly": settings.seed.seed_on_empty_only,
+            "repairSeedInvariants": settings.seed.repair_seed_invariants,
             "advisoryLockEnabled": settings.seed.advisory_lock_enabled,
             "advisoryLockKey": settings.seed.advisory_lock_key,
             "failOnError": settings.seed.fail_on_error,
         },
         "worldDefaults": {
             "projectId": settings.world_defaults.project_id,
+            "projectSlug": settings.world_defaults.project_slug,
+            "projectName": settings.world_defaults.project_name,
             "universeId": settings.world_defaults.universe_id,
+            "universeSlug": settings.world_defaults.universe_slug,
+            "universeName": settings.world_defaults.universe_name,
             "worldId": settings.world_defaults.world_id,
+            "defaultWorldId": settings.world_defaults.default_world_id,
+            "instanceWorldId": settings.world_defaults.instance_world_id,
+            "worldSlug": settings.world_defaults.world_slug,
+            "worldName": settings.world_defaults.world_name,
             "templateId": settings.world_defaults.template_id,
             "providerId": settings.world_defaults.provider_id,
             "providerWorldId": settings.world_defaults.provider_world_id,
@@ -1856,10 +2229,29 @@ def build_settings_summary(app: Any = None) -> dict[str, Any]:
             "surfaceY": settings.world_defaults.surface_y,
             "minY": settings.world_defaults.min_y,
             "maxY": settings.world_defaults.max_y,
+            "blockRegistryId": settings.world_defaults.block_registry_id,
+            "blockRegistryVersion": settings.world_defaults.block_registry_version,
+            "spawn": {
+                "x": settings.world_defaults.spawn_x,
+                "y": settings.world_defaults.spawn_y,
+                "z": settings.world_defaults.spawn_z,
+                "yaw": settings.world_defaults.spawn_yaw,
+                "pitch": settings.world_defaults.spawn_pitch,
+            },
+        },
+        "blockDefaults": {
+            "registryId": settings.block_defaults.registry_id,
+            "registryVersion": settings.block_defaults.registry_version,
+            "seedDebugGrass": settings.block_defaults.seed_debug_grass,
+            "seedDebugDirt": settings.block_defaults.seed_debug_dirt,
         },
         "api": {
             "apiPrefix": settings.api.api_prefix,
             "healthcheckPath": settings.api.healthcheck_path,
+            "healthcheckRequireOk": settings.api.healthcheck_require_ok,
+            "schemaReadyRequired": settings.api.schema_ready_required,
+            "seedReadyRequired": settings.api.seed_ready_required,
+            "defaultWorldReadyRequired": settings.api.default_world_ready_required,
             "maxBatchChunks": settings.api.max_batch_chunks,
             "routeMaxBatchChunks": settings.api.route_max_batch_chunks,
             "maxCommandAffectedCells": settings.api.max_command_affected_cells,
@@ -1874,19 +2266,34 @@ def build_env_debug_snapshot(keys: Sequence[str] | None = None) -> dict[str, str
     """
     Build a safe debug snapshot of selected environment variables.
 
-    Secret/password values are masked.
+    Secret/password/token values and URI credentials are masked.
     """
     if keys is None:
         keys = (
             "VECTOPLAN_CHUNK_MODE",
+            "VECTOPLAN_CHUNK_STARTUP_MODE",
+            "VECTOPLAN_CHUNK_RUNTIME_MODE",
             "VECTOPLAN_CHUNK_RUN_MODE",
             "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS",
+            "VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY",
             "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
             "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
             "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
+            "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+            "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
             "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
             "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
             "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
+            "VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS",
+            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_WORLD_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_INSTANCE_WORLD_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID",
             "VECTOPLAN_CHUNK_DB_HOST",
             "VECTOPLAN_CHUNK_DB_PORT",
             "VECTOPLAN_CHUNK_DB_NAME",
@@ -1907,11 +2314,7 @@ def build_env_debug_snapshot(keys: Sequence[str] | None = None) -> dict[str, str
         if value is MISSING:
             continue
 
-        lowered = safe_key.lower()
-        if "password" in lowered or "secret" in lowered or "token" in lowered:
-            snapshot[safe_key] = "***"
-        else:
-            snapshot[safe_key] = _safe_str(value, "")
+        snapshot[safe_key] = _mask_sensitive_value(safe_key, value)
 
     return snapshot
 
@@ -1924,11 +2327,14 @@ __all__ = [
     "ApiSettings",
     "BlockDefaultsSettings",
     "BootstrapSettings",
+    "CHECK_ONLY_MODES",
+    "DB_BOOTSTRAP_MODES",
     "DatabaseSettings",
+    "RUNTIME_MODES",
+    "RuntimeStartupSettings",
     "SchemaBootstrapSettings",
     "SeedBootstrapSettings",
     "ServiceIdentitySettings",
-    "RuntimeStartupSettings",
     "WorldDefaultsSettings",
     "build_api_settings",
     "build_block_defaults_settings",
@@ -1950,13 +2356,16 @@ __all__ = [
     "get_list_setting",
     "get_raw_setting",
     "get_str_setting",
+    "is_check_only_mode",
     "is_db_bootstrap_mode",
     "is_postgresql_uri",
     "is_runtime_mode",
     "is_sqlite_uri",
+    "is_startup_strict",
     "normalize_mode",
     "settings_to_dict",
     "should_check_database_on_startup",
+    "should_repair_seed_invariants",
     "should_require_database_on_startup",
     "should_run_create_all_in_runtime",
     "should_run_db_bootstrap",
@@ -1964,5 +2373,4 @@ __all__ = [
     "should_run_seed_bootstrap",
     "should_run_seed_in_runtime",
     "should_run_startup_hooks",
-    "is_startup_strict",
 ]
