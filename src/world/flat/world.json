@@ -3,49 +3,69 @@
   "schemaVersion": "world.schema.v1",
   "worldId": "flat",
   "worldType": "flat",
-  "label": "Flat Debug World",
-  "description": "Initial deterministic flat world for the VECTOPLAN chunk service.",
+  "label": "Flat System Terrain World",
+  "description": "Deterministic flat VECTOPLAN world generated exclusively from the built-in immutable system states system_air and system_terrain.",
   "status": "development",
-
   "planetId": "dev-earth",
-  "worldVersion": "1",
-
+  "worldVersion": "2",
   "generatorType": "flat-world",
-  "generatorVersion": "1",
-  "seed": "vectoplan-flat-dev-seed-v1",
-
+  "generatorVersion": "2",
+  "seed": "vectoplan-flat-system-terrain-seed-v2",
   "chunkSize": 16,
   "cellSize": 1,
-
   "coordinateSystem": "vectoplan-world-y-up-v1",
   "projectionType": "flat-local-v1",
   "topologyType": "flat-unbounded-v1",
-
   "surfaceY": 0,
   "minY": -8,
   "maxY": 64,
-
   "blockRegistryId": "debug-blocks",
   "blockRegistryVersion": "1",
-
+  "requiredSystemBlocks": {
+    "version": "flat-required-system-blocks.v1",
+    "immutable": true,
+    "air": {
+      "systemBlockId": "system_air",
+      "runtimeBlockTypeId": null,
+      "reservedCellValue": 0,
+      "persistAsBlockType": false,
+      "storedInPositivePalette": false,
+      "inventoryVisible": false,
+      "placeable": false,
+      "generationRole": "air"
+    },
+    "terrain": {
+      "systemBlockId": "system_terrain",
+      "runtimeBlockTypeId": "system_terrain",
+      "persistAsBlockType": true,
+      "storedInPositivePalette": true,
+      "inventoryVisible": true,
+      "generationRole": "terrain"
+    }
+  },
   "cellEncoding": {
     "version": "cell-encoding.palette-index-plus-one.v1",
     "airCellValue": 0,
+    "airSystemBlockId": "system_air",
     "blockCellValueRule": "paletteIndex + 1",
+    "positivePaletteValuesAreLocal": true,
     "examples": [
+      {
+        "cellValue": 0,
+        "paletteIndex": null,
+        "systemBlockId": "system_air",
+        "blockTypeId": null,
+        "meaning": "Reserved air cell state"
+      },
       {
         "paletteIndex": 0,
         "cellValue": 1,
-        "blockTypeId": "debug_grass"
-      },
-      {
-        "paletteIndex": 1,
-        "cellValue": 2,
-        "blockTypeId": "debug_dirt"
+        "systemBlockId": "system_terrain",
+        "blockTypeId": "system_terrain",
+        "meaning": "Terrain in the current flat-world palette"
       }
     ]
   },
-
   "cellIndexing": {
     "version": "cell-indexing.x-fastest-y-then-z.v1",
     "order": "x-fastest-y-then-z",
@@ -56,77 +76,73 @@
       "z": "north-south"
     }
   },
-
   "palette": [
     {
       "registryId": "debug-blocks",
       "registryVersion": "1",
-      "blockTypeId": "debug_grass",
-      "label": "Debug Grass",
+      "blockTypeId": "system_terrain",
+      "label": "Terrain",
       "solid": true,
       "placeable": true,
       "breakable": true,
       "metadata": {
-        "category": "debug",
-        "role": "surface",
-        "debugColor": "#4caf50",
-        "editorHint": "Temporary surface block for the first flat world."
-      }
-    },
-    {
-      "registryId": "debug-blocks",
-      "registryVersion": "1",
-      "blockTypeId": "debug_dirt",
-      "label": "Debug Dirt",
-      "solid": true,
-      "placeable": true,
-      "breakable": true,
-      "metadata": {
-        "category": "debug",
-        "role": "subsurface",
-        "debugColor": "#795548",
-        "editorHint": "Temporary subsurface block for the first flat world."
+        "source": "system",
+        "category": "system",
+        "systemBlockId": "system_terrain",
+        "runtimeBlockTypeId": "system_terrain",
+        "immutableDefinition": true,
+        "inventoryVisible": true,
+        "generationRole": "terrain",
+        "usedForSurface": true,
+        "usedForSubsurface": true,
+        "cellValueRule": "paletteIndex + 1",
+        "editorHint": "Built-in immutable terrain definition used by the default flat-world generator."
       }
     }
   ],
-
   "layers": {
-    "version": "flat-layers.v1",
+    "version": "flat-layers.v2",
     "airBlockValue": 0,
-    "surfaceBlockTypeId": "debug_grass",
-    "subsurfaceBlockTypeId": "debug_dirt",
+    "airSystemBlockId": "system_air",
+    "surfaceBlockTypeId": "system_terrain",
+    "subsurfaceBlockTypeId": "system_terrain",
+    "terrainBlockTypeId": "system_terrain",
     "rules": [
       {
-        "name": "above_surface_is_air",
+        "name": "above_surface_is_system_air",
         "condition": "worldY > surfaceY",
         "cellValue": 0,
+        "systemBlockId": "system_air",
         "blockTypeId": null
       },
       {
-        "name": "surface_is_grass",
+        "name": "surface_is_system_terrain",
         "condition": "worldY == surfaceY",
-        "blockTypeId": "debug_grass"
+        "systemBlockId": "system_terrain",
+        "blockTypeId": "system_terrain"
       },
       {
-        "name": "subsurface_is_dirt",
+        "name": "subsurface_is_system_terrain",
         "condition": "minY <= worldY < surfaceY",
-        "blockTypeId": "debug_dirt"
+        "systemBlockId": "system_terrain",
+        "blockTypeId": "system_terrain"
       },
       {
-        "name": "below_min_y_is_air",
+        "name": "below_min_y_is_system_air",
         "condition": "worldY < minY",
         "cellValue": 0,
+        "systemBlockId": "system_air",
         "blockTypeId": null
       },
       {
-        "name": "above_max_y_is_air",
+        "name": "above_max_y_is_system_air",
         "condition": "worldY > maxY",
         "cellValue": 0,
+        "systemBlockId": "system_air",
         "blockTypeId": null
       }
     ]
   },
-
   "spawn": {
     "position": {
       "x": 0,
@@ -139,7 +155,6 @@
       "z": 8
     }
   },
-
   "runtime": {
     "source": "generated",
     "materializeUnchangedChunks": false,
@@ -147,31 +162,58 @@
     "supportsEvents": false,
     "supportsCommands": false,
     "supportsBatchChunks": true,
-    "supportsNegativeChunkCoordinates": true
+    "supportsNegativeChunkCoordinates": true,
+    "providerScopeOnly": true,
+    "cachePolicy": {
+      "worldDefinitionCacheAllowed": true,
+      "invalidateOnProcessRestart": true,
+      "generatorOutputCacheRequired": false
+    }
   },
-
   "editor": {
     "intendedConsumer": "vectoplan-editor",
     "contentType": "RuntimeChunkContent",
     "renderingMode": "voxel-cells",
     "meshingHint": "solid-block-faces",
     "targetingHint": "cell-raycast",
-    "reloadDirtyChunksAfterCommand": true
+    "reloadDirtyChunksAfterCommand": true,
+    "airInventoryVisible": false,
+    "terrainInventoryVisible": true,
+    "builtInBlockDefinitionsImmutable": true
   },
-
   "metadata": {
-    "purpose": "First deterministic flat world used to validate remote chunk loading before database snapshots and commands exist.",
-    "phase": "phase-1-world-generation",
-    "isPlaceholderWorld": true,
-    "usesDatabase": false,
+    "purpose": "Canonical deterministic default flat-world configuration based only on the built-in system air and terrain definitions.",
+    "phase": "system-terrain-flat-world-v2",
+    "isPlaceholderWorld": false,
+    "generatorBaselineChanged": true,
+    "generatedFallbackUsesSystemBlocks": true,
+    "snapshotOverlaySupportedByWorldState": true,
+    "providerUsesDatabase": false,
     "usesGeoData": false,
     "usesCore": false,
     "usesLibraryService": false,
+    "compatibility": {
+      "previousSurfaceBlockTypeId": "debug_grass",
+      "previousSubsurfaceBlockTypeId": "debug_dirt",
+      "existingSnapshotsRequireResetOrMigration": true,
+      "unmaterializedChunksUseThisConfiguration": true
+    },
+    "invariants": [
+      "system_air is represented exclusively by cellValue 0.",
+      "system_air is never stored in the positive palette.",
+      "system_terrain is the only positive palette entry of the default flat world.",
+      "surfaceBlockTypeId and subsurfaceBlockTypeId both resolve to system_terrain.",
+      "Positive cell values remain palette-local and follow paletteIndex + 1.",
+      "System block definitions are immutable; generated chunk cells remain editable through commands.",
+      "Existing materialized snapshots override generated fallback until reset or migrated."
+    ],
     "notes": [
       "This world config is loaded from src/world/flat/world.json.",
-      "The generator uses surfaceY, minY, maxY and layer blockTypeIds to create cells.",
-      "Unchanged chunks are generated and not persisted in this phase.",
-      "Database snapshots and events are intentionally not part of this file."
+      "The flat generator continues to use surfaceY, minY, maxY and the layer blockTypeIds.",
+      "Air is not a BlockType and is not part of the positive palette.",
+      "The block registry identity remains debug-blocks@1 because built-in persistent system blocks are mirrored into the existing registry.",
+      "Runtime try/catch behavior belongs to provider.py and loader.py; strict JSON contains no executable error-handling logic.",
+      "World-definition caching belongs to WorldLoader and is refreshed by restarting the service or explicitly clearing its cache."
     ]
   }
 }

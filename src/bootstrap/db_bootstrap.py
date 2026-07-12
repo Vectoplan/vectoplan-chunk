@@ -11,6 +11,10 @@ Responsibilities:
 - ensure schema bootstrap runs before seed bootstrap,
 - repair partial default seed invariants in explicit bootstrap mode,
 - ensure the concrete editable default world `world_spawn` exists,
+- require the default runtime BlockRegistry,
+- require the reserved Air persistence invariant,
+- require the canonical `system_railing` BlockType mirror,
+- reject inactive, deleted or drifted built-in system-block mirrors,
 - prevent seed bootstrap after failed schema bootstrap,
 - collect read-only pre/post status,
 - cleanup SQLAlchemy sessions after each phase,
@@ -40,6 +44,12 @@ Seed invariant rule:
         Project.project_id      = dev-project
         Universe.universe_id    = dev-universe
         WorldInstance.world_id  = world_spawn
+        BlockRegistry              = debug-blocks@1
+        Air cell state             = cellValue 0, without BlockType row
+        BlockType.block_type_id    = system_railing
+
+    `system_railing` must be active and match its immutable code definition.
+    `system_air` must not exist as a persistent BlockType row.
 
     `world_spawn` is the concrete editable world.
     `flat` is only the template/provider id.
@@ -58,6 +68,8 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Final, Mapping, Sequence
 
 try:
@@ -83,12 +95,14 @@ try:
     from .default_seed import (
         build_default_seed_status,
         build_default_seed_summary,
+        build_default_system_blocks_status,
         default_seed_result_to_dict,
         run_default_seed,
     )
 except Exception:  # pragma: no cover - fallback for partial import tests
     build_default_seed_status = None  # type: ignore[assignment]
     build_default_seed_summary = None  # type: ignore[assignment]
+    build_default_system_blocks_status = None  # type: ignore[assignment]
     default_seed_result_to_dict = None  # type: ignore[assignment]
     run_default_seed = None  # type: ignore[assignment]
 
@@ -144,7 +158,7 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-DB_BOOTSTRAP_RESULT_VERSION: Final[str] = "db-bootstrap-result.v2"
+DB_BOOTSTRAP_RESULT_VERSION: Final[str] = "db-bootstrap-result.v3"
 
 STATUS_COMPLETED: Final[str] = "completed"
 STATUS_SKIPPED: Final[str] = "skipped"
@@ -173,6 +187,16 @@ DEFAULT_PROVIDER_ID: Final[str] = "flat"
 DEFAULT_PROVIDER_WORLD_ID: Final[str] = "flat"
 DEFAULT_BLOCK_REGISTRY_ID: Final[str] = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION: Final[str] = "1"
+DEFAULT_BLOCK_REGISTRY_SOURCE: Final[str] = "internal"
+BLOCK_REGISTRY_ALLOWED_SOURCES: Final[tuple[str, ...]] = (
+    "internal",
+    "library",
+    "imported",
+    "test",
+)
+DEFAULT_SYSTEM_AIR_BLOCK_ID: Final[str] = "system_air"
+DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID: Final[str] = "system_railing"
+DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID: Final[str] = "vectoplan-system-block-bootstrap"
 
 
 # -----------------------------------------------------------------------------
@@ -230,9 +254,23 @@ class DbBootstrapResult:
 
     schema_ready: bool | None = None
     seed_ready: bool | None = None
+
     default_project_ready: bool | None = None
     default_universe_ready: bool | None = None
     default_world_ready: bool | None = None
+
+    block_registry_ready: bool | None = None
+    debug_blocks_ready: bool | None = None
+
+    system_blocks_ready: bool | None = None
+    system_railing_ready: bool | None = None
+    air_invariant_ready: bool | None = None
+
+    system_block_count: int = 0
+    system_blocks_created: int = 0
+    system_blocks_updated: int = 0
+    system_blocks_missing: int = 0
+    system_blocks_drifted: int = 0
 
     fail_on_error: bool = True
 
@@ -243,6 +281,7 @@ class DbBootstrapResult:
     schema: dict[str, Any] = field(default_factory=dict)
     seed: dict[str, Any] = field(default_factory=dict)
     seed_invariant: dict[str, Any] = field(default_factory=dict)
+    system_blocks: dict[str, Any] = field(default_factory=dict)
     pre_status: dict[str, Any] = field(default_factory=dict)
     post_status: dict[str, Any] = field(default_factory=dict)
 
@@ -798,6 +837,345 @@ def _row_public_id(row: Any, *names: str) -> str | None:
 
 
 # -----------------------------------------------------------------------------
+# Built-in system-block bootstrap adapter
+# -----------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_system_block_bootstrap_api() -> Mapping[str, Any]:
+    """
+    Load the system-block bootstrap API lazily and cache immutable exports.
+
+    Database rows and SQLAlchemy instances are deliberately never cached.
+    """
+    candidates = (
+        "src.system_blocks.bootstrap",
+        "system_blocks.bootstrap",
+    )
+
+    required_exports = (
+        "build_system_block_bootstrap_status_for_registry",
+        "ensure_system_blocks_for_registry",
+        "get_default_system_block_bootstrap_policy",
+    )
+
+    import_errors: list[str] = []
+
+    for import_path in candidates:
+        try:
+            module = __import__(
+                import_path,
+                fromlist=required_exports,
+            )
+        except Exception as exc:
+            import_errors.append(
+                f"{import_path}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+            continue
+
+        exports: dict[str, Any] = {
+            "module": module,
+            "moduleName": _safe_str(getattr(module, "__name__", None), ""),
+            "modulePath": _safe_str(getattr(module, "__file__", None), ""),
+        }
+
+        missing: list[str] = []
+
+        for export_name in required_exports:
+            try:
+                value = getattr(module, export_name)
+            except Exception:
+                value = None
+
+            if not callable(value):
+                missing.append(export_name)
+                continue
+
+            exports[export_name] = value
+
+        if missing:
+            import_errors.append(
+                f"{import_path}: missing callable exports: "
+                + ", ".join(missing)
+            )
+            continue
+
+        return MappingProxyType(exports) if "MappingProxyType" in globals() else exports
+
+    raise RuntimeError(
+        "Could not import the system-block bootstrap API. "
+        + " | ".join(import_errors)
+    )
+
+
+def clear_db_bootstrap_system_block_caches() -> None:
+    """Clear only immutable system-block integration caches."""
+    try:
+        api = _load_system_block_bootstrap_api()
+        module = api.get("module")
+        clear_function = getattr(
+            module,
+            "clear_system_block_bootstrap_caches",
+            None,
+        )
+        if callable(clear_function):
+            clear_function()
+    except Exception:
+        pass
+
+    _load_system_block_bootstrap_api.cache_clear()
+
+
+def _empty_system_block_status(
+    *,
+    registry: Any = None,
+    error: str | None = None,
+    exception_type: str | None = None,
+) -> dict[str, Any]:
+    """Return a stable not-ready system-block status payload."""
+    registry_id = _row_public_id(registry, "registry_id")
+    registry_version = _row_public_id(registry, "registry_version")
+
+    return {
+        "ready": False,
+        "repairable": False,
+        "registryDbId": _row_db_id(registry),
+        "registryId": registry_id,
+        "registryVersion": registry_version,
+        "registryKey": (
+            f"{registry_id}@{registry_version}"
+            if registry_id and registry_version
+            else None
+        ),
+        "air": {
+            "ready": False,
+            "systemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
+            "illegalRowCount": None,
+        },
+        "mirrors": [],
+        "counts": {
+            "mirrors": 0,
+            "readyMirrors": 0,
+            "created": 0,
+            "updated": 0,
+            "missing": 0,
+            "drifted": 0,
+        },
+        "errors": [error] if error else [],
+        "errorType": exception_type,
+        "error": error,
+    }
+
+
+def build_system_block_invariant_status(
+    registry: Any,
+) -> dict[str, Any]:
+    """
+    Build non-mutating Air and persistent-system-block readiness.
+
+    The newer default-seed adapter is preferred so both bootstrap layers expose
+    the same payload. A direct system-block package fallback keeps this module
+    independently usable in partial import environments.
+    """
+    if registry is None:
+        return _empty_system_block_status(
+            error="Default BlockRegistry does not exist.",
+            exception_type="RegistryMissing",
+        )
+
+    if callable(build_default_system_blocks_status):
+        try:
+            payload = build_default_system_blocks_status(registry)
+            normalized = _safe_dict(payload)
+            if normalized:
+                return normalized
+        except Exception:
+            pass
+
+    try:
+        api = _load_system_block_bootstrap_api()
+        factory = api["build_system_block_bootstrap_status_for_registry"]
+        payload = factory(registry)
+        normalized = _safe_dict(payload)
+
+        if normalized:
+            return normalized
+
+        return _empty_system_block_status(
+            registry=registry,
+            error="System-block status factory returned no mapping.",
+            exception_type="InvalidStatusPayload",
+        )
+
+    except Exception as exc:
+        return _empty_system_block_status(
+            registry=registry,
+            error=_safe_exception_message(exc),
+            exception_type=exc.__class__.__name__,
+        )
+
+
+def _system_block_status_counts(
+    status: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Extract stable system-block counts."""
+    status_dict = _safe_dict(status)
+    mirrors = status_dict.get("mirrors") or []
+
+    if not isinstance(mirrors, Sequence) or isinstance(
+        mirrors,
+        (str, bytes, bytearray),
+    ):
+        mirrors = []
+
+    inferred = {
+        "mirrors": len(mirrors),
+        "readyMirrors": 0,
+        "created": 0,
+        "updated": 0,
+        "missing": 0,
+        "drifted": 0,
+    }
+
+    for raw_mirror in mirrors:
+        mirror = _safe_dict(raw_mirror)
+        action = _safe_str(mirror.get("action"), "").lower()
+
+        if _safe_bool(mirror.get("ready"), False):
+            inferred["readyMirrors"] += 1
+        if _safe_bool(mirror.get("created"), False):
+            inferred["created"] += 1
+        if _safe_bool(mirror.get("updated"), False):
+            inferred["updated"] += 1
+        if action in {"missing", "would_create"}:
+            inferred["missing"] += 1
+        if mirror.get("driftBefore") or action in {
+            "drifted",
+            "would_update",
+            "updated",
+        }:
+            inferred["drifted"] += 1
+
+    counts = _safe_dict(status_dict.get("counts"))
+
+    return {
+        key: max(0, _safe_int(counts.get(key), default))
+        for key, default in inferred.items()
+    }
+
+
+def _system_railing_ready(
+    status: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether the canonical Railing mirror is fully ready."""
+    mirrors = _safe_dict(status).get("mirrors") or []
+
+    if not isinstance(mirrors, Sequence) or isinstance(
+        mirrors,
+        (str, bytes, bytearray),
+    ):
+        return False
+
+    for raw_mirror in mirrors:
+        mirror = _safe_dict(raw_mirror)
+        system_id = _safe_str(mirror.get("systemBlockId"), "").lower()
+        runtime_id = _safe_str(mirror.get("runtimeBlockTypeId"), "").lower()
+
+        if DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID in {system_id, runtime_id}:
+            return _safe_bool(mirror.get("ready"), False)
+
+    return False
+
+
+def _air_invariant_ready(
+    status: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether Air remains the reserved non-persistent cell state."""
+    air = _safe_dict(_safe_dict(status).get("air"))
+    return _safe_bool(air.get("ready"), False)
+
+
+def _system_blocks_ready(
+    status: Mapping[str, Any] | None,
+) -> bool:
+    """Require aggregate, Air and Railing readiness together."""
+    status_dict = _safe_dict(status)
+    return bool(
+        _safe_bool(status_dict.get("ready"), False)
+        and _air_invariant_ready(status_dict)
+        and _system_railing_ready(status_dict)
+    )
+
+
+def _reconcile_system_blocks_for_registry(
+    registry: Any,
+    db_obj: Any,
+    *,
+    operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Reconcile canonical persistent system blocks without committing.
+
+    The surrounding default-world invariant transaction owns commit/rollback.
+    Illegal Air rows are not silently deleted by the default policy; they make
+    the bootstrap fail explicitly.
+    """
+    if registry is None:
+        raise RuntimeError(
+            "Cannot reconcile system blocks without a BlockRegistry."
+        )
+
+    api = _load_system_block_bootstrap_api()
+    policy = api["get_default_system_block_bootstrap_policy"]()
+    ensure_function = api["ensure_system_blocks_for_registry"]
+
+    bootstrap_result = ensure_function(
+        registry,
+        policy=policy,
+        created_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+        updated_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+    )
+
+    data = _safe_dict(bootstrap_result)
+
+    if not data:
+        to_dict = getattr(bootstrap_result, "to_dict", None)
+        if callable(to_dict):
+            data = _safe_dict(to_dict())
+
+    if not _system_blocks_ready(data):
+        raise RuntimeError(
+            "Built-in system-block reconciliation did not produce a ready "
+            "Air/Railing state."
+        )
+
+    db_obj.session.flush()
+
+    counts = _system_block_status_counts(data)
+    changed = _safe_bool(data.get("changed"), False)
+
+    operations.append(
+        {
+            "kind": "system_blocks",
+            "status": "updated" if changed else "existing",
+            "ready": True,
+            "changed": changed,
+            "created": counts["created"],
+            "updated": counts["updated"],
+            "missing": counts["missing"],
+            "drifted": counts["drifted"],
+            "airInvariantReady": _air_invariant_ready(data),
+            "systemRailingReady": _system_railing_ready(data),
+            "registryId": _row_public_id(registry, "registry_id"),
+            "registryVersion": _row_public_id(registry, "registry_version"),
+            "registryDbId": _row_db_id(registry),
+        }
+    )
+
+    return data
+
+
+# -----------------------------------------------------------------------------
 # Default seed invariant status/repair
 # -----------------------------------------------------------------------------
 
@@ -807,7 +1185,16 @@ def build_default_world_invariant_status(
     db_extension: Any = None,
 ) -> dict[str, Any]:
     """
-    Build read-only status for the mandatory default project/universe/world.
+    Build read-only readiness for the mandatory default runtime graph.
+
+    Ready means all of the following are true:
+
+    - Project ``dev-project`` exists,
+    - Universe ``dev-universe`` exists,
+    - concrete WorldInstance ``world_spawn`` exists,
+    - the configured BlockRegistry exists,
+    - Air is reserved at cell value 0 and has no BlockType row,
+    - ``system_railing`` exists, is active and matches its code definition.
 
     This function does not create or mutate anything.
     """
@@ -825,9 +1212,7 @@ def build_default_world_invariant_status(
                 "completedAt": completed_at,
                 "durationMs": _duration_ms(started_at, completed_at),
                 "error": "SQLAlchemy db extension is unavailable.",
-                "database": {
-                    "engineAvailable": False,
-                },
+                "database": {"engineAvailable": False},
             }
 
         Project = _model_class("Project")
@@ -860,35 +1245,33 @@ def build_default_world_invariant_status(
                 Project,
                 project_id=project_id,
             )
-
             project_db_id = _row_db_id(project)
 
-            universe_query_fields = {
+            universe_fields: dict[str, Any] = {
                 "universe_id": universe_id,
             }
             if project_db_id is not None:
-                universe_query_fields["project_db_id"] = project_db_id
+                universe_fields["project_db_id"] = project_db_id
 
             universe = _query_first_by_fields(
                 db_obj.session,
                 Universe,
-                **universe_query_fields,
+                **universe_fields,
             )
-
             universe_db_id = _row_db_id(universe)
 
-            world_query_fields = {
+            world_fields: dict[str, Any] = {
                 "world_id": world_id,
             }
             if project_db_id is not None:
-                world_query_fields["project_db_id"] = project_db_id
+                world_fields["project_db_id"] = project_db_id
             if universe_db_id is not None:
-                world_query_fields["universe_db_id"] = universe_db_id
+                world_fields["universe_db_id"] = universe_db_id
 
             world = _query_first_by_fields(
                 db_obj.session,
                 WorldInstance,
-                **world_query_fields,
+                **world_fields,
             )
 
             if BlockRegistry is not None:
@@ -898,7 +1281,6 @@ def build_default_world_invariant_status(
                     registry_id=registry_id,
                     registry_version=registry_version,
                 )
-
                 if block_registry is None:
                     block_registry = _query_first_by_fields(
                         db_obj.session,
@@ -909,10 +1291,23 @@ def build_default_world_invariant_status(
             if BlockType is not None:
                 try:
                     query = db_obj.session.query(BlockType)
-                    if _model_has_column(BlockType, "registry_id"):
-                        query = query.filter(BlockType.registry_id == registry_id)
-                    if _model_has_column(BlockType, "registry_version"):
-                        query = query.filter(BlockType.registry_version == registry_version)
+                    registry_db_id = _row_db_id(block_registry)
+                    if registry_db_id is not None and _model_has_column(
+                        BlockType,
+                        "registry_db_id",
+                    ):
+                        query = query.filter(
+                            BlockType.registry_db_id == registry_db_id
+                        )
+                    else:
+                        if _model_has_column(BlockType, "registry_id"):
+                            query = query.filter(
+                                BlockType.registry_id == registry_id
+                            )
+                        if _model_has_column(BlockType, "registry_version"):
+                            query = query.filter(
+                                BlockType.registry_version == registry_version
+                            )
                     block_type_count = int(query.count())
                 except Exception:
                     block_type_count = None
@@ -922,18 +1317,35 @@ def build_default_world_invariant_status(
                 _make_message(
                     code="default_world_invariant_status_failed",
                     message=_safe_exception_message(exc),
-                    details={
-                        "exceptionType": exc.__class__.__name__,
-                    },
+                    details={"exceptionType": exc.__class__.__name__},
                 )
             )
+
+        system_blocks = build_system_block_invariant_status(block_registry)
+        system_counts = _system_block_status_counts(system_blocks)
 
         project_ready = project is not None
         universe_ready = universe is not None
         world_ready = world is not None
-        block_registry_ready = block_registry is not None if BlockRegistry is not None else None
+        registry_ready = (
+            block_registry is not None
+            if BlockRegistry is not None
+            else False
+        )
+        air_ready = _air_invariant_ready(system_blocks)
+        railing_ready = _system_railing_ready(system_blocks)
+        system_ready = _system_blocks_ready(system_blocks)
 
-        ok = bool(project_ready and universe_ready and world_ready and not errors)
+        ok = bool(
+            project_ready
+            and universe_ready
+            and world_ready
+            and registry_ready
+            and system_ready
+            and air_ready
+            and railing_ready
+            and not errors
+        )
 
         completed_at = _utc_now_iso()
 
@@ -952,6 +1364,10 @@ def build_default_world_invariant_status(
                 "providerWorldId": provider_world_id,
                 "blockRegistryId": registry_id,
                 "blockRegistryVersion": registry_version,
+                "airSystemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
+                "systemRailingBlockTypeId": (
+                    DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
+                ),
             },
             "project": {
                 "exists": project_ready,
@@ -973,7 +1389,7 @@ def build_default_world_invariant_status(
             },
             "blockRegistry": {
                 "checked": BlockRegistry is not None,
-                "exists": block_registry_ready,
+                "exists": registry_ready,
                 "registryId": registry_id,
                 "registryVersion": registry_version,
                 "dbId": _row_db_id(block_registry),
@@ -981,13 +1397,32 @@ def build_default_world_invariant_status(
             "debugBlocks": {
                 "checked": BlockType is not None,
                 "count": block_type_count,
-                "complete": None if block_type_count is None else block_type_count > 0,
+                "complete": (
+                    None
+                    if block_type_count is None
+                    else block_type_count > 0
+                ),
+            },
+            "systemBlocks": {
+                **system_blocks,
+                "summary": {
+                    "ready": system_ready,
+                    "airInvariantReady": air_ready,
+                    "systemRailingReady": railing_ready,
+                    "mirrorCount": system_counts["mirrors"],
+                    "readyMirrorCount": system_counts["readyMirrors"],
+                    "missingCount": system_counts["missing"],
+                    "driftedCount": system_counts["drifted"],
+                },
             },
             "ready": {
                 "project": project_ready,
                 "universe": universe_ready,
                 "world": world_ready,
-                "blockRegistry": block_registry_ready,
+                "blockRegistry": registry_ready,
+                "systemBlocks": system_ready,
+                "airInvariant": air_ready,
+                "systemRailing": railing_ready,
             },
             "warnings": warnings,
             "errors": errors,
@@ -1000,7 +1435,7 @@ def _create_or_update_block_registry(
     *,
     operations: list[dict[str, Any]],
 ) -> Any | None:
-    """Ensure default BlockRegistry exists when model is available."""
+    """Ensure the default active BlockRegistry exists."""
     BlockRegistry = _model_class("BlockRegistry")
     if BlockRegistry is None:
         operations.append(
@@ -1021,7 +1456,6 @@ def _create_or_update_block_registry(
         registry_id=registry_id,
         registry_version=registry_version,
     )
-
     if registry is None:
         registry = _query_first_by_fields(
             db_obj.session,
@@ -1029,60 +1463,151 @@ def _create_or_update_block_registry(
             registry_id=registry_id,
         )
 
+    created = False
+    changed = False
+
     if registry is None:
-        registry = _make_instance(
-            BlockRegistry,
-            {
-                "registry_id": registry_id,
-                "registry_version": registry_version,
-                "label": "Debug Blocks",
-                "description": "Default debug block registry seeded by vectoplan-chunk bootstrap.",
-                "status": "active",
-                "schema_version": "block-registry.schema.v1",
-                "revision": 1,
-                "source": "bootstrap",
-                "is_default": True,
-                "created_by_user_id": "bootstrap",
-                "updated_by_user_id": "bootstrap",
-                "metadata_json": {
-                    "seededBy": "db_bootstrap.default_world_invariant_repair",
-                    "createdAt": _utc_now_iso(),
+        factory = getattr(BlockRegistry, "create", None)
+        if callable(factory):
+            try:
+                registry = factory(
+                    registry_id=registry_id,
+                    registry_version=registry_version,
+                    label="Debug Blocks",
+                    description=(
+                        "Default runtime block registry seeded by "
+                        "vectoplan-chunk bootstrap."
+                    ),
+                    status="active",
+                    source=DEFAULT_BLOCK_REGISTRY_SOURCE,
+                    is_default=True,
+                    created_by_user_id="bootstrap",
+                    metadata_json={
+                        "seededBy": (
+                            "db_bootstrap.default_world_invariant_repair"
+                        ),
+                        "createdAt": _utc_now_iso(),
+                    },
+                )
+            except Exception:
+                registry = None
+
+        if registry is None:
+            registry = _make_instance(
+                BlockRegistry,
+                {
+                    "registry_id": registry_id,
+                    "registry_version": registry_version,
+                    "label": "Debug Blocks",
+                    "description": (
+                        "Default runtime block registry seeded by "
+                        "vectoplan-chunk bootstrap."
+                    ),
+                    "status": "active",
+                    "schema_version": "block-registry.schema.v1",
+                    "revision": 1,
+                    "source": DEFAULT_BLOCK_REGISTRY_SOURCE,
+                    "is_default": True,
+                    "created_by_user_id": "bootstrap",
+                    "updated_by_user_id": "bootstrap",
+                    "metadata_json": {
+                        "seededBy": (
+                            "db_bootstrap.default_world_invariant_repair"
+                        ),
+                        "createdAt": _utc_now_iso(),
+                    },
                 },
-            },
-        )
+            )
+
         db_obj.session.add(registry)
         db_obj.session.flush()
-        operations.append(
-            {
-                "kind": "block_registry",
-                "status": "created",
-                "registryId": registry_id,
-                "registryVersion": registry_version,
-                "dbId": _row_db_id(registry),
-            }
-        )
+        created = True
+
     else:
-        _set_attr_if_empty(registry, "registry_version", registry_version)
-        _set_attr_if_empty(registry, "label", "Debug Blocks")
-        _set_attr_if_empty(registry, "status", "active")
-        _set_attr_if_supported(registry, "is_default", True)
-        _set_attr_if_supported(registry, "updated_by_user_id", "bootstrap")
+        current_status = _safe_str(
+            getattr(registry, "status", None),
+            "",
+        ).lower()
+        is_deleted = _safe_bool(
+            getattr(registry, "is_deleted", False),
+            False,
+        )
+
+        if current_status != "active" or is_deleted:
+            restore = getattr(registry, "restore", None)
+            if callable(restore):
+                try:
+                    restore(updated_by_user_id="bootstrap")
+                    changed = True
+                except Exception:
+                    pass
+
+            changed = _set_attr_force(registry, "status", "active") or changed
+            changed = _set_attr_force(registry, "deleted_at", None) or changed
+            changed = _set_attr_force(registry, "archived_at", None) or changed
+
+        changed = _set_attr_force(
+            registry,
+            "registry_id",
+            registry_id,
+        ) or changed
+        changed = _set_attr_force(
+            registry,
+            "registry_version",
+            registry_version,
+        ) or changed
+        changed = _set_attr_if_empty(
+            registry,
+            "label",
+            "Debug Blocks",
+        ) or changed
+        changed = _set_attr_if_supported(
+            registry,
+            "is_default",
+            True,
+        ) or changed
+        changed = _set_attr_force(
+            registry,
+            "source",
+            DEFAULT_BLOCK_REGISTRY_SOURCE,
+        ) or changed
+        changed = _set_attr_if_supported(
+            registry,
+            "updated_by_user_id",
+            "bootstrap",
+        ) or changed
         _merge_metadata_json(
             registry,
             {
-                "seededBy": "db_bootstrap.default_world_invariant_repair",
+                "seededBy": (
+                    "db_bootstrap.default_world_invariant_repair"
+                ),
                 "updatedAt": _utc_now_iso(),
             },
         )
-        operations.append(
-            {
-                "kind": "block_registry",
-                "status": "existing",
-                "registryId": registry_id,
-                "registryVersion": registry_version,
-                "dbId": _row_db_id(registry),
-            }
-        )
+
+        if changed:
+            db_obj.session.flush()
+
+    operations.append(
+        {
+            "kind": "block_registry",
+            "status": (
+                "created"
+                if created
+                else "updated"
+                if changed
+                else "existing"
+            ),
+            "registryId": registry_id,
+            "registryVersion": registry_version,
+            "source": _safe_str(
+                getattr(registry, "source", None),
+                DEFAULT_BLOCK_REGISTRY_SOURCE,
+            ),
+            "dbId": _row_db_id(registry),
+        }
+    )
 
     return registry
 
@@ -1542,10 +2067,10 @@ def repair_default_world_invariant(
     commit: bool = True,
 ) -> dict[str, Any]:
     """
-    Ensure default Project/Universe/WorldInstance exists.
+    Ensure the complete default runtime graph and built-in blocks are ready.
 
-    This is an explicit bootstrap-only repair helper. It is idempotent and must
-    not be called by normal runtime startup.
+    This explicit bootstrap-only helper is idempotent. The outer function owns
+    commit/rollback. The system-block layer only flushes and never commits.
     """
     started_at = _utc_now_iso()
 
@@ -1564,6 +2089,7 @@ def repair_default_world_invariant(
             "errors": [],
             "before": {},
             "after": {},
+            "systemBlocks": {},
         }
 
         if db_obj is None:
@@ -1584,11 +2110,22 @@ def repair_default_world_invariant(
                 db_extension=db_obj,
             )
 
-            _create_or_update_block_registry(
+            registry = _create_or_update_block_registry(
                 app,
                 db_obj,
                 operations=result["operations"],
             )
+            if registry is None:
+                raise RuntimeError(
+                    "Default BlockRegistry could not be created or loaded."
+                )
+
+            result["systemBlocks"] = _reconcile_system_blocks_for_registry(
+                registry,
+                db_obj,
+                operations=result["operations"],
+            )
+
             project = _create_or_update_project(
                 app,
                 db_obj,
@@ -1618,16 +2155,19 @@ def repair_default_world_invariant(
                 db_extension=db_obj,
             )
             result["ok"] = bool((result["after"] or {}).get("ok"))
-            result["status"] = STATUS_COMPLETED if result["ok"] else STATUS_PARTIAL
+            result["status"] = (
+                STATUS_COMPLETED if result["ok"] else STATUS_PARTIAL
+            )
 
             if not result["ok"]:
                 result["errors"].append(
                     _make_message(
                         code="default_world_invariant_repair_incomplete",
-                        message="Default world invariant repair did not produce a ready state.",
-                        details={
-                            "after": result["after"],
-                        },
+                        message=(
+                            "Default world/system-block invariant repair did "
+                            "not produce a ready state."
+                        ),
+                        details={"after": result["after"]},
                     )
                 )
 
@@ -1643,16 +2183,13 @@ def repair_default_world_invariant(
                 _make_message(
                     code="default_world_invariant_repair_exception",
                     message=_safe_exception_message(exc),
-                    details={
-                        "exceptionType": exc.__class__.__name__,
-                    },
+                    details={"exceptionType": exc.__class__.__name__},
                 )
             )
 
         completed_at = _utc_now_iso()
         result["completedAt"] = completed_at
         result["durationMs"] = _duration_ms(started_at, completed_at)
-
         return result
 
 
@@ -1661,13 +2198,29 @@ def _seed_status_needs_invariant_repair(
     seed_status: Mapping[str, Any] | None,
     invariant_status: Mapping[str, Any] | None,
 ) -> bool:
-    """Return whether seed data/status indicates partial default world invariant."""
+    """Return whether default world or built-in system invariants need repair."""
     seed_data = seed_data or {}
     seed_status = seed_status or {}
     invariant_status = invariant_status or {}
 
     if invariant_status and invariant_status.get("ok") is False:
         return True
+
+    invariant_ready = _safe_dict(invariant_status.get("ready"))
+    for key in (
+        "project",
+        "universe",
+        "world",
+        "blockRegistry",
+        "systemBlocks",
+        "airInvariant",
+        "systemRailing",
+    ):
+        if key in invariant_ready and not _safe_bool(
+            invariant_ready.get(key),
+            False,
+        ):
+            return True
 
     for payload in (seed_data, seed_status):
         if not payload:
@@ -1676,8 +2229,19 @@ def _seed_status_needs_invariant_repair(
         if payload.get("ok") is False:
             return True
 
-        if _safe_str(payload.get("status"), "").lower() in {STATUS_PARTIAL, STATUS_FAILED}:
+        if _safe_str(payload.get("status"), "").lower() in {
+            STATUS_PARTIAL,
+            STATUS_FAILED,
+        }:
             return True
+
+        for key in (
+            "systemBlocksReady",
+            "systemRailingReady",
+            "airInvariantReady",
+        ):
+            if key in payload and not _safe_bool(payload.get(key), False):
+                return True
 
         world = payload.get("world")
         if isinstance(world, Mapping) and world.get("exists") is False:
@@ -1686,6 +2250,22 @@ def _seed_status_needs_invariant_repair(
         default_world = payload.get("defaultWorld")
         if isinstance(default_world, Mapping) and default_world.get("exists") is False:
             return True
+
+        system_blocks = payload.get("systemBlocks")
+        if isinstance(system_blocks, Mapping) and not _system_blocks_ready(
+            system_blocks
+        ):
+            return True
+
+        ready = payload.get("ready")
+        if isinstance(ready, Mapping):
+            for key in (
+                "systemBlocks",
+                "airInvariant",
+                "systemRailing",
+            ):
+                if key in ready and not _safe_bool(ready.get(key), False):
+                    return True
 
         invariant = payload.get("defaultWorldInvariant")
         if isinstance(invariant, Mapping) and invariant.get("ok") is False:
@@ -1715,7 +2295,7 @@ def _build_seed_status_with_invariant(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """Build seed status and always attach direct default-world invariant status."""
+    """Build seed status with mandatory world and system-block invariants."""
     seed_status: dict[str, Any] = {}
 
     if build_default_seed_status is not None:
@@ -1746,6 +2326,11 @@ def _build_seed_status_with_invariant(
     seed_status = _safe_dict(seed_status)
     seed_status["defaultWorldInvariant"] = invariant_status
 
+    invariant_system_blocks = _safe_dict(
+        invariant_status.get("systemBlocks")
+    )
+    seed_status.setdefault("systemBlocks", invariant_system_blocks)
+
     if seed_status.get("ok") is not True:
         return seed_status
 
@@ -1756,8 +2341,11 @@ def _build_seed_status_with_invariant(
         if isinstance(seed_status["errors"], list):
             seed_status["errors"].append(
                 _make_message(
-                    code="default_world_invariant_not_ready",
-                    message="Default world invariant is not ready.",
+                    code="default_world_or_system_invariant_not_ready",
+                    message=(
+                        "Default world or built-in system-block invariant "
+                        "is not ready."
+                    ),
                     details=invariant_status,
                 )
             )
@@ -1769,8 +2357,11 @@ def _build_seed_status_with_invariant(
 # Settings resolution
 # -----------------------------------------------------------------------------
 
-def resolve_bootstrap_settings(app: Any = None, settings: BootstrapSettings | None = None) -> Any:
-    """Resolve aggregate bootstrap settings."""
+def resolve_bootstrap_settings(
+    app: Any = None,
+    settings: BootstrapSettings | None = None,
+) -> Any:
+    """Resolve aggregate bootstrap settings with a safe fallback object."""
     if settings is not None:
         return settings
 
@@ -1781,70 +2372,89 @@ def resolve_bootstrap_settings(app: Any = None, settings: BootstrapSettings | No
     except Exception:
         pass
 
-    class FallbackSettings:
-        class Schema:
-            bootstrap_enabled = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
-                False,
-                aliases=("DB_BOOTSTRAP_ENABLED",),
-            )
-            create_all = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
-                bootstrap_enabled,
-                aliases=("DB_BOOTSTRAP_CREATE_ALL", "VECTOPLAN_CHUNK_AUTO_CREATE_ALL"),
-            )
-            fail_on_error = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
-                True,
-                aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
-            )
+    schema_enabled = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED",
+        False,
+        aliases=("DB_BOOTSTRAP_ENABLED",),
+    )
 
-        class Seed:
-            seed_defaults = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
-                Schema.bootstrap_enabled,
-                aliases=("DB_BOOTSTRAP_SEED_DEFAULTS", "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS"),
-            )
-            seed_debug_blocks = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
-                seed_defaults,
-                aliases=("DB_BOOTSTRAP_SEED_DEBUG_BLOCKS", "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS"),
-            )
-            seed_dev_project = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
-                seed_defaults,
-                aliases=("DB_BOOTSTRAP_SEED_DEV_PROJECT", "VECTOPLAN_CHUNK_SEED_DEV_PROJECT"),
-            )
-            seed_on_empty_only = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY",
-                True,
-                aliases=("DB_BOOTSTRAP_SEED_ON_EMPTY_ONLY",),
-            )
-            repair_seed_invariants = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
-                True,
-                aliases=("DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",),
-            )
-            fail_on_error = get_bool_setting(
-                app,
-                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
-                True,
-                aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
-            )
+    schema = SimpleNamespace(
+        bootstrap_enabled=schema_enabled,
+        create_all=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL",
+            schema_enabled,
+            aliases=(
+                "DB_BOOTSTRAP_CREATE_ALL",
+                "VECTOPLAN_CHUNK_AUTO_CREATE_ALL",
+            ),
+        ),
+        fail_on_error=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
+            True,
+            aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
+        ),
+    )
 
-        schema = Schema()
-        seed = Seed()
+    seed_defaults = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
+        schema_enabled,
+        aliases=(
+            "DB_BOOTSTRAP_SEED_DEFAULTS",
+            "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
+        ),
+    )
 
-    return FallbackSettings()
+    seed = SimpleNamespace(
+        seed_defaults=seed_defaults,
+        seed_debug_blocks=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+            seed_defaults,
+            aliases=(
+                "DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+                "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+            ),
+        ),
+        seed_dev_project=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+            seed_defaults,
+            aliases=(
+                "DB_BOOTSTRAP_SEED_DEV_PROJECT",
+                "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
+            ),
+        ),
+        seed_on_empty_only=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY",
+            True,
+            aliases=("DB_BOOTSTRAP_SEED_ON_EMPTY_ONLY",),
+        ),
+        repair_seed_invariants=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",
+            True,
+            aliases=("DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS",),
+        ),
+        fail_on_error=get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR",
+            True,
+            aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
+        ),
+    )
 
+    return SimpleNamespace(
+        schema=schema,
+        seed=seed,
+        world_defaults=None,
+        block_defaults=None,
+        identity=None,
+    )
 
 def get_effective_db_bootstrap_flags(
     app: Any = None,
@@ -1918,11 +2528,7 @@ def build_db_bootstrap_status(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """
-    Build read-only DB bootstrap status.
-
-    This does not create tables and does not seed data.
-    """
+    """Build read-only schema, seed, world and system-block readiness."""
     started_at = _utc_now_iso()
 
     with _app_context(app):
@@ -1969,12 +2575,22 @@ def build_db_bootstrap_status(
 
         invariant = _safe_dict(seed_status.get("defaultWorldInvariant"))
         ready = _safe_dict(invariant.get("ready"))
+        system_blocks = _safe_dict(invariant.get("systemBlocks"))
+        counts = _system_block_status_counts(system_blocks)
+
+        system_ready = _system_blocks_ready(system_blocks)
+        air_ready = _air_invariant_ready(system_blocks)
+        railing_ready = _system_railing_ready(system_blocks)
 
         completed_at = _utc_now_iso()
 
         return {
             "ok": bool(schema_ok and seed_ok),
-            "status": STATUS_COMPLETED if schema_ok and seed_ok else STATUS_PARTIAL,
+            "status": (
+                STATUS_COMPLETED
+                if schema_ok and seed_ok
+                else STATUS_PARTIAL
+            ),
             "startedAt": started_at,
             "completedAt": completed_at,
             "durationMs": _duration_ms(started_at, completed_at),
@@ -1983,8 +2599,19 @@ def build_db_bootstrap_status(
             "defaultProjectReady": ready.get("project"),
             "defaultUniverseReady": ready.get("universe"),
             "defaultWorldReady": ready.get("world"),
+            "blockRegistryReady": ready.get("blockRegistry"),
+            "debugBlocksReady": _safe_dict(
+                seed_status.get("debugBlocks")
+            ).get("complete"),
+            "systemBlocksReady": system_ready,
+            "systemRailingReady": railing_ready,
+            "airInvariantReady": air_ready,
+            "systemBlockCount": counts["mirrors"],
+            "systemBlocksMissing": counts["missing"],
+            "systemBlocksDrifted": counts["drifted"],
             "schema": schema_status,
             "seed": seed_status,
+            "systemBlocks": system_blocks,
         }
 
 
@@ -2060,6 +2687,8 @@ def run_db_bootstrap(
                 "providerWorldId": _default_provider_world_id(app),
                 "blockRegistryId": _default_block_registry_id(app),
                 "blockRegistryVersion": _default_block_registry_version(app),
+                "airSystemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
+                "systemRailingBlockTypeId": DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID,
             }
 
             schema_settings = getattr(resolved_settings, "schema", None)
@@ -2197,10 +2826,12 @@ def run_db_bootstrap(
 
         _safe_log_info(
             app,
-            "DB bootstrap completed successfully. schema_ok=%s seed_ok=%s default_world_ready=%s",
+            "DB bootstrap completed successfully. schema_ok=%s seed_ok=%s "
+            "default_world_ready=%s system_blocks_ready=%s",
             result.schema_bootstrap_ok,
             result.seed_bootstrap_ok,
             result.default_world_ready,
+            result.system_blocks_ready,
         )
 
         return _finish_result(result, db_extension=db_extension)
@@ -2232,6 +2863,10 @@ def _run_pre_status_step(
                     "defaultProjectReady": status.get("defaultProjectReady"),
                     "defaultUniverseReady": status.get("defaultUniverseReady"),
                     "defaultWorldReady": status.get("defaultWorldReady"),
+                    "blockRegistryReady": status.get("blockRegistryReady"),
+                    "systemBlocksReady": status.get("systemBlocksReady"),
+                    "airInvariantReady": status.get("airInvariantReady"),
+                    "systemRailingReady": status.get("systemRailingReady"),
                 },
             )
         )
@@ -2241,9 +2876,7 @@ def _run_pre_status_step(
             _make_message(
                 code="pre_status_failed",
                 message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                details={"exceptionType": exc.__class__.__name__},
             )
         )
         result.steps.append(
@@ -2253,9 +2886,7 @@ def _run_pre_status_step(
                 status=STEP_STATUS_WARNING,
                 message=message,
                 started_at=started_at,
-                data={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                data={"exceptionType": exc.__class__.__name__},
             )
         )
 
@@ -2380,7 +3011,7 @@ def _run_seed_step(
     resolved_settings: Any,
     db_extension: Any = None,
 ) -> None:
-    """Run default seed bootstrap step and repair partial seed invariants."""
+    """Run default seed and repair world/system-block invariants."""
     started_at = _utc_now_iso()
 
     seed_settings = getattr(resolved_settings, "seed", None)
@@ -2394,7 +3025,10 @@ def _run_seed_step(
     if run_default_seed is None:
         seed_run_error = _make_message(
             code="default_seed_unavailable",
-            message="run_default_seed is unavailable. Falling back to direct invariant repair.",
+            message=(
+                "run_default_seed is unavailable. Falling back to direct "
+                "world/system-block invariant repair."
+            ),
         )
         result.warnings.append(seed_run_error)
     else:
@@ -2423,9 +3057,7 @@ def _run_seed_step(
             seed_run_error = _make_message(
                 code="default_seed_exception",
                 message=_safe_exception_message(exc),
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                details={"exceptionType": exc.__class__.__name__},
             )
             seed_data = {
                 "ok": False,
@@ -2472,18 +3104,21 @@ def _run_seed_step(
             _make_step(
                 name=STEP_DEFAULT_SEED_INVARIANT_REPAIR,
                 ok=bool(repair_result.get("ok")),
-                status=STEP_STATUS_OK if repair_result.get("ok") else STEP_STATUS_FAILED,
-                message=(
-                    "Default seed invariant repair completed."
+                status=(
+                    STEP_STATUS_OK
                     if repair_result.get("ok")
-                    else "Default seed invariant repair failed."
+                    else STEP_STATUS_FAILED
+                ),
+                message=(
+                    "Default world/system-block invariant repair completed."
+                    if repair_result.get("ok")
+                    else "Default world/system-block invariant repair failed."
                 ),
                 started_at=repair_started_at,
-                data={
-                    "repair": repair_result,
-                },
+                data={"repair": repair_result},
             )
         )
+
     elif needs_repair and not repair_allowed:
         result.seed_invariant_repair_executed = False
         result.seed_invariant_repair_ok = False
@@ -2513,9 +3148,16 @@ def _run_seed_step(
     final_seed_ok = bool(seed_status_after.get("ok"))
     final_invariant_ok = bool(invariant_after.get("ok"))
 
+    system_blocks = _safe_dict(invariant_after.get("systemBlocks"))
+    system_counts = _system_block_status_counts(system_blocks)
+
     result.seed = {
         "ok": bool(final_seed_ok and final_invariant_ok),
-        "status": STATUS_COMPLETED if final_seed_ok and final_invariant_ok else STATUS_PARTIAL,
+        "status": (
+            STATUS_COMPLETED
+            if final_seed_ok and final_invariant_ok
+            else STATUS_PARTIAL
+        ),
         "initialSeedResult": seed_data,
         "initialSeedSummary": seed_summary,
         "initialSeedError": seed_run_error,
@@ -2524,25 +3166,49 @@ def _run_seed_step(
         "invariantBeforeRepair": invariant_before,
         "invariantAfterRepair": invariant_after,
         "repair": repair_result,
+        "systemBlocks": system_blocks,
     }
     result.seed_invariant = invariant_after
+    result.system_blocks = system_blocks
     result.seed_bootstrap_ok = bool(final_seed_ok and final_invariant_ok)
     result.seed_ready = result.seed_bootstrap_ok
 
     ready = _safe_dict(invariant_after.get("ready"))
-    result.default_project_ready = bool(ready.get("project"))
-    result.default_universe_ready = bool(ready.get("universe"))
-    result.default_world_ready = bool(ready.get("world"))
+    result.default_project_ready = _safe_bool(ready.get("project"), False)
+    result.default_universe_ready = _safe_bool(ready.get("universe"), False)
+    result.default_world_ready = _safe_bool(ready.get("world"), False)
+    result.block_registry_ready = _safe_bool(ready.get("blockRegistry"), False)
+    result.system_blocks_ready = _system_blocks_ready(system_blocks)
+    result.air_invariant_ready = _air_invariant_ready(system_blocks)
+    result.system_railing_ready = _system_railing_ready(system_blocks)
+
+    result.system_block_count = system_counts["mirrors"]
+    result.system_blocks_created = system_counts["created"]
+    result.system_blocks_updated = system_counts["updated"]
+    result.system_blocks_missing = system_counts["missing"]
+    result.system_blocks_drifted = system_counts["drifted"]
+
+    debug_blocks = _safe_dict(seed_status_after.get("debugBlocks"))
+    result.debug_blocks_ready = (
+        _safe_bool(debug_blocks.get("complete"), False)
+        if debug_blocks
+        else None
+    )
 
     result.steps.append(
         _make_step(
             name=STEP_DEFAULT_SEED,
             ok=bool(result.seed_bootstrap_ok),
-            status=STEP_STATUS_OK if result.seed_bootstrap_ok else STEP_STATUS_FAILED,
-            message=(
-                "Default seed bootstrap completed and invariant is ready."
+            status=(
+                STEP_STATUS_OK
                 if result.seed_bootstrap_ok
-                else "Default seed bootstrap is incomplete."
+                else STEP_STATUS_FAILED
+            ),
+            message=(
+                "Default seed bootstrap completed and all runtime invariants "
+                "are ready."
+                if result.seed_bootstrap_ok
+                else "Default seed bootstrap or system-block invariant is incomplete."
             ),
             started_at=started_at,
             data={
@@ -2557,6 +3223,13 @@ def _run_seed_step(
                     "defaultProjectReady": result.default_project_ready,
                     "defaultUniverseReady": result.default_universe_ready,
                     "defaultWorldReady": result.default_world_ready,
+                    "blockRegistryReady": result.block_registry_ready,
+                    "systemBlocksReady": result.system_blocks_ready,
+                    "airInvariantReady": result.air_invariant_ready,
+                    "systemRailingReady": result.system_railing_ready,
+                    "systemBlockCount": result.system_block_count,
+                    "systemBlocksMissing": result.system_blocks_missing,
+                    "systemBlocksDrifted": result.system_blocks_drifted,
                 },
                 "result": result.seed,
             },
@@ -2567,10 +3240,14 @@ def _run_seed_step(
         result.errors.append(
             _make_message(
                 code="default_seed_failed",
-                message="Default seed bootstrap failed or remained partial.",
+                message=(
+                    "Default seed bootstrap failed or the world/system-block "
+                    "invariant remained partial."
+                ),
                 details={
                     "seedStatusAfterRepair": seed_status_after,
                     "invariantAfterRepair": invariant_after,
+                    "systemBlocks": system_blocks,
                     "repair": repair_result,
                 },
             )
@@ -2603,6 +3280,10 @@ def _run_post_status_step(
                     "defaultProjectReady": status.get("defaultProjectReady"),
                     "defaultUniverseReady": status.get("defaultUniverseReady"),
                     "defaultWorldReady": status.get("defaultWorldReady"),
+                    "blockRegistryReady": status.get("blockRegistryReady"),
+                    "systemBlocksReady": status.get("systemBlocksReady"),
+                    "airInvariantReady": status.get("airInvariantReady"),
+                    "systemRailingReady": status.get("systemRailingReady"),
                 },
             )
         )
@@ -2612,9 +3293,7 @@ def _run_post_status_step(
             _make_message(
                 code="post_status_failed",
                 message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                details={"exceptionType": exc.__class__.__name__},
             )
         )
         result.steps.append(
@@ -2624,24 +3303,66 @@ def _run_post_status_step(
                 status=STEP_STATUS_WARNING,
                 message=message,
                 started_at=started_at,
-                data={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                data={"exceptionType": exc.__class__.__name__},
             )
         )
 
 
 def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
-    """Apply post-status readiness to aggregate result."""
+    """Apply post-status readiness and enforce system-block invariants."""
     post_status = result.post_status or {}
     if not isinstance(post_status, Mapping):
         return
 
-    result.schema_ready = bool(post_status.get("schemaReady"))
-    result.seed_ready = bool(post_status.get("seedReady"))
-    result.default_project_ready = _safe_bool(post_status.get("defaultProjectReady"), False)
-    result.default_universe_ready = _safe_bool(post_status.get("defaultUniverseReady"), False)
-    result.default_world_ready = _safe_bool(post_status.get("defaultWorldReady"), False)
+    result.schema_ready = _safe_bool(post_status.get("schemaReady"), False)
+    result.seed_ready = _safe_bool(post_status.get("seedReady"), False)
+    result.default_project_ready = _safe_bool(
+        post_status.get("defaultProjectReady"),
+        False,
+    )
+    result.default_universe_ready = _safe_bool(
+        post_status.get("defaultUniverseReady"),
+        False,
+    )
+    result.default_world_ready = _safe_bool(
+        post_status.get("defaultWorldReady"),
+        False,
+    )
+    result.block_registry_ready = _safe_bool(
+        post_status.get("blockRegistryReady"),
+        False,
+    )
+    result.debug_blocks_ready = (
+        _safe_bool(post_status.get("debugBlocksReady"), False)
+        if post_status.get("debugBlocksReady") is not None
+        else None
+    )
+    result.system_blocks_ready = _safe_bool(
+        post_status.get("systemBlocksReady"),
+        False,
+    )
+    result.system_railing_ready = _safe_bool(
+        post_status.get("systemRailingReady"),
+        False,
+    )
+    result.air_invariant_ready = _safe_bool(
+        post_status.get("airInvariantReady"),
+        False,
+    )
+
+    result.system_block_count = max(
+        0,
+        _safe_int(post_status.get("systemBlockCount"), 0),
+    )
+    result.system_blocks_missing = max(
+        0,
+        _safe_int(post_status.get("systemBlocksMissing"), 0),
+    )
+    result.system_blocks_drifted = max(
+        0,
+        _safe_int(post_status.get("systemBlocksDrifted"), 0),
+    )
+    result.system_blocks = _safe_dict(post_status.get("systemBlocks"))
 
     if result.schema_bootstrap_requested and not result.schema_ready:
         result.schema_bootstrap_ok = False
@@ -2649,23 +3370,66 @@ def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
             _make_message(
                 code="post_bootstrap_schema_not_ready",
                 message="Schema is not ready after bootstrap.",
-                details={
-                    "postStatus": dict(post_status),
-                },
+                details={"postStatus": dict(post_status)},
             )
         )
 
-    if result.seed_bootstrap_requested and not result.seed_ready:
-        result.seed_bootstrap_ok = False
-        result.errors.append(
-            _make_message(
-                code="post_bootstrap_seed_not_ready",
-                message="Seed/default world invariant is not ready after bootstrap.",
-                details={
-                    "postStatus": dict(post_status),
-                },
+    if result.seed_bootstrap_requested:
+        invariant_failures: list[tuple[str, str]] = []
+
+        if not result.block_registry_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_block_registry_not_ready",
+                    "Default BlockRegistry is not ready after bootstrap.",
+                )
             )
-        )
+        if not result.system_blocks_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_system_blocks_not_ready",
+                    "Built-in system blocks are not ready after bootstrap.",
+                )
+            )
+        if not result.air_invariant_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_air_invariant_not_ready",
+                    "Air persistence invariant is not ready after bootstrap.",
+                )
+            )
+        if not result.system_railing_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_system_railing_not_ready",
+                    "system_railing is missing, inactive, deleted or drifted.",
+                )
+            )
+
+        for code, message in invariant_failures:
+            result.errors.append(
+                _make_message(
+                    code=code,
+                    message=message,
+                    details={
+                        "postStatus": dict(post_status),
+                        "systemBlocks": result.system_blocks,
+                    },
+                )
+            )
+
+        if not result.seed_ready or invariant_failures:
+            result.seed_bootstrap_ok = False
+            result.errors.append(
+                _make_message(
+                    code="post_bootstrap_seed_not_ready",
+                    message=(
+                        "Seed/default world/system-block invariant is not "
+                        "ready after bootstrap."
+                    ),
+                    details={"postStatus": dict(post_status)},
+                )
+            )
 
 
 def _finish_result(
@@ -2751,7 +3515,7 @@ def db_bootstrap_result_to_dict(
 def build_db_bootstrap_summary(
     result: DbBootstrapResult | Mapping[str, Any] | Any,
 ) -> dict[str, Any]:
-    """Build compact DB bootstrap summary."""
+    """Build compact DB-bootstrap summary."""
     data = db_bootstrap_result_to_dict(result)
     steps = data.get("steps") or []
 
@@ -2771,11 +3535,23 @@ def build_db_bootstrap_summary(
         "defaultProjectReady": data.get("default_project_ready"),
         "defaultUniverseReady": data.get("default_universe_ready"),
         "defaultWorldReady": data.get("default_world_ready"),
+        "blockRegistryReady": data.get("block_registry_ready"),
+        "debugBlocksReady": data.get("debug_blocks_ready"),
+        "systemBlocksReady": data.get("system_blocks_ready"),
+        "systemRailingReady": data.get("system_railing_ready"),
+        "airInvariantReady": data.get("air_invariant_ready"),
+        "systemBlockCount": data.get("system_block_count"),
+        "systemBlocksCreated": data.get("system_blocks_created"),
+        "systemBlocksUpdated": data.get("system_blocks_updated"),
+        "systemBlocksMissing": data.get("system_blocks_missing"),
+        "systemBlocksDrifted": data.get("system_blocks_drifted"),
         "schemaBootstrapRequested": bool(data.get("schema_bootstrap_requested")),
         "seedBootstrapRequested": bool(data.get("seed_bootstrap_requested")),
         "schemaBootstrapExecuted": bool(data.get("schema_bootstrap_executed")),
         "seedBootstrapExecuted": bool(data.get("seed_bootstrap_executed")),
-        "seedInvariantRepairExecuted": bool(data.get("seed_invariant_repair_executed")),
+        "seedInvariantRepairExecuted": bool(
+            data.get("seed_invariant_repair_executed")
+        ),
         "schemaBootstrapOk": data.get("schema_bootstrap_ok"),
         "seedBootstrapOk": data.get("seed_bootstrap_ok"),
         "seedInvariantRepairOk": data.get("seed_invariant_repair_ok"),
@@ -2807,7 +3583,9 @@ def build_db_bootstrap_exit_code(
 # -----------------------------------------------------------------------------
 
 __all__ = [
+    "BLOCK_REGISTRY_ALLOWED_SOURCES",
     "DB_BOOTSTRAP_RESULT_VERSION",
+    "DEFAULT_BLOCK_REGISTRY_SOURCE",
     "STATUS_COMPLETED",
     "STATUS_FAILED",
     "STATUS_PARTIAL",
@@ -2831,6 +3609,8 @@ __all__ = [
     "build_db_bootstrap_status",
     "build_db_bootstrap_summary",
     "build_default_world_invariant_status",
+    "build_system_block_invariant_status",
+    "clear_db_bootstrap_system_block_caches",
     "db_bootstrap_result_to_dict",
     "get_effective_db_bootstrap_flags",
     "repair_default_world_invariant",

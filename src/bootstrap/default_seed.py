@@ -8,8 +8,10 @@ Responsibilities:
 - seed the default development Project,
 - seed the default development Universe,
 - seed the default editable WorldInstance,
-- seed the default debug BlockRegistry,
-- seed the default debug BlockType entries,
+- seed the default runtime BlockRegistry,
+- optionally seed the default debug BlockType entries,
+- reconcile built-in system blocks into the runtime BlockRegistry,
+- enforce the Air persistence invariant,
 - keep seeding idempotent,
 - repair partial default seed state,
 - avoid loading chunks, snapshots, events, commands or object refs,
@@ -42,8 +44,14 @@ Target default graph:
 Target default block registry:
 
     BlockRegistry(registry_id="debug-blocks", registry_version="1")
-      -> BlockType(block_type_id="debug_grass")
-      -> BlockType(block_type_id="debug_dirt")
+      -> BlockType(block_type_id="debug_grass")       # optional debug seed
+      -> BlockType(block_type_id="debug_dirt")        # optional debug seed
+      -> BlockType(block_type_id="system_railing")    # required system mirror
+
+Air invariant:
+
+    cellValue = 0
+    system_air must not exist as a BlockType row.
 
 World-id rule:
 
@@ -56,6 +64,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Final, Mapping, Sequence
 
 try:
@@ -139,7 +148,7 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v2"
+DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v3"
 
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
 DEFAULT_PROJECT_SLUG: Final[str] = "dev-project"
@@ -159,6 +168,10 @@ DEFAULT_PROVIDER_WORLD_ID: Final[str] = "flat"
 
 DEFAULT_BLOCK_REGISTRY_ID: Final[str] = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION: Final[str] = "1"
+
+DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID: Final[str] = "bootstrap"
+DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID: Final[str] = "system_railing"
+DEFAULT_SYSTEM_AIR_BLOCK_ID: Final[str] = "system_air"
 
 DEFAULT_GENERATOR_TYPE: Final[str] = "flat-world"
 DEFAULT_GENERATOR_VERSION: Final[str] = "1"
@@ -238,6 +251,7 @@ class DefaultSeedResult:
     enabled: bool = False
     seed_defaults_requested: bool = False
     seed_debug_blocks_requested: bool = False
+    seed_system_blocks_requested: bool = False
     seed_dev_project_requested: bool = False
     seed_on_empty_only: bool = True
 
@@ -258,6 +272,15 @@ class DefaultSeedResult:
     default_world_ready: bool | None = None
     block_registry_ready: bool | None = None
     debug_blocks_ready: bool | None = None
+
+    system_blocks_ready: bool | None = None
+    system_railing_ready: bool | None = None
+    air_invariant_ready: bool | None = None
+
+    system_block_count: int = 0
+    system_blocks_created: int = 0
+    system_blocks_updated: int = 0
+    system_blocks_missing: int = 0
 
     operations: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
@@ -858,6 +881,591 @@ def load_seed_model_classes() -> dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Built-in system-block bootstrap adapter
+# -----------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def load_system_block_bootstrap_api() -> Mapping[str, Any]:
+    """
+    Load the system-block bootstrap API lazily.
+
+    The default seed module remains importable in partial migration/test
+    environments where the new system-block package may not yet be available.
+    A real seed run still fails clearly when the required API cannot be loaded.
+
+    Successful resolution is cached because these exports are immutable process
+    references. Database rows and query results are never cached here.
+    """
+    import_errors: list[str] = []
+
+    candidates = (
+        "src.system_blocks.bootstrap",
+        "system_blocks.bootstrap",
+    )
+
+    module = None
+
+    for import_path in candidates:
+        try:
+            module = __import__(
+                import_path,
+                fromlist=(
+                    "build_system_block_bootstrap_status_for_registry",
+                    "ensure_system_blocks_for_registry",
+                    "get_default_system_block_bootstrap_policy",
+                    "get_read_only_system_block_bootstrap_policy",
+                ),
+            )
+            break
+        except Exception as exc:
+            import_errors.append(
+                f"{import_path}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+
+    if module is None:
+        raise RuntimeError(
+            "Could not import the system-block bootstrap API. "
+            + " | ".join(import_errors)
+        )
+
+    required_exports = (
+        "build_system_block_bootstrap_status_for_registry",
+        "ensure_system_blocks_for_registry",
+        "get_default_system_block_bootstrap_policy",
+        "get_read_only_system_block_bootstrap_policy",
+    )
+
+    exports: dict[str, Any] = {}
+
+    for export_name in required_exports:
+        try:
+            value = getattr(module, export_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"System-block bootstrap export '{export_name}' is unavailable: "
+                f"{_safe_exception_message(exc)}"
+            ) from exc
+
+        if not callable(value):
+            raise RuntimeError(
+                f"System-block bootstrap export '{export_name}' is not callable."
+            )
+
+        exports[export_name] = value
+
+    exports["module"] = module
+    exports["moduleName"] = _safe_str(
+        getattr(module, "__name__", None),
+        "",
+    )
+    exports["modulePath"] = _safe_str(
+        getattr(module, "__file__", None),
+        "",
+    )
+
+    return exports
+
+
+def clear_default_seed_system_block_caches() -> None:
+    """
+    Clear only default-seed integration caches.
+
+    The child package exposes its own cache-clear functions. This helper avoids
+    importing or resetting them unless they have already been resolved.
+    """
+    try:
+        api = load_system_block_bootstrap_api()
+        module = api.get("module")
+
+        clear_function = getattr(
+            module,
+            "clear_system_block_bootstrap_caches",
+            None,
+        )
+
+        if callable(clear_function):
+            clear_function()
+    except Exception:
+        pass
+
+    load_system_block_bootstrap_api.cache_clear()
+
+
+def _empty_system_block_status(
+    *,
+    registry: Any = None,
+    error: str | None = None,
+    exception_type: str | None = None,
+) -> dict[str, Any]:
+    """Build a stable unavailable/not-ready system-block status."""
+    registry_id = (
+        _safe_str(getattr(registry, "registry_id", None), "")
+        if registry is not None
+        else ""
+    )
+    registry_version = (
+        _safe_str(getattr(registry, "registry_version", None), "")
+        if registry is not None
+        else ""
+    )
+
+    return {
+        "ready": False,
+        "repairable": False,
+        "registryDbId": _safe_model_id(registry),
+        "registryId": registry_id or None,
+        "registryVersion": registry_version or None,
+        "registryKey": (
+            f"{registry_id}@{registry_version}"
+            if registry_id and registry_version
+            else None
+        ),
+        "air": {
+            "ready": False,
+            "systemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
+            "illegalRowCount": None,
+        },
+        "mirrors": [],
+        "counts": {
+            "mirrors": 0,
+            "readyMirrors": 0,
+            "created": 0,
+            "updated": 0,
+            "drifted": 0,
+            "missing": 0,
+        },
+        "errors": [error] if error else [],
+        "errorType": exception_type,
+        "error": error,
+    }
+
+
+def build_default_system_blocks_status(
+    registry: Any,
+) -> dict[str, Any]:
+    """
+    Build non-mutating built-in system-block readiness for one registry.
+
+    This helper never creates or updates rows.
+    """
+    if registry is None:
+        return _empty_system_block_status(
+            error="Default BlockRegistry does not exist.",
+            exception_type="RegistryMissing",
+        )
+
+    try:
+        api = load_system_block_bootstrap_api()
+        status_factory = api[
+            "build_system_block_bootstrap_status_for_registry"
+        ]
+        status = status_factory(registry)
+    except Exception as exc:
+        return _empty_system_block_status(
+            registry=registry,
+            error=_safe_exception_message(exc),
+            exception_type=exc.__class__.__name__,
+        )
+
+    normalized = _safe_dict(status)
+
+    if not normalized:
+        return _empty_system_block_status(
+            registry=registry,
+            error="System-block status factory returned no mapping.",
+            exception_type="InvalidStatusPayload",
+        )
+
+    return normalized
+
+
+def _system_block_status_counts(
+    status: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Extract stable aggregate counts from a system-block status payload."""
+    status_dict = _safe_dict(status)
+    mirrors = status_dict.get("mirrors") or []
+
+    if not isinstance(mirrors, Sequence) or isinstance(
+        mirrors,
+        (str, bytes, bytearray),
+    ):
+        mirrors = []
+
+    created = 0
+    updated = 0
+    missing = 0
+    ready = 0
+    drifted = 0
+
+    for raw_mirror in mirrors:
+        mirror = _safe_dict(raw_mirror)
+
+        if _safe_bool(mirror.get("created"), False):
+            created += 1
+
+        if _safe_bool(mirror.get("updated"), False):
+            updated += 1
+
+        if _safe_bool(mirror.get("ready"), False):
+            ready += 1
+
+        action = _safe_str(mirror.get("action"), "").lower()
+
+        if action in {
+            "missing",
+            "would_create",
+        }:
+            missing += 1
+
+        if mirror.get("driftBefore") or action in {
+            "drifted",
+            "would_update",
+            "updated",
+        }:
+            drifted += 1
+
+    counts = _safe_dict(status_dict.get("counts"))
+
+    return {
+        "mirrors": _safe_int(
+            counts.get("mirrors"),
+            len(mirrors),
+            minimum=0,
+        ),
+        "readyMirrors": _safe_int(
+            counts.get("readyMirrors"),
+            ready,
+            minimum=0,
+        ),
+        "created": _safe_int(
+            counts.get("created"),
+            created,
+            minimum=0,
+        ),
+        "updated": _safe_int(
+            counts.get("updated"),
+            updated,
+            minimum=0,
+        ),
+        "missing": _safe_int(
+            counts.get("missing"),
+            missing,
+            minimum=0,
+        ),
+        "drifted": _safe_int(
+            counts.get("drifted"),
+            drifted,
+            minimum=0,
+        ),
+    }
+
+
+def _system_railing_ready(
+    status: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether the canonical persistent Railing mirror is ready."""
+    status_dict = _safe_dict(status)
+    mirrors = status_dict.get("mirrors") or []
+
+    if not isinstance(mirrors, Sequence) or isinstance(
+        mirrors,
+        (str, bytes, bytearray),
+    ):
+        return False
+
+    for raw_mirror in mirrors:
+        mirror = _safe_dict(raw_mirror)
+
+        system_block_id = _safe_str(
+            mirror.get("systemBlockId"),
+            "",
+        ).lower()
+
+        runtime_block_type_id = _safe_str(
+            mirror.get("runtimeBlockTypeId"),
+            "",
+        ).lower()
+
+        if (
+            system_block_id
+            == DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
+            or runtime_block_type_id
+            == DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
+        ):
+            return _safe_bool(
+                mirror.get("ready"),
+                False,
+            )
+
+    return False
+
+
+def default_system_blocks_exist(
+    registry: Any,
+) -> bool:
+    """Return whether Air and all persistent system mirrors are ready."""
+    status = build_default_system_blocks_status(
+        registry
+    )
+
+    return _safe_bool(
+        status.get("ready"),
+        False,
+    )
+
+
+def seed_system_blocks(
+    app: Flask,
+    models: dict[str, Any],
+    block_defaults: Any,
+    *,
+    db_extension: Any = None,
+) -> list[dict[str, Any]]:
+    """
+    Ensure the default registry and reconcile built-in system blocks.
+
+    This function does not commit. The surrounding default-seed transaction
+    owns the final commit or rollback.
+    """
+    operations: list[dict[str, Any]] = []
+
+    BlockRegistry = models["BlockRegistry"]
+
+    registry_id = _safe_str(
+        getattr(
+            block_defaults,
+            "registry_id",
+            DEFAULT_BLOCK_REGISTRY_ID,
+        ),
+        DEFAULT_BLOCK_REGISTRY_ID,
+    )
+    registry_version = _safe_str(
+        getattr(
+            block_defaults,
+            "registry_version",
+            DEFAULT_BLOCK_REGISTRY_VERSION,
+        ),
+        DEFAULT_BLOCK_REGISTRY_VERSION,
+    )
+
+    registry = find_default_block_registry(
+        models,
+        block_defaults,
+    )
+
+    if registry is None:
+        registry_started_at = _utc_now_iso()
+
+        registry = create_block_registry_object(
+            BlockRegistry,
+            block_defaults,
+        )
+        _add_to_session(
+            registry,
+            db_extension,
+        )
+        _flush_session(
+            db_extension
+        )
+
+        operations.append(
+            _make_operation(
+                name="block_registry:system_blocks",
+                ok=True,
+                status=OP_STATUS_OK,
+                created=True,
+                message=(
+                    "Block registry created for built-in system blocks."
+                ),
+                started_at=registry_started_at,
+                data={
+                    "registryId": registry_id,
+                    "registryVersion": registry_version,
+                    "registryDbId": _safe_model_id(
+                        registry
+                    ),
+                },
+            )
+        )
+
+    else:
+        registry_started_at = _utc_now_iso()
+
+        registry_updated = (
+            apply_block_registry_defaults_to_object(
+                registry,
+                block_defaults,
+            )
+        )
+
+        if registry_updated:
+            _flush_session(
+                db_extension
+            )
+
+        operations.append(
+            _make_operation(
+                name="block_registry:system_blocks",
+                ok=True,
+                status=(
+                    OP_STATUS_OK
+                    if registry_updated
+                    else OP_STATUS_SKIPPED
+                ),
+                updated=registry_updated,
+                skipped=not registry_updated,
+                message=(
+                    "Block registry updated for built-in system blocks."
+                    if registry_updated
+                    else (
+                        "Block registry for built-in system blocks "
+                        "is already ready."
+                    )
+                ),
+                started_at=registry_started_at,
+                data={
+                    "registryId": registry_id,
+                    "registryVersion": registry_version,
+                    "registryDbId": _safe_model_id(
+                        registry
+                    ),
+                },
+            )
+        )
+
+    registry_db_id = _safe_model_id(
+        registry
+    )
+
+    if registry_db_id is None:
+        raise RuntimeError(
+            "Block registry has no database id before system-block bootstrap."
+        )
+
+    op_started_at = _utc_now_iso()
+
+    try:
+        api = load_system_block_bootstrap_api()
+
+        policy_factory = api[
+            "get_default_system_block_bootstrap_policy"
+        ]
+        ensure_function = api[
+            "ensure_system_blocks_for_registry"
+        ]
+
+        policy = policy_factory()
+
+        bootstrap_result = ensure_function(
+            registry,
+            policy=policy,
+            created_by_user_id=(
+                DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID
+            ),
+            updated_by_user_id=(
+                DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID
+            ),
+        )
+
+        bootstrap_data = _safe_dict(
+            bootstrap_result
+        )
+
+        if not bootstrap_data:
+            to_dict = getattr(
+                bootstrap_result,
+                "to_dict",
+                None,
+            )
+
+            if callable(to_dict):
+                bootstrap_data = _safe_dict(
+                    to_dict()
+                )
+
+        ready = _safe_bool(
+            bootstrap_data.get("ready"),
+            False,
+        )
+        changed = _safe_bool(
+            bootstrap_data.get("changed"),
+            False,
+        )
+
+        counts = _system_block_status_counts(
+            bootstrap_data
+        )
+
+        created = counts["created"] > 0
+        updated = bool(
+            counts["updated"] > 0
+            or (
+                changed
+                and not created
+            )
+        )
+
+        if not ready:
+            raise RuntimeError(
+                "Built-in system-block reconciliation returned ready=false."
+            )
+
+        operations.append(
+            _make_operation(
+                name="system_blocks",
+                ok=True,
+                status=(
+                    OP_STATUS_OK
+                    if changed
+                    else OP_STATUS_SKIPPED
+                ),
+                created=created,
+                updated=updated,
+                skipped=not changed,
+                changed=changed,
+                message=(
+                    "Built-in system blocks reconciled."
+                    if changed
+                    else "Built-in system blocks are already ready."
+                ),
+                started_at=op_started_at,
+                data=bootstrap_data,
+            )
+        )
+
+    except Exception as exc:
+        message = _safe_exception_message(
+            exc
+        )
+
+        operations.append(
+            _make_operation(
+                name="system_blocks",
+                ok=False,
+                status=OP_STATUS_FAILED,
+                message=message,
+                started_at=op_started_at,
+                data={
+                    "registryId": registry_id,
+                    "registryVersion": registry_version,
+                    "registryDbId": registry_db_id,
+                    "exceptionType": (
+                        exc.__class__.__name__
+                    ),
+                },
+            )
+        )
+
+        raise RuntimeError(
+            f"Built-in system-block bootstrap failed: {message}"
+        ) from exc
+
+    return operations
+
+
+# -----------------------------------------------------------------------------
 # Settings/default resolution
 # -----------------------------------------------------------------------------
 
@@ -1337,31 +1945,71 @@ def is_default_seed_complete(
     block_defaults: Any,
     *,
     require_blocks: bool = True,
+    require_system_blocks: bool = True,
     require_project: bool = True,
 ) -> bool:
-    """Return whether target default seed graph is complete."""
+    """
+    Return whether the target default seed graph is complete.
+
+    Built-in system blocks are checked independently from optional debug block
+    seeding. A complete runtime registry must satisfy the Air invariant and
+    contain every persistent built-in system mirror.
+    """
     try:
-        if require_blocks:
-            registry = find_default_block_registry(models, block_defaults)
+        registry = None
+
+        if require_blocks or require_system_blocks:
+            registry = find_default_block_registry(
+                models,
+                block_defaults,
+            )
+
             if registry is None:
                 return False
-            if not default_debug_blocks_exist(models, registry, block_defaults):
+
+        if require_blocks:
+            if not default_debug_blocks_exist(
+                models,
+                registry,
+                block_defaults,
+            ):
+                return False
+
+        if require_system_blocks:
+            if not default_system_blocks_exist(
+                registry
+            ):
                 return False
 
         if require_project:
-            project = find_default_project(models, world_defaults)
+            project = find_default_project(
+                models,
+                world_defaults,
+            )
+
             if project is None:
                 return False
 
-            universe = find_default_universe(models, project, world_defaults)
+            universe = find_default_universe(
+                models,
+                project,
+                world_defaults,
+            )
+
             if universe is None:
                 return False
 
-            world = find_default_world(models, universe, world_defaults)
+            world = find_default_world(
+                models,
+                universe,
+                world_defaults,
+            )
+
             if world is None:
                 return False
 
         return True
+
     except Exception:
         return False
 
@@ -1845,7 +2493,44 @@ def apply_block_registry_defaults_to_object(registry: Any, block_defaults: Any) 
     changed = _set_attr_if_supported(registry, "registry_id", registry_id, overwrite=True) or changed
     changed = _set_attr_if_supported(registry, "registry_version", registry_version, overwrite=True) or changed
     changed = _set_attr_if_supported(registry, "label", f"{registry_id} {registry_version}", overwrite=False) or changed
-    changed = _set_attr_if_supported(registry, "status", "active", overwrite=False) or changed
+
+    registry_status = _safe_str(
+        getattr(registry, "status", ""),
+        "",
+    ).lower()
+    registry_deleted_at = getattr(
+        registry,
+        "deleted_at",
+        None,
+    )
+
+    if registry_status != "active" or registry_deleted_at is not None:
+        if _call_if_available(
+            registry,
+            "restore",
+            updated_by_user_id="bootstrap",
+        ):
+            changed = True
+        else:
+            changed = _set_attr_if_supported(
+                registry,
+                "status",
+                "active",
+                overwrite=True,
+            ) or changed
+            changed = _set_attr_if_supported(
+                registry,
+                "archived_at",
+                None,
+                overwrite=True,
+            ) or changed
+            changed = _set_attr_if_supported(
+                registry,
+                "deleted_at",
+                None,
+                overwrite=True,
+            ) or changed
+
     changed = _set_attr_if_supported(registry, "is_default", True, overwrite=True) or changed
     changed = _set_attr_if_supported(registry, "updated_by_user_id", "bootstrap", overwrite=True) or changed
     changed = _merge_metadata_json(
@@ -2417,8 +3102,11 @@ def run_default_seed(
         )
 
         result.enabled = resolved_enabled
+        resolved_seed_system_blocks = bool(resolved_enabled)
+
         result.seed_defaults_requested = resolved_enabled
         result.seed_debug_blocks_requested = resolved_seed_blocks
+        result.seed_system_blocks_requested = resolved_seed_system_blocks
         result.seed_dev_project_requested = resolved_seed_project
         result.seed_on_empty_only = resolved_seed_on_empty_only
 
@@ -2439,6 +3127,7 @@ def run_default_seed(
 
         result.metadata["advisoryLockEnabled"] = advisory_lock_enabled
         result.metadata["failOnError"] = resolved_fail_on_error
+        result.metadata["seedSystemBlocks"] = resolved_seed_system_blocks
         result.metadata["defaults"] = {
             "projectId": result.project_id,
             "universeId": result.universe_id,
@@ -2470,7 +3159,11 @@ def run_default_seed(
             result.status = STATUS_SKIPPED
             return _finish_result(result)
 
-        if not resolved_seed_blocks and not resolved_seed_project:
+        if (
+            not resolved_seed_blocks
+            and not resolved_seed_system_blocks
+            and not resolved_seed_project
+        ):
             result.operations.append(
                 _make_operation(
                     name="default_seed",
@@ -2520,6 +3213,7 @@ def run_default_seed(
                 resolved_world_defaults,
                 resolved_block_defaults,
                 require_blocks=resolved_seed_blocks,
+                require_system_blocks=resolved_seed_system_blocks,
                 require_project=resolved_seed_project,
             ):
                 result.seed_skipped_because_complete = True
@@ -2533,6 +3227,7 @@ def run_default_seed(
                         data={
                             "seedOnEmptyOnly": True,
                             "seedDebugBlocks": resolved_seed_blocks,
+                            "seedSystemBlocks": resolved_seed_system_blocks,
                             "seedDevProject": resolved_seed_project,
                         },
                     )
@@ -2556,6 +3251,26 @@ def run_default_seed(
                         status=OP_STATUS_SKIPPED,
                         skipped=True,
                         message="Debug block seeding disabled.",
+                    )
+                )
+
+            if resolved_seed_system_blocks:
+                result.operations.extend(
+                    seed_system_blocks(
+                        app,
+                        models,
+                        resolved_block_defaults,
+                        db_extension=db_extension,
+                    )
+                )
+            else:
+                result.operations.append(
+                    _make_operation(
+                        name="system_blocks",
+                        ok=True,
+                        status=OP_STATUS_SKIPPED,
+                        skipped=True,
+                        message="Built-in system-block seeding disabled.",
                     )
                 )
 
@@ -2636,6 +3351,39 @@ def run_default_seed(
                     )
                 )
 
+            if resolved_seed_system_blocks and not result.system_blocks_ready:
+                result.errors.append(
+                    _make_message(
+                        code="system_blocks_not_ready_after_seed",
+                        message=(
+                            "Built-in system blocks are not ready after seed."
+                        ),
+                        details=result.post_status,
+                    )
+                )
+
+            if resolved_seed_system_blocks and not result.air_invariant_ready:
+                result.errors.append(
+                    _make_message(
+                        code="air_invariant_not_ready_after_seed",
+                        message=(
+                            "Air persistence invariant is not ready after seed."
+                        ),
+                        details=result.post_status,
+                    )
+                )
+
+            if resolved_seed_system_blocks and not result.system_railing_ready:
+                result.errors.append(
+                    _make_message(
+                        code="system_railing_not_ready_after_seed",
+                        message=(
+                            "Built-in Railing mirror is not ready after seed."
+                        ),
+                        details=result.post_status,
+                    )
+                )
+
             if result.errors:
                 result.ok = False
                 result.status = STATUS_FAILED
@@ -2677,14 +3425,105 @@ def run_default_seed(
             _cleanup_db_session(rollback=False, db_extension=db_extension)
 
 
-def _apply_status_to_result(result: DefaultSeedResult, status: Mapping[str, Any]) -> None:
-    """Apply readiness fields from status payload."""
+def _apply_status_to_result(
+    result: DefaultSeedResult,
+    status: Mapping[str, Any],
+) -> None:
+    """Apply readiness and system-block counts from a status payload."""
     try:
-        result.default_project_ready = _safe_bool((status.get("project") or {}).get("exists"), False)
-        result.default_universe_ready = _safe_bool((status.get("universe") or {}).get("exists"), False)
-        result.default_world_ready = _safe_bool((status.get("world") or {}).get("exists"), False)
-        result.block_registry_ready = _safe_bool((status.get("blockRegistry") or {}).get("exists"), False)
-        result.debug_blocks_ready = _safe_bool((status.get("debugBlocks") or {}).get("complete"), False)
+        result.default_project_ready = _safe_bool(
+            (status.get("project") or {}).get("exists"),
+            False,
+        )
+        result.default_universe_ready = _safe_bool(
+            (status.get("universe") or {}).get("exists"),
+            False,
+        )
+        result.default_world_ready = _safe_bool(
+            (status.get("world") or {}).get("exists"),
+            False,
+        )
+        result.block_registry_ready = _safe_bool(
+            (status.get("blockRegistry") or {}).get("exists"),
+            False,
+        )
+        result.debug_blocks_ready = _safe_bool(
+            (status.get("debugBlocks") or {}).get("complete"),
+            False,
+        )
+
+        system_status = _safe_dict(
+            status.get("systemBlocks")
+        )
+
+        result.system_blocks_ready = _safe_bool(
+            system_status.get("ready"),
+            False,
+        )
+
+        result.air_invariant_ready = _safe_bool(
+            (_safe_dict(system_status.get("air"))).get("ready"),
+            False,
+        )
+
+        result.system_railing_ready = _system_railing_ready(
+            system_status
+        )
+
+        counts = _system_block_status_counts(
+            system_status
+        )
+
+        operation_created = 0
+        operation_updated = 0
+
+        for raw_operation in result.operations:
+            operation = _safe_dict(
+                raw_operation
+            )
+
+            if _safe_str(
+                operation.get("name"),
+                "",
+            ) != "system_blocks":
+                continue
+
+            operation_data = _safe_dict(
+                operation.get("data")
+            )
+
+            operation_counts = (
+                _system_block_status_counts(
+                    operation_data
+                )
+            )
+
+            operation_created = max(
+                operation_created,
+                operation_counts["created"],
+            )
+            operation_updated = max(
+                operation_updated,
+                operation_counts["updated"],
+            )
+
+        result.system_block_count = counts[
+            "mirrors"
+        ]
+        result.system_blocks_created = max(
+            result.system_blocks_created,
+            operation_created,
+            counts["created"],
+        )
+        result.system_blocks_updated = max(
+            result.system_blocks_updated,
+            operation_updated,
+            counts["updated"],
+        )
+        result.system_blocks_missing = counts[
+            "missing"
+        ]
+
     except Exception:
         pass
 
@@ -2758,49 +3597,158 @@ def build_default_seed_status(
     """
     Build read-only default seed status.
 
-    This does not create or update anything.
+    This does not create or update anything. Built-in system-block status is
+    evaluated against the same default BlockRegistry used by the concrete world.
     """
     started_at = _utc_now_iso()
 
     with _app_context(app):
         try:
             models = load_seed_model_classes()
-            world_defaults = resolve_world_defaults(app, None)
-            block_defaults = resolve_block_defaults(app, None)
+            world_defaults = resolve_world_defaults(
+                app,
+                None,
+            )
+            block_defaults = resolve_block_defaults(
+                app,
+                None,
+            )
 
-            registry = find_default_block_registry(models, block_defaults)
-            project = find_default_project(models, world_defaults)
-            universe = find_default_universe(models, project, world_defaults) if project is not None else None
-            world = find_default_world(models, universe, world_defaults) if universe is not None else None
+            registry = find_default_block_registry(
+                models,
+                block_defaults,
+            )
+            project = find_default_project(
+                models,
+                world_defaults,
+            )
+            universe = (
+                find_default_universe(
+                    models,
+                    project,
+                    world_defaults,
+                )
+                if project is not None
+                else None
+            )
+            world = (
+                find_default_world(
+                    models,
+                    universe,
+                    world_defaults,
+                )
+                if universe is not None
+                else None
+            )
 
-            debug_blocks_ok = default_debug_blocks_exist(models, registry, block_defaults)
+            debug_blocks_ok = (
+                default_debug_blocks_exist(
+                    models,
+                    registry,
+                    block_defaults,
+                )
+            )
+
+            system_blocks_status = (
+                build_default_system_blocks_status(
+                    registry
+                )
+            )
+
+            system_blocks_ready = _safe_bool(
+                system_blocks_status.get("ready"),
+                False,
+            )
+
+            air_invariant_ready = _safe_bool(
+                (
+                    _safe_dict(
+                        system_blocks_status.get("air")
+                    )
+                ).get("ready"),
+                False,
+            )
+
+            system_railing_ready = (
+                _system_railing_ready(
+                    system_blocks_status
+                )
+            )
+
+            system_counts = (
+                _system_block_status_counts(
+                    system_blocks_status
+                )
+            )
+
             project_exists = project is not None
             universe_exists = universe is not None
             world_exists = world is not None
             registry_exists = registry is not None
 
-            complete = bool(registry_exists and debug_blocks_ok and project_exists and universe_exists and world_exists)
+            complete = bool(
+                registry_exists
+                and debug_blocks_ok
+                and system_blocks_ready
+                and air_invariant_ready
+                and system_railing_ready
+                and project_exists
+                and universe_exists
+                and world_exists
+            )
 
             completed_at = _utc_now_iso()
 
-            project_id = _resolve_project_id(world_defaults)
-            universe_id = _resolve_universe_id(world_defaults)
-            world_id = _resolve_world_id(world_defaults)
-            template_id = _resolve_template_id(world_defaults)
-            provider_id = _resolve_provider_id(world_defaults)
-            provider_world_id = _resolve_provider_world_id(world_defaults)
-            registry_id = _safe_str(getattr(block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID), DEFAULT_BLOCK_REGISTRY_ID)
+            project_id = _resolve_project_id(
+                world_defaults
+            )
+            universe_id = _resolve_universe_id(
+                world_defaults
+            )
+            world_id = _resolve_world_id(
+                world_defaults
+            )
+            template_id = _resolve_template_id(
+                world_defaults
+            )
+            provider_id = _resolve_provider_id(
+                world_defaults
+            )
+            provider_world_id = (
+                _resolve_provider_world_id(
+                    world_defaults
+                )
+            )
+            registry_id = _safe_str(
+                getattr(
+                    block_defaults,
+                    "registry_id",
+                    DEFAULT_BLOCK_REGISTRY_ID,
+                ),
+                DEFAULT_BLOCK_REGISTRY_ID,
+            )
             registry_version = _safe_str(
-                getattr(block_defaults, "registry_version", DEFAULT_BLOCK_REGISTRY_VERSION),
+                getattr(
+                    block_defaults,
+                    "registry_version",
+                    DEFAULT_BLOCK_REGISTRY_VERSION,
+                ),
                 DEFAULT_BLOCK_REGISTRY_VERSION,
             )
 
             return {
                 "ok": complete,
-                "status": STATUS_READY if complete else STATUS_PARTIAL,
+                "status": (
+                    STATUS_READY
+                    if complete
+                    else STATUS_PARTIAL
+                ),
                 "startedAt": started_at,
                 "completedAt": completed_at,
-                "durationMs": _duration_ms(started_at, completed_at),
+                "durationMs": _duration_ms(
+                    started_at,
+                    completed_at,
+                ),
                 "defaults": {
                     "projectId": project_id,
                     "universeId": universe_id,
@@ -2809,32 +3757,150 @@ def build_default_seed_status(
                     "providerId": provider_id,
                     "providerWorldId": provider_world_id,
                     "blockRegistryId": registry_id,
-                    "blockRegistryVersion": registry_version,
+                    "blockRegistryVersion": (
+                        registry_version
+                    ),
+                    "systemRailingBlockTypeId": (
+                        DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
+                    ),
+                    "airSystemBlockId": (
+                        DEFAULT_SYSTEM_AIR_BLOCK_ID
+                    ),
                 },
                 "project": {
                     "exists": project_exists,
                     "projectId": project_id,
                     "dbId": _safe_model_id(project),
-                    "defaultUniverseId": _safe_str(getattr(project, "default_universe_id", ""), "") if project is not None else None,
-                    "defaultWorldId": _safe_str(getattr(project, "default_world_id", ""), "") if project is not None else None,
-                    "spawnWorldId": _safe_str(getattr(project, "spawn_world_id", ""), "") if project is not None else None,
+                    "defaultUniverseId": (
+                        _safe_str(
+                            getattr(
+                                project,
+                                "default_universe_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if project is not None
+                        else None
+                    ),
+                    "defaultWorldId": (
+                        _safe_str(
+                            getattr(
+                                project,
+                                "default_world_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if project is not None
+                        else None
+                    ),
+                    "spawnWorldId": (
+                        _safe_str(
+                            getattr(
+                                project,
+                                "spawn_world_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if project is not None
+                        else None
+                    ),
                 },
                 "universe": {
                     "exists": universe_exists,
                     "universeId": universe_id,
                     "dbId": _safe_model_id(universe),
-                    "defaultWorldId": _safe_str(getattr(universe, "default_world_id", ""), "") if universe is not None else None,
-                    "spawnWorldId": _safe_str(getattr(universe, "spawn_world_id", ""), "") if universe is not None else None,
+                    "defaultWorldId": (
+                        _safe_str(
+                            getattr(
+                                universe,
+                                "default_world_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if universe is not None
+                        else None
+                    ),
+                    "spawnWorldId": (
+                        _safe_str(
+                            getattr(
+                                universe,
+                                "spawn_world_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if universe is not None
+                        else None
+                    ),
                 },
                 "world": {
                     "exists": world_exists,
                     "worldId": world_id,
                     "dbId": _safe_model_id(world),
-                    "templateId": _safe_str(getattr(world, "template_id", ""), "") if world is not None else None,
-                    "providerId": _safe_str(getattr(world, "provider_id", ""), "") if world is not None else None,
-                    "providerWorldId": _safe_str(getattr(world, "provider_world_id", ""), "") if world is not None else None,
-                    "blockRegistryId": _safe_str(getattr(world, "block_registry_id", ""), "") if world is not None else None,
-                    "blockRegistryVersion": _safe_str(getattr(world, "block_registry_version", ""), "") if world is not None else None,
+                    "templateId": (
+                        _safe_str(
+                            getattr(
+                                world,
+                                "template_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if world is not None
+                        else None
+                    ),
+                    "providerId": (
+                        _safe_str(
+                            getattr(
+                                world,
+                                "provider_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if world is not None
+                        else None
+                    ),
+                    "providerWorldId": (
+                        _safe_str(
+                            getattr(
+                                world,
+                                "provider_world_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if world is not None
+                        else None
+                    ),
+                    "blockRegistryId": (
+                        _safe_str(
+                            getattr(
+                                world,
+                                "block_registry_id",
+                                "",
+                            ),
+                            "",
+                        )
+                        if world is not None
+                        else None
+                    ),
+                    "blockRegistryVersion": (
+                        _safe_str(
+                            getattr(
+                                world,
+                                "block_registry_version",
+                                "",
+                            ),
+                            "",
+                        )
+                        if world is not None
+                        else None
+                    ),
                 },
                 "blockRegistry": {
                     "exists": registry_exists,
@@ -2845,12 +3911,39 @@ def build_default_seed_status(
                 "debugBlocks": {
                     "complete": debug_blocks_ok,
                 },
+                "systemBlocks": {
+                    **system_blocks_status,
+                    "summary": {
+                        "ready": system_blocks_ready,
+                        "airInvariantReady": (
+                            air_invariant_ready
+                        ),
+                        "systemRailingReady": (
+                            system_railing_ready
+                        ),
+                        "mirrorCount": system_counts[
+                            "mirrors"
+                        ],
+                        "readyMirrorCount": system_counts[
+                            "readyMirrors"
+                        ],
+                        "missingCount": system_counts[
+                            "missing"
+                        ],
+                        "driftedCount": system_counts[
+                            "drifted"
+                        ],
+                    },
+                },
                 "ready": {
                     "project": project_exists,
                     "universe": universe_exists,
                     "world": world_exists,
                     "blockRegistry": registry_exists,
                     "debugBlocks": debug_blocks_ok,
+                    "systemBlocks": system_blocks_ready,
+                    "airInvariant": air_invariant_ready,
+                    "systemRailing": system_railing_ready,
                 },
             }
 
@@ -2862,9 +3955,14 @@ def build_default_seed_status(
                 "status": STATUS_FAILED,
                 "startedAt": started_at,
                 "completedAt": completed_at,
-                "durationMs": _duration_ms(started_at, completed_at),
+                "durationMs": _duration_ms(
+                    started_at,
+                    completed_at,
+                ),
                 "error": _safe_exception_message(exc),
-                "exceptionType": exc.__class__.__name__,
+                "exceptionType": (
+                    exc.__class__.__name__
+                ),
             }
 
 
@@ -2908,6 +4006,7 @@ def build_default_seed_summary(
         "enabled": bool(data.get("enabled")),
         "seedDefaultsRequested": bool(data.get("seed_defaults_requested")),
         "seedDebugBlocksRequested": bool(data.get("seed_debug_blocks_requested")),
+        "seedSystemBlocksRequested": bool(data.get("seed_system_blocks_requested")),
         "seedDevProjectRequested": bool(data.get("seed_dev_project_requested")),
         "seedOnEmptyOnly": bool(data.get("seed_on_empty_only")),
         "seedSkippedBecauseComplete": bool(data.get("seed_skipped_because_complete")),
@@ -2925,6 +4024,13 @@ def build_default_seed_summary(
         "defaultWorldReady": data.get("default_world_ready"),
         "blockRegistryReady": data.get("block_registry_ready"),
         "debugBlocksReady": data.get("debug_blocks_ready"),
+        "systemBlocksReady": data.get("system_blocks_ready"),
+        "systemRailingReady": data.get("system_railing_ready"),
+        "airInvariantReady": data.get("air_invariant_ready"),
+        "systemBlockCount": data.get("system_block_count"),
+        "systemBlocksCreated": data.get("system_blocks_created"),
+        "systemBlocksUpdated": data.get("system_blocks_updated"),
+        "systemBlocksMissing": data.get("system_blocks_missing"),
         "operationCount": len(operations),
         "createdCount": created_count,
         "updatedCount": updated_count,
@@ -2959,6 +4065,7 @@ __all__ = [
     "apply_universe_defaults_to_object",
     "apply_world_defaults_to_object",
     "build_default_seed_status",
+    "build_default_system_blocks_status",
     "build_default_seed_summary",
     "create_block_registry_object",
     "create_debug_block_object",
@@ -2966,6 +4073,7 @@ __all__ = [
     "create_universe_object",
     "create_world_object",
     "default_debug_blocks_exist",
+    "default_system_blocks_exist",
     "default_seed_result_to_dict",
     "find_default_block_registry",
     "find_default_project",
@@ -2973,11 +4081,14 @@ __all__ = [
     "find_default_world",
     "is_default_seed_complete",
     "load_seed_model_classes",
+    "load_system_block_bootstrap_api",
+    "clear_default_seed_system_block_caches",
     "resolve_block_defaults",
     "resolve_seed_settings",
     "resolve_world_defaults",
     "run_default_seed",
     "run_default_seed_if_enabled",
     "seed_debug_blocks",
+    "seed_system_blocks",
     "seed_dev_project_universe_world",
 ]
