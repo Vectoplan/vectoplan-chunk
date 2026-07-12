@@ -1,13 +1,125 @@
+<!-- services/vectoplan-chunk/IST-Zustand.md -->
 # IST-Zustand.md – VECTOPLAN Chunk Service
+
+## Status dieser aktualisierten Fassung
+
+Stand: 2026-07-12  
+Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Default-Welt, App-Provisioning, bestätigter Editor-Chunk-Anbindung und betriebsfähiger eingebauter Systemblock-Schicht.
+
+Diese Aktualisierung **kürzt die bisherige IST-Dokumentation nicht**. Die vollständige bisherige Bestandsaufnahme bleibt weiter unten als historische Basis enthalten. Ergänzt wurden der inzwischen bestätigte Systemblock-Katalog, Air- und Railing-Invarianten, die persistente Registry-Spiegelung, die neuen Blockrouten und die verifizierte Editor-/Admin-Sichtbarkeit.
+
+### Neu bestätigter Stand seit der historischen Basisfassung
+
+```text
+Systemblock-Katalog bereit
+→ catalogReady = true
+→ zwei Code-Definitionen vorhanden
+→ system_air und system_railing
+
+Registry bereit
+→ registryReady = true
+→ debug-blocks@1
+→ source = internal
+
+Air-Invariante bereit
+→ airInvariantReady = true
+→ cellValue 0
+→ keine persistente BlockType-Zeile
+→ nicht inventarsichtbar
+→ nicht platzierbar
+
+Railing-Mirror bereit
+→ systemRailingReady = true
+→ system_railing ist persistiert
+→ status = active
+→ category = system
+→ kein Drift zur Code-Definition
+→ inventarsichtbar
+→ platzierbar
+→ selektierbar
+→ kollidierbar
+
+Gesamte Systemblock-Schicht bereit
+→ systemBlocksReady = true
+
+Normale Welt-Blockroute
+→ debug_grass  = paletteIndex 0 / cellValue 1
+→ debug_dirt   = paletteIndex 1 / cellValue 2
+→ system_railing = paletteIndex 2 / cellValue 3
+→ Air bleibt separat bei cellValue 0
+```
+
+### Wichtige begriffliche Einordnung
+
+Im Backend gibt es aktuell keine eigene technische Kategorie `admin`.
+
+Die sichtbaren Blockarten sind:
+
+```text
+category = debug
+→ debug_grass
+→ debug_dirt
+
+category = system
+→ system_railing
+
+reservierter Zellzustand
+→ system_air
+```
+
+Wenn in der Oberfläche von „Admin-Blöcken“ gesprochen wird, ist damit im derzeit bestätigten Zustand vor allem der eingebaute, unveränderliche Systemblock `system_railing` gemeint.
+
+### Aktuell wichtigste neue Dateien
+
+```text
+services/vectoplan-chunk/src/system_blocks/__init__.py
+services/vectoplan-chunk/src/system_blocks/contracts.py
+services/vectoplan-chunk/src/system_blocks/catalog.py
+services/vectoplan-chunk/src/system_blocks/bootstrap.py
+
+services/vectoplan-chunk/src/system_blocks/air/__init__.py
+services/vectoplan-chunk/src/system_blocks/air/definition.py
+
+services/vectoplan-chunk/src/system_blocks/railing/__init__.py
+services/vectoplan-chunk/src/system_blocks/railing/definition.py
+
+services/vectoplan-chunk/src/system_blocks/IST-Zustand.md
+```
+
+### Aktuell wichtigste geänderte Integrationsdateien
+
+```text
+services/vectoplan-chunk/src/bootstrap/default_seed.py
+services/vectoplan-chunk/src/bootstrap/db_bootstrap.py
+services/vectoplan-chunk/scripts/bootstrap_db.py
+services/vectoplan-chunk/routes/blocks.py
+```
+
+### Neue zentrale Systemblock-Routen
+
+```text
+GET /projects/<project_id>/worlds/<world_id>/blocks/system
+GET /blocks/system
+```
+
+Die normale Welt-Blockroute bleibt für Editor und konkrete Palette entscheidend:
+
+```text
+GET /projects/<project_id>/worlds/<world_id>/blocks
+```
+
+---
+
+## Historische Basisfassung – VECTOPLAN Chunk Service
 
 <!-- services/vectoplan-chunk/IST-Zustand.md -->
 
-## Status dieser Fassung
+### Status der historischen Basisfassung
 
 Stand: 2026-06-24
 Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Default-Welt, App-Provisioning und bestätigter Editor-Chunk-Anbindung
 
-> Teil 1 von 2
+> Historische Basis: Teil 1 von 2
 
 Diese Datei beschreibt den aktuellen **IST-Zustand** des `vectoplan-chunk`-Services nach:
 
@@ -4393,4 +4505,1567 @@ Grenztests
 Negative Koordinaten
 Batch-Mix
 Object-Commands
+```
+
+---
+
+## 26. Aktualisierung 2026-07-12 – Eingebaute Systemblöcke
+
+Dieser Abschnitt ergänzt die vollständige historische Bestandsaufnahme um den inzwischen implementierten und erfolgreich gestarteten Systemblock-Slice.
+
+### 26.1 Aktueller Gesamtstatus
+
+Der Systemblock-Slice ist betriebsfähig.
+
+Verifiziert ist:
+
+```text
+responseVersion = system-blocks-response.v1
+ok = true
+ready = true
+
+catalogReady = true
+registryReady = true
+airInvariantReady = true
+systemRailingReady = true
+systemBlocksReady = true
+```
+
+Der Code-Katalog, die Datenbank-Registry und die persistente Spiegelung stimmen miteinander überein.
+
+Aktuelle Definitionen:
+
+```text
+system_air
+system_railing
+```
+
+Aktuelle persistente Systemblock-Mirrors:
+
+```text
+system_railing
+```
+
+Aktuelle reservierte, nicht persistente Definition:
+
+```text
+system_air
+```
+
+Katalogzählung:
+
+```text
+definitionCount           = 2
+persistentDefinitionCount = 1
+reservedDefinitionCount   = 1
+inventoryDefinitionCount  = 1
+```
+
+Registry-Zählung für Systemblöcke:
+
+```text
+mirrors      = 1
+readyMirrors = 1
+created      = 0
+updated      = 0
+drifted      = 0
+```
+
+Die Werte `created = 0` und `updated = 0` im Read-only-Status bedeuten, dass beim Statusaufruf keine Reparatur nötig war. Der persistente Mirror war bereits vorhanden und unverändert.
+
+---
+
+### 26.2 Fachliche Abgrenzung: Systemblock, Debug-Block und Air
+
+#### Systemblock
+
+Ein Systemblock ist im Code definiert und besitzt eine stabile Systemidentität.
+
+Beispiel:
+
+```text
+systemBlockId      = system_railing
+runtimeBlockTypeId = system_railing
+source             = system
+category           = system
+```
+
+Ein persistenter Systemblock wird in die BlockRegistry gespiegelt, damit bestehende Runtime-, Palette- und Command-Pfade ihn wie einen normalen `BlockType` auflösen können.
+
+#### Debug-Block
+
+Debug-Blöcke sind persistente Entwicklungsblöcke der Default-Registry.
+
+Aktuell:
+
+```text
+debug_grass
+debug_dirt
+```
+
+Sie besitzen:
+
+```text
+category = debug
+source   = Registry-/Seed-Kontext
+```
+
+#### Air
+
+Air ist weder Debug-Block noch normaler persistenter Systemblock.
+
+Air ist der reservierte leere Zellzustand:
+
+```text
+systemBlockId = system_air
+cellValue     = 0
+BlockType     = nicht vorhanden
+PaletteEntry  = nicht vorhanden
+```
+
+---
+
+### 26.3 Architektur des Pakets `src/system_blocks`
+
+Aktuelle Struktur:
+
+```text
+services/vectoplan-chunk/src/system_blocks/
+├── __init__.py
+├── contracts.py
+├── catalog.py
+├── bootstrap.py
+├── IST-Zustand.md
+├── air/
+│   ├── __init__.py
+│   └── definition.py
+└── railing/
+    ├── __init__.py
+    └── definition.py
+```
+
+Verantwortlichkeiten:
+
+```text
+contracts.py
+→ frameworkunabhängiger Definitionsvertrag
+→ Validierung
+→ Serialisierung
+→ Fingerprint
+→ persistente Wertabbildung
+→ DB-Vergleich
+
+catalog.py
+→ Provider laden
+→ Air und Railing zusammenführen
+→ Definitionen validieren
+→ Indizes und Lookups erzeugen
+→ Katalogstatus liefern
+→ persistente Definitionen filtern
+
+bootstrap.py
+→ Air-Invariante prüfen
+→ persistente Mirrors prüfen
+→ fehlende Mirrors erstellen
+→ Drift reparieren
+→ inaktive Mirrors wiederherstellen
+→ Registry-Identität prüfen
+→ ohne äußeren Commit arbeiten
+
+__init__.py
+→ Lazy Package-Fassade
+→ stabile öffentliche Exporte
+→ Moduldiagnostik
+→ Cache-Steuerung
+
+air/definition.py
+→ kanonische Air-Definition
+
+railing/definition.py
+→ kanonische Railing-Definition
+```
+
+Die Paketstruktur erzeugt keine zweite SQL-Registry. Es bleibt bei der vorhandenen `BlockRegistry`-/`BlockType`-Struktur.
+
+---
+
+### 26.4 Definitionsvertrag
+
+Die gemeinsame Definition wird durch `SystemBlockDefinition` beschrieben.
+
+Wichtige Identitätsfelder:
+
+```text
+system_block_id
+runtime_block_type_id
+definition_version
+definition_key
+definition_fingerprint
+kind
+source
+category
+status
+```
+
+Wichtige Speicherfelder:
+
+```text
+reserved_cell_value
+persist_as_block_type
+default_palette_index
+```
+
+Wichtige Editor-/Runtime-Felder:
+
+```text
+inventory_visible
+solid
+opaque
+placeable
+breakable
+selectable
+collidable
+emits_light
+light_level
+hardness
+stack_size
+render_mode
+shape_type
+material_id
+texture_id
+icon_id
+```
+
+Wichtige abgeleitete Eigenschaften:
+
+```text
+is_reserved_cell_state
+is_air_state
+is_persisted_runtime_block
+can_appear_in_inventory
+```
+
+Der Definitions-Fingerprint ist entscheidend für den Drift-Abgleich:
+
+```text
+Code-Definition
+→ kanonisch serialisieren
+→ Fingerprint erzeugen
+→ im persistenten Metadata-Bereich speichern
+→ beim Status-/Bootstrap-Lauf vergleichen
+```
+
+---
+
+### 26.5 Katalog
+
+Der Katalog trägt aktuell die Identität:
+
+```text
+catalogId      = vectoplan-built-in-system-blocks
+catalogVersion = 1
+moduleVersion  = 1.0.1
+```
+
+Provider:
+
+```text
+air
+railing
+```
+
+Beide Provider sind aktuell:
+
+```text
+required = true
+ready    = true
+imported = true
+```
+
+Importpfade:
+
+```text
+src.system_blocks.air
+src.system_blocks.railing
+```
+
+Der Katalog stellt Lookups bereit nach:
+
+```text
+systemBlockId
+runtimeBlockTypeId
+Definition-Key
+Alias
+reserviertem Zellwert
+```
+
+Kataloginvarianten:
+
+```text
+systemBlockId muss eindeutig sein
+runtimeBlockTypeId muss eindeutig sein
+Alias muss eindeutig sein
+reservierter Zellwert muss eindeutig sein
+Air muss cellValue 0 reservieren
+Air darf nicht persistiert werden
+persistente Systemblöcke benötigen runtimeBlockTypeId
+inventarsichtbare Definitionen müssen platzierbar sein
+```
+
+---
+
+### 26.6 Air-Definition
+
+Identität:
+
+```text
+systemBlockId      = system_air
+runtimeBlockTypeId = null
+definitionVersion  = 1
+kind               = air
+source             = system
+category           = system
+status             = active
+```
+
+Speichersemantik:
+
+```text
+reservedCellValue  = 0
+persistAsBlockType = false
+storedAsBlockType  = false
+storedInPositivePalette = false
+storedAsCellValue  = 0
+```
+
+Editorsemantik:
+
+```text
+inventoryVisible = false
+placeable        = false
+breakable        = false
+selectable       = false
+targetable       = false
+replaceable      = true
+```
+
+Rendering:
+
+```text
+visible     = false
+createsMesh = false
+renderMode  = invisible
+shapeType   = empty
+```
+
+Physik:
+
+```text
+solid          = false
+collidable     = false
+blocksMovement = false
+hardness       = 0.0
+```
+
+Command-Semantik:
+
+```text
+creationCommand          = RemoveBlock
+placementCommand         = null
+forbiddenPlacementCommand = SetBlock
+setBlockErrorCode        = air_requires_remove_block
+```
+
+Verifizierter Datenbankstatus:
+
+```text
+illegalRowCount     = 0
+illegalRowDbIds     = []
+illegalBlockTypeIds = []
+action              = ready
+ready               = true
+```
+
+Damit ist bestätigt:
+
+```text
+Keine BlockType-Zeile für system_air vorhanden.
+cellValue 0 bleibt ausschließlich Air.
+```
+
+---
+
+### 26.7 Railing-Definition
+
+Identität:
+
+```text
+systemBlockId      = system_railing
+runtimeBlockTypeId = system_railing
+definitionVersion  = 1
+kind               = railing
+source             = system
+category           = system
+status             = active
+```
+
+Persistenz:
+
+```text
+persistAsBlockType  = true
+immutableDefinition = true
+inventoryVisible    = true
+```
+
+Laufzeitflags:
+
+```text
+solid       = true
+opaque      = true
+placeable   = true
+breakable   = true
+selectable  = true
+collidable  = true
+emitsLight  = false
+lightLevel  = 0
+hardness    = 1.0
+stackSize   = 64
+```
+
+Rendering in Version 1:
+
+```text
+renderMode      = cube
+shapeType       = cube
+currentGeometry = full_cube
+futureGeometry  = railing
+```
+
+Kollision in Version 1:
+
+```text
+currentCollision = full_cube
+blocksMovement   = true
+```
+
+Noch nicht implementiert:
+
+```text
+orientationSupported          = false
+neighbourConnectionSupported  = false
+multiBlockObject               = false
+```
+
+Zukunftskompatibilität:
+
+```text
+runtimeBlockTypeId bleibt system_railing
+Geometrie darf später geändert werden
+Kollision darf später geändert werden
+Orientierung darf später ergänzt werden
+Nachbarverbindungen dürfen später ergänzt werden
+```
+
+---
+
+### 26.8 Persistenter Railing-Mirror
+
+Der persistente Mirror liegt in:
+
+```text
+registryId      = debug-blocks
+registryVersion = 1
+registryKey     = debug-blocks@1
+```
+
+Persistente Identität:
+
+```text
+blockTypeId      = system_railing
+systemBlockId    = system_railing
+runtimeBlockTypeId = system_railing
+category         = system
+status           = active
+revision         = 1
+```
+
+Verifizierter Mirror-Status:
+
+```text
+ready                 = true
+repairable            = true
+action                = unchanged
+driftBefore           = {}
+driftAfter            = {}
+modelValidationErrors = {}
+wouldChange           = false
+changed               = false
+created               = false
+updated               = false
+errors                = []
+```
+
+Der Mirror enthält Systemmetadaten unter:
+
+```text
+metadata.vectoplanSystemBlock
+```
+
+Wichtige Werte:
+
+```text
+schemaVersion          = system-block-metadata.schema.v1
+systemBlockId          = system_railing
+runtimeBlockTypeId     = system_railing
+definitionVersion      = 1
+persistAsBlockType     = true
+inventoryVisible       = true
+immutableDefinition    = true
+cellEncodingVersion    = cell-encoding.palette-index-plus-one.v1
+blockCellValueRule     = paletteIndex + 1
+definitionFingerprint  = kanonischer Railing-Fingerprint
+```
+
+---
+
+### 26.9 BlockRegistry
+
+Aktuell bestätigte Default-Registry:
+
+```text
+registryId      = debug-blocks
+registryVersion = 1
+registryKey     = debug-blocks@1
+label           = Debug Blocks
+status          = active
+source          = internal
+isDefault       = true
+```
+
+Wichtig:
+
+```text
+BlockRegistry.source = internal
+```
+
+Der frühere temporäre Bootstrap-Wert:
+
+```text
+source = bootstrap
+```
+
+ist für die Datenbankspalte nicht gültig und wird nicht mehr verwendet.
+
+`bootstrap` bleibt zulässig als:
+
+```text
+createdByUserId
+updatedByUserId
+seededBy-Metadatum
+```
+
+Die Registry enthält aktuell drei positive Paletteeinträge:
+
+```text
+debug_grass
+debug_dirt
+system_railing
+```
+
+Air ist nicht Teil dieser positiven Liste.
+
+---
+
+### 26.10 Zellwert- und Palettenmodell
+
+Globale Kodierungsregel:
+
+```text
+encoding.version = cell-encoding.palette-index-plus-one.v1
+airCellValue     = 0
+blockCellValueRule = paletteIndex + 1
+```
+
+Aktuell konkrete Default-Weltpalette:
+
+```text
+paletteIndex 0
+→ blockTypeId = debug_grass
+→ cellValue   = 1
+
+paletteIndex 1
+→ blockTypeId = debug_dirt
+→ cellValue   = 2
+
+paletteIndex 2
+→ blockTypeId = system_railing
+→ cellValue   = 3
+```
+
+Wichtig:
+
+```text
+system_railing hat keinen global fest reservierten Zellwert 3.
+```
+
+Der aktuelle Wert `3` entsteht nur aus:
+
+```text
+paletteIndex 2 + 1
+```
+
+In einer anderen Chunkpalette kann `system_railing` einen anderen positiven Zellwert erhalten.
+
+Persistente Railing-Defaults bleiben deshalb:
+
+```text
+defaultPaletteIndex = null
+defaultCellValue    = null
+```
+
+Die konkrete Palette bestimmt den Zellwert.
+
+---
+
+### 26.11 Bootstrap-Integration
+
+Die Systemblock-Schicht ist in den expliziten DB-Bootstrap integriert.
+
+Beteiligte Dateien:
+
+```text
+src/bootstrap/default_seed.py
+src/bootstrap/db_bootstrap.py
+scripts/bootstrap_db.py
+src/system_blocks/bootstrap.py
+```
+
+Aktueller Ablauf:
+
+```text
+Schema prüfen/erzeugen
+→ Default-Registry sicherstellen
+→ Debug-Blöcke sicherstellen
+→ Air-Invariante prüfen
+→ system_railing-Mirror sicherstellen
+→ Dev-Project sicherstellen
+→ Dev-Universe sicherstellen
+→ world_spawn sicherstellen
+→ Gesamtstatus prüfen
+→ äußerer Commit
+```
+
+Bei einem Fehler:
+
+```text
+äußerer Rollback
+```
+
+Transaktionsregel:
+
+```text
+src/system_blocks/bootstrap.py
+→ darf flushen
+→ darf verschachtelte Transaktion verwenden
+→ führt keinen äußeren Commit aus
+
+default_seed.py / db_bootstrap.py
+→ besitzen Commit-/Rollback-Verantwortung
+```
+
+Aktuelle Readiness-Felder:
+
+```text
+systemBlocksReady
+systemRailingReady
+airInvariantReady
+systemBlockCount
+systemBlocksCreated
+systemBlocksUpdated
+systemBlocksMissing
+systemBlocksDrifted
+```
+
+Der Bootstrap gilt nicht als vollständig bereit, wenn:
+
+```text
+system_air als BlockType existiert
+system_railing fehlt
+system_railing inaktiv ist
+system_railing gelöscht ist
+system_railing zur Code-Definition driftet
+Registry fehlt oder inaktiv ist
+```
+
+---
+
+### 26.12 Normale Welt-Blockroute
+
+Route:
+
+```text
+GET /projects/dev-project/worlds/world_spawn/blocks
+```
+
+Antwortversion:
+
+```text
+world-blocks-response.v2
+```
+
+Die Route liefert:
+
+```text
+Registry-Kontext
+Air separat
+positive Blockliste
+Palette
+konkrete Paletteindizes
+konkrete Zellwerte
+Blockflags
+Systemblock-Metadaten
+Route-Hints
+```
+
+Aktuell bestätigte Blockliste:
+
+```text
+debug_grass
+debug_dirt
+system_railing
+```
+
+Aktuelle Zählung:
+
+```text
+blocks         = 3
+paletteEntries = 3
+includingAir   = 4
+```
+
+Bestätigter Railing-Eintrag:
+
+```json
+{
+  "paletteIndex": 2,
+  "cellValue": 3,
+  "blockTypeId": "system_railing",
+  "label": "Railing",
+  "category": "system",
+  "systemBlockId": "system_railing",
+  "runtimeBlockTypeId": "system_railing",
+  "definitionVersion": "1",
+  "source": "system",
+  "persistAsBlockType": true,
+  "inventoryVisible": true,
+  "immutableDefinition": true,
+  "placeable": true,
+  "breakable": true,
+  "selectable": true,
+  "collidable": true,
+  "renderMode": "cube",
+  "shapeType": "cube"
+}
+```
+
+Diese Route bestätigt, dass der eingebaute Systemblock für die normale Editor-Blockauswahl verfügbar ist.
+
+---
+
+### 26.13 Systemblock-Spezialroute
+
+Projektgescopt:
+
+```text
+GET /projects/dev-project/worlds/world_spawn/blocks/system
+```
+
+Default-Komfortpfad:
+
+```text
+GET /blocks/system
+```
+
+Antwortversion:
+
+```text
+system-blocks-response.v1
+```
+
+Die Route liefert:
+
+```text
+readiness
+Air
+Code-Definitionen
+persistente Mirrors
+Katalog
+Katalogstatus
+Registrystatus
+Encoding
+Counts
+Route-Hints
+Metadaten
+```
+
+Verifizierte Kernwerte:
+
+```text
+ok    = true
+ready = true
+
+readiness.catalogReady        = true
+readiness.registryReady       = true
+readiness.airInvariantReady   = true
+readiness.systemRailingReady  = true
+readiness.systemBlocksReady   = true
+```
+
+Persistente Systemblöcke:
+
+```text
+persistentBlocks = [system_railing]
+```
+
+Air:
+
+```text
+air.systemBlockId = system_air
+air.cellValue     = 0
+air.blockTypeId   = null
+```
+
+---
+
+### 26.14 Bekannte Spezialrouten-Inkonsistenz
+
+Die aktuelle Spezialroute liefert gleichzeitig:
+
+```text
+persistentBlocks = [system_railing]
+blocks           = []
+inventoryBlocks  = []
+```
+
+Die Readiness bleibt korrekt und der persistente Mirror ist vorhanden.
+
+Einordnung:
+
+```text
+Die normale Welt-Blockroute zeigt system_railing korrekt an.
+Die Systemblock-Spezialroute zeigt system_railing korrekt unter persistentBlocks an.
+Die Top-Level-Listen blocks und inventoryBlocks der Spezialroute sind derzeit leer.
+```
+
+Auswirkung:
+
+```text
+Editor liest normale Welt-Blockroute
+→ Railing sichtbar
+
+Admin-UI liest Spezialroute und persistentBlocks
+→ Railing sichtbar
+
+Admin-UI liest Spezialroute ausschließlich über inventoryBlocks
+→ Railing derzeit nicht sichtbar
+```
+
+Empfohlene spätere Bereinigung in `routes/blocks.py`:
+
+```text
+Option A:
+inventoryBlocks mit inventarsichtbaren persistenten Systemblöcken befüllen
+
+Option B:
+blocks/inventoryBlocks eindeutig als code-only Listen benennen
+
+Option C:
+Payload-Vertrag dokumentieren und Counts angleichen
+```
+
+Dies ist kein Bootstrap- oder Persistenzfehler.
+
+---
+
+### 26.15 Editor-/Admin-Sichtbarkeit
+
+Aktuell über die normale Welt-Blockroute sichtbar:
+
+```text
+debug_grass
+debug_dirt
+system_railing
+```
+
+Nicht als Blockauswahl sichtbar:
+
+```text
+system_air
+```
+
+Das ist beabsichtigt.
+
+`system_railing` ist aktuell:
+
+```text
+aktiv
+inventarsichtbar
+platzierbar
+zerstörbar
+selektierbar
+zielbar
+kollidierbar
+persistiert
+als Systemblock markiert
+in positiver Palette enthalten
+```
+
+`system_air` ist aktuell:
+
+```text
+nicht inventarsichtbar
+nicht platzierbar
+nicht selektierbar
+nicht kollidierbar
+nicht persistiert
+als Zellwert 0 reserviert
+```
+
+---
+
+### 26.16 Command-Integration
+
+Der bestehende Command-Pfad kann `system_railing` grundsätzlich wie einen normalen Registry-Block auflösen.
+
+Vorgesehener Railing-Pfad:
+
+```text
+SetBlock
+→ blockTypeId = system_railing
+→ Registry-Block auflösen
+→ positive Chunkpalette verwenden/ergänzen
+→ cellValue = paletteIndex + 1
+→ Snapshot schreiben
+→ ChunkEvent schreiben
+→ WorldCommandLog schreiben
+```
+
+Railing benötigt keinen neuen Command-Typ.
+
+Metadaten:
+
+```text
+placementCommand      = SetBlock
+removalCommand        = RemoveBlock
+requiresNewCommandType = false
+```
+
+Noch nicht als eigene Command-Regel umgesetzt:
+
+```text
+SetBlock(system_air)
+→ sollte ausdrücklich HTTP 400 liefern
+→ code = air_requires_remove_block
+```
+
+Aktueller Schutz ohne Command-Anpassung:
+
+```text
+system_air besitzt keine BlockType-Zeile
+→ bestehende BlockType-Auflösung findet Air nicht
+→ Air kann nicht als normaler Block gesetzt werden
+```
+
+Empfohlene spätere Änderung in `routes/commands.py`:
+
+```text
+system_air vor DB-Lookup erkennen
+explizit als invalid_command ablehnen
+Hinweis auf RemoveBlock ausgeben
+Systemblock-Metadaten in neu erzeugten Paletten erhalten
+Command-Status um Systemblockregeln ergänzen
+```
+
+---
+
+### 26.17 Aktuelle Datenbankerwartung
+
+Tabelle `block_registries`:
+
+```text
+debug-blocks@1
+status  = active
+source  = internal
+default = true
+```
+
+Tabelle `block_types`:
+
+```text
+debug_grass
+debug_dirt
+system_railing
+```
+
+Nicht vorhanden:
+
+```text
+system_air
+```
+
+SQL-Prüfung:
+
+```powershell
+docker exec vectoplan-chunk-db psql `
+  -U vectoplan_chunk `
+  -d vectoplan_chunk `
+  -c "select registry_id, registry_version, status, source, is_default from block_registries order by id;"
+```
+
+Erwartung:
+
+```text
+registry_id      = debug-blocks
+registry_version = 1
+status           = active
+source           = internal
+is_default       = true
+```
+
+Systemblock-Prüfung:
+
+```powershell
+docker exec vectoplan-chunk-db psql `
+  -U vectoplan_chunk `
+  -d vectoplan_chunk `
+  -c "select block_type_id, category, status, placeable, selectable, collidable, render_mode, shape_type from block_types where block_type_id in ('system_air','system_railing') order by block_type_id;"
+```
+
+Erwartung:
+
+```text
+genau eine Zeile:
+system_railing | system | active | true | true | true | cube | cube
+
+keine Zeile:
+system_air
+```
+
+---
+
+### 26.18 Manuelle Statusprüfung
+
+Externer lokaler Service-Port laut bestehender Service-Dokumentation:
+
+```text
+http://127.0.0.1:5002
+```
+
+Systemblockstatus:
+
+```powershell
+$BASE = "http://127.0.0.1:5002"
+
+$system = Invoke-RestMethod `
+  -Method Get `
+  -Uri "$($BASE)/projects/dev-project/worlds/world_spawn/blocks/system" `
+  -TimeoutSec 20
+
+$system | ConvertTo-Json -Depth 50
+```
+
+Assertions:
+
+```powershell
+if (-not $system.ok) {
+  throw "Systemblock-Route meldet ok=false."
+}
+
+if (-not $system.ready) {
+  throw "Systemblock-Route meldet ready=false."
+}
+
+if (-not $system.readiness.catalogReady) {
+  throw "Systemblock-Katalog ist nicht bereit."
+}
+
+if (-not $system.readiness.registryReady) {
+  throw "BlockRegistry ist nicht bereit."
+}
+
+if (-not $system.readiness.airInvariantReady) {
+  throw "Air-Invariante ist nicht bereit."
+}
+
+if (-not $system.readiness.systemRailingReady) {
+  throw "system_railing ist nicht bereit."
+}
+
+if (-not $system.readiness.systemBlocksReady) {
+  throw "Gesamte Systemblock-Schicht ist nicht bereit."
+}
+
+$railingMirror = @(
+  $system.persistentBlocks |
+    Where-Object { $_.blockTypeId -eq "system_railing" }
+)
+
+if ($railingMirror.Count -ne 1) {
+  throw "Erwartet genau einen persistenten system_railing-Mirror."
+}
+
+if ($system.air.cellValue -ne 0) {
+  throw "Air muss cellValue 0 besitzen."
+}
+
+if ($null -ne $system.air.blockTypeId) {
+  throw "Air darf keine blockTypeId besitzen."
+}
+
+"SYSTEMBLOCK-STATUS ERFOLGREICH"
+```
+
+---
+
+### 26.19 Manuelle Weltpalettenprüfung
+
+```powershell
+$BASE = "http://127.0.0.1:5002"
+
+$worldBlocks = Invoke-RestMethod `
+  -Method Get `
+  -Uri "$($BASE)/projects/dev-project/worlds/world_spawn/blocks" `
+  -TimeoutSec 20
+
+$worldBlocks | ConvertTo-Json -Depth 50
+```
+
+Railing suchen:
+
+```powershell
+$railing = @(
+  $worldBlocks.blocks.blocks |
+    Where-Object { $_.blockTypeId -eq "system_railing" }
+)
+
+if ($railing.Count -ne 1) {
+  throw "system_railing fehlt in der normalen Welt-Blockliste."
+}
+
+if (-not $railing[0].inventoryVisible) {
+  throw "system_railing ist nicht inventarsichtbar."
+}
+
+if (-not $railing[0].placeable) {
+  throw "system_railing ist nicht platzierbar."
+}
+
+if ($railing[0].category -ne "system") {
+  throw "system_railing besitzt nicht category=system."
+}
+
+if ($railing[0].cellValue -ne ($railing[0].paletteIndex + 1)) {
+  throw "Railing-Zellwert verletzt paletteIndex+1."
+}
+
+if ($worldBlocks.blocks.air.cellValue -ne 0) {
+  throw "Air muss in der Welt-Blockroute cellValue 0 besitzen."
+}
+
+"WELTPALETTE ERFOLGREICH"
+```
+
+---
+
+### 26.20 Railing-Platzierungstest
+
+Der bestehende Command-Pfad ist für Railing konzeptionell vorbereitet.
+
+Beispiel:
+
+```powershell
+$BASE = "http://127.0.0.1:5002"
+
+$body = @{
+  type = "SetBlock"
+  userId = "system_block_test"
+  sessionId = "system_block_test_$(Get-Date -Format yyyyMMddHHmmss)"
+  position = @{
+    x = 1
+    y = 2
+    z = 1
+  }
+  blockTypeId = "system_railing"
+} | ConvertTo-Json -Depth 20
+
+$result = Invoke-RestMethod `
+  -Method Post `
+  -Uri "$($BASE)/projects/dev-project/worlds/world_spawn/commands" `
+  -ContentType "application/json" `
+  -Body $body `
+  -TimeoutSec 20
+
+$result | ConvertTo-Json -Depth 40
+```
+
+Erwartung:
+
+```text
+ok = true
+commandType = SetBlock
+commandStatus = applied
+changed = true
+snapshotIds vorhanden
+eventIds vorhanden
+changedChunks vorhanden
+dirtyChunks vorhanden
+```
+
+Aufräumen:
+
+```powershell
+$removeBody = @{
+  type = "RemoveBlock"
+  userId = "system_block_test"
+  sessionId = "system_block_test_$(Get-Date -Format yyyyMMddHHmmss)"
+  position = @{
+    x = 1
+    y = 2
+    z = 1
+  }
+} | ConvertTo-Json -Depth 20
+
+$removeResult = Invoke-RestMethod `
+  -Method Post `
+  -Uri "$($BASE)/projects/dev-project/worlds/world_spawn/commands" `
+  -ContentType "application/json" `
+  -Body $removeBody `
+  -TimeoutSec 20
+
+$removeResult | ConvertTo-Json -Depth 40
+```
+
+---
+
+### 26.21 Erweiterte aktuelle Invarianten
+
+Zusätzlich zu den in Abschnitt 13 dokumentierten Regeln gelten nun:
+
+```text
+49. Systemblock-Definitionen sind codegeführt und unveränderlich.
+50. Der Systemblock-Katalog ist keine zweite Datenbankregistry.
+51. Persistente Systemblöcke werden in die vorhandene BlockRegistry gespiegelt.
+52. system_air reserviert ausschließlich cellValue 0.
+53. system_air darf niemals als BlockType persistiert werden.
+54. system_air darf keinen positiven Paletteintrag besitzen.
+55. system_air ist nicht inventarsichtbar.
+56. system_air wird durch RemoveBlock erzeugt.
+57. SetBlock(system_air) ist fachlich unzulässig.
+58. system_railing besitzt die stabile runtimeBlockTypeId system_railing.
+59. system_railing wird als BlockType in die World-Registry gespiegelt.
+60. system_railing muss aktiv und nicht gelöscht sein.
+61. system_railing muss dem Code-Fingerprint entsprechen.
+62. system_railing besitzt keinen global festen Zellwert.
+63. Der konkrete Railing-Zellwert ist paletteIndex + 1.
+64. system_railing ist aktuell inventarsichtbar und platzierbar.
+65. Railing Version 1 rendert als full_cube.
+66. Railing Version 1 kollidiert als full_cube.
+67. Eine spätere Geländergeometrie darf die stabile Block-ID nicht ändern.
+68. Der Systemblock-Bootstrap führt keinen äußeren Commit aus.
+69. Default-Seed und DB-Bootstrap besitzen die äußere Transaktion.
+70. BlockRegistry.source für die interne Default-Registry ist internal.
+71. Bootstrap ist nur Benutzer-/Metadatenkennzeichnung, kein Registry-source-Wert.
+72. Readiness erfordert Katalog, Registry, Air und Railing gemeinsam.
+73. Ein fehlender oder gedrifteter Railing-Mirror macht Seed-Readiness false.
+74. Eine persistente Air-Zeile macht Air-Invariant-Readiness false.
+75. Die normale Welt-Blockroute ist die konkrete Editor-Palettenquelle.
+76. Die Systemblock-Spezialroute ist Diagnose- und Definitionsquelle.
+77. persistentBlocks der Spezialroute enthält den Datenbankmirror.
+78. Die derzeit leeren Spezialroutenfelder blocks/inventoryBlocks sind dokumentierte API-Unschärfe.
+```
+
+---
+
+### 26.22 Aktualisierte Dateieinordnung
+
+Neu:
+
+```text
+src/system_blocks/__init__.py
+src/system_blocks/contracts.py
+src/system_blocks/catalog.py
+src/system_blocks/bootstrap.py
+src/system_blocks/air/__init__.py
+src/system_blocks/air/definition.py
+src/system_blocks/railing/__init__.py
+src/system_blocks/railing/definition.py
+src/system_blocks/IST-Zustand.md
+```
+
+Geändert:
+
+```text
+src/bootstrap/default_seed.py
+src/bootstrap/db_bootstrap.py
+scripts/bootstrap_db.py
+routes/blocks.py
+```
+
+Noch als nächster Integrationspunkt vorgesehen:
+
+```text
+routes/commands.py
+```
+
+Später zu prüfen:
+
+```text
+routes/projects.py
+routes/worlds.py
+Editor-Inventar-/Admin-UI
+```
+
+---
+
+### 26.23 Aktualisierte Bewertung von `routes/blocks.py`
+
+Neue wichtige Routen:
+
+```text
+GET /projects/<project_id>/worlds/<world_id>/blocks/system
+GET /blocks/system
+```
+
+Erweiterte normale Route:
+
+```text
+GET /projects/<project_id>/worlds/<world_id>/blocks
+```
+
+Neue Fähigkeiten:
+
+```text
+Air als eigener reservierter Zellzustand
+Systemblock-Metadaten
+Railing-Erkennung
+Code-Katalog-Abgleich
+Registry-Mirror-Abgleich
+Air-/Railing-/Gesamtreadiness
+Katalogdiagnostik
+Registrydiagnostik
+Systemblock-Route-Hints
+```
+
+Aktuelle Route-Version:
+
+```text
+routeModuleVersion = 0.3.0
+```
+
+Antwortversionen:
+
+```text
+world-blocks-response.v2
+system-blocks-response.v1
+blocks-route-status-response.v2
+```
+
+---
+
+### 26.24 Aktualisierte Bewertung von `default_seed.py`
+
+Der Default-Seed erzeugt beziehungsweise prüft nun nicht nur:
+
+```text
+debug-blocks@1
+debug_grass
+debug_dirt
+dev-project
+dev-universe
+world_spawn
+```
+
+sondern zusätzlich:
+
+```text
+Air-Invariante
+system_railing-Mirror
+Systemblock-Readiness
+```
+
+Der Seed bleibt idempotent.
+
+Der Systemblock-Abgleich erfolgt nach dem Sicherstellen der Registry und innerhalb des kontrollierten Seed-Transaktionspfads.
+
+Bei `seed-on-empty-only` darf ein vorhandener Datenbestand nicht allein deshalb als vollständig gelten, weil Registry und Debug-Blöcke existieren. Auch Air und Railing müssen bereit sein.
+
+---
+
+### 26.25 Aktualisierte Bewertung von `db_bootstrap.py`
+
+Zusätzliche Readiness:
+
+```text
+systemBlocksReady
+systemRailingReady
+airInvariantReady
+```
+
+Zusätzliche Zähler:
+
+```text
+systemBlockCount
+systemBlocksCreated
+systemBlocksUpdated
+systemBlocksMissing
+systemBlocksDrifted
+```
+
+Zusätzliche Reparaturziele:
+
+```text
+fehlender Railing-Mirror
+inaktiver Railing-Mirror
+gelöschter Railing-Mirror
+gedrifteter Railing-Mirror
+ungültige Registry-Quelle
+```
+
+Harte Fehlerbedingungen:
+
+```text
+persistentes system_air
+fehlendes system_railing
+nicht bereites Systemblock-Paket
+nicht bereite Registry
+```
+
+---
+
+### 26.26 Aktualisierte Bewertung von `scripts/bootstrap_db.py`
+
+Aktuelle Script-Ergebnisversion:
+
+```text
+bootstrap-db-script-result.v5
+```
+
+Die Ausgabe normalisiert Systemblock-Werte über:
+
+```text
+Preferred Bootstrap-Pfad
+Fallback-Pfad
+Check-only-Pfad
+JSON-Ausgabe
+Human-Ausgabe
+```
+
+Systemblock-Reconciliation benötigt keinen eigenen CLI-Schalter.
+
+Sie folgt automatisch:
+
+```text
+--seed
+```
+
+Check-only bleibt read-only:
+
+```text
+--check-only
+→ keine Erstellung
+→ kein Update
+→ keine Reparatur
+→ nur Status und Readiness
+```
+
+---
+
+### 26.27 Bekannte offene Punkte
+
+Noch offen beziehungsweise nicht abschließend bestätigt:
+
+```text
+explizite HTTP-400-Regel für SetBlock(system_air)
+vollständiger Railing-SetBlock-/Reload-/RemoveBlock-End-to-End-Test
+Systemblock-Metadaten in jeder neu erzeugten Chunkpalette
+Befüllung von inventoryBlocks der Systemblock-Spezialroute
+echte Geländergeometrie
+schmalere Geländerkollision
+Orientierung
+Nachbarverbindungen
+Editor-Kennzeichnung als eingebaut/unveränderlich
+Admin-UI-Vertrag für persistentBlocks vs inventoryBlocks
+```
+
+Diese Punkte ändern nicht die bestätigte Tatsache, dass Katalog, Registry, Air-Invariante und Railing-Mirror aktuell bereit sind und `system_railing` in der normalen Weltpalette ausgegeben wird.
+
+---
+
+### 26.28 Aktualisierter nächster sinnvoller Schritt
+
+Fachlich nächster Integrationspunkt:
+
+```text
+services/vectoplan-chunk/routes/commands.py
+```
+
+Minimal notwendige Ergänzungen:
+
+```text
+SetBlock(system_air) explizit ablehnen
+air_requires_remove_block ausgeben
+Railing-Systemmetadaten in Paletten erhalten
+Command-Status um Systemblockregeln ergänzen
+```
+
+Danach:
+
+```text
+Railing End-to-End setzen
+Chunk neu laden
+Railing-Zelle prüfen
+Railing entfernen
+Chunk neu laden
+Air-Zelle prüfen
+Editor-Auswahl prüfen
+Spezialroute inventoryBlocks konsistent machen
+```
+
+---
+
+### 26.29 Aktualisierter Gesamtbefund
+
+Der aktuelle bestätigte Gesamtstand lautet:
+
+```text
+vectoplan-chunk startet stabil.
+Runtime bleibt read-only.
+DB-Bootstrap ist explizit.
+Schema ist bereit.
+Default-Seed ist bereit.
+dev-project ist vorhanden.
+dev-universe ist vorhanden.
+world_spawn ist vorhanden.
+debug-blocks@1 ist aktiv.
+Registry-source ist internal.
+debug_grass ist vorhanden.
+debug_dirt ist vorhanden.
+Systemblock-Katalog ist bereit.
+system_air ist als cellValue 0 reserviert.
+Es existiert keine persistente Air-Zeile.
+system_railing ist als aktiver BlockType gespiegelt.
+system_railing stimmt mit der Code-Definition überein.
+system_railing ist in der normalen Weltpalette enthalten.
+system_railing ist inventarsichtbar und platzierbar.
+Air-, Railing- und Gesamtreadiness sind true.
+```
+
+Damit ist der eingebaute Systemblock-Slice als aktueller IST-Zustand bestätigt.
+
+Die Formulierung „Admin-Blöcke werden angezeigt“ ist für die Oberfläche verständlich. Technisch präzise lautet der Befund:
+
+```text
+Der eingebaute Systemblock system_railing wird zusammen mit den Debug-Blöcken
+in der normalen Welt-Blockpalette ausgegeben. Air bleibt korrekt separat,
+unsichtbar und nicht persistent.
 ```

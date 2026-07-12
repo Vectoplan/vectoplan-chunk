@@ -12,6 +12,8 @@ Responsibilities:
 - run default seed bootstrap when requested,
 - repair missing default seed invariants when requested,
 - ensure the concrete editable default world `world_spawn` exists in init mode,
+- verify the reserved Air invariant and persistent `system_railing` mirror,
+- expose system-block readiness and reconciliation counters in every output mode,
 - run read-only check-only diagnostics,
 - print a JSON or human-readable result,
 - return a useful process exit code.
@@ -66,7 +68,7 @@ from typing import Any, Mapping, Sequence
 # Constants
 # -----------------------------------------------------------------------------
 
-SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v4"
+SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v5"
 
 EXIT_OK = 0
 EXIT_BOOTSTRAP_FAILED = 1
@@ -88,6 +90,8 @@ DEFAULT_PROVIDER_ID = "flat"
 DEFAULT_PROVIDER_WORLD_ID = "flat"
 DEFAULT_BLOCK_REGISTRY_ID = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION = "1"
+DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID = "system_railing"
+DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID = "vectoplan-system-block-bootstrap"
 
 
 # -----------------------------------------------------------------------------
@@ -280,6 +284,16 @@ def _print_human_result(result: dict[str, Any]) -> None:
     print(f"default project ready: {result.get('defaultProjectReady')}")
     print(f"default universe ready:{result.get('defaultUniverseReady')}")
     print(f"default world ready:   {result.get('defaultWorldReady')}")
+    print(f"block registry ready:  {result.get('blockRegistryReady')}")
+    print(f"debug blocks ready:    {result.get('debugBlocksReady')}")
+    print(f"system blocks ready:   {result.get('systemBlocksReady')}")
+    print(f"Air invariant ready:   {result.get('airInvariantReady')}")
+    print(f"system railing ready:  {result.get('systemRailingReady')}")
+    print(f"system block count:    {result.get('systemBlockCount')}")
+    print(f"system blocks created: {result.get('systemBlocksCreated')}")
+    print(f"system blocks updated: {result.get('systemBlocksUpdated')}")
+    print(f"system blocks missing: {result.get('systemBlocksMissing')}")
+    print(f"system blocks drifted: {result.get('systemBlocksDrifted')}")
     print(f"schema requested:      {result.get('schemaBootstrapRequested')}")
     print(f"schema executed:       {result.get('schemaBootstrapExecuted')}")
     print(f"schema ok:             {result.get('schemaBootstrapOk')}")
@@ -462,7 +476,9 @@ def set_default_env(
         set_env_value("VECTOPLAN_CHUNK_AUTO_CREATE_ALL", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_SYSTEM_BLOCKS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "false", override=True)
     else:
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED", "true", override=True)
@@ -471,12 +487,15 @@ def set_default_env(
         set_env_value("VECTOPLAN_CHUNK_AUTO_CREATE_ALL", "true" if create_all else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "true" if repair_seed_invariants else "false", override=True)
 
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_CREATE_ALL", "true" if create_all else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS", "true" if repair_missing_columns else "false", override=False)
 
@@ -1362,6 +1381,15 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             }
         )
 
+    system_blocks = _run_system_block_repair_inner(commit=False)
+    system_readiness = _extract_system_block_readiness(system_blocks)
+
+    if not system_readiness["systemBlocksReady"]:
+        raise RuntimeError(
+            "Direct seed fallback could not produce a ready Air/Railing "
+            "system-block state."
+        )
+
     db.session.commit()
 
     return {
@@ -1374,6 +1402,16 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
         "defaultProjectReady": True,
         "defaultUniverseReady": True,
         "defaultWorldReady": True,
+        "blockRegistryReady": True,
+        "systemBlocksReady": system_readiness["systemBlocksReady"],
+        "systemRailingReady": system_readiness["systemRailingReady"],
+        "airInvariantReady": system_readiness["airInvariantReady"],
+        "systemBlockCount": system_readiness["systemBlockCount"],
+        "systemBlocksCreated": system_readiness["systemBlocksCreated"],
+        "systemBlocksUpdated": system_readiness["systemBlocksUpdated"],
+        "systemBlocksMissing": system_readiness["systemBlocksMissing"],
+        "systemBlocksDrifted": system_readiness["systemBlocksDrifted"],
+        "systemBlocks": system_blocks,
         "defaults": {
             "projectId": project_id,
             "universeId": universe_id,
@@ -1504,11 +1542,30 @@ def _fallback_bootstrap(
 
     post_status = _inspect_database_schema(app)
     invariant_status = _build_invariant_status_if_available(app)
+    system_status = _extract_system_block_status(seed_result)
+    if not system_status:
+        system_status = _extract_system_block_status(invariant_status)
+    if not system_status:
+        system_status = _build_system_block_status_if_available(app)
+    system_readiness = _extract_system_block_readiness(
+        {
+            "seed": seed_result,
+            "seedInvariant": invariant_status,
+            "systemBlocks": system_status,
+        }
+    )
 
     default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
     default_universe_ready = _nested_bool(invariant_status, ("ready", "universe"))
     default_world_ready = _nested_bool(invariant_status, ("ready", "world"))
-    seed_ready = bool(seed_result.get("ok")) and (default_world_ready is not False)
+    seed_ready = bool(
+        bool(seed_result.get("ok"))
+        and (default_world_ready is not False)
+        and (
+            not run_seed
+            or system_readiness["systemBlocksReady"]
+        )
+    )
 
     ok = (
         bool(schema_result.get("ok"))
@@ -1516,6 +1573,7 @@ def _fallback_bootstrap(
         and bool(seed_result.get("ok"))
         and bool(post_status.get("ok"))
         and (default_world_ready is not False)
+        and (not run_seed or system_readiness["systemBlocksReady"])
     )
 
     if not post_status.get("ok"):
@@ -1539,6 +1597,18 @@ def _fallback_bootstrap(
             }
         )
 
+    if run_seed and not system_readiness["systemBlocksReady"]:
+        errors.append(
+            {
+                "code": "post_bootstrap_system_blocks_not_ready",
+                "message": (
+                    "Built-in Air/Railing system-block state is not ready "
+                    "after bootstrap."
+                ),
+                "details": system_status,
+            }
+        )
+
     result = {
         "ok": ok,
         "status": "completed" if ok else "failed",
@@ -1549,6 +1619,17 @@ def _fallback_bootstrap(
         "defaultProjectReady": default_project_ready,
         "defaultUniverseReady": default_universe_ready,
         "defaultWorldReady": default_world_ready,
+        "blockRegistryReady": _nested_bool(invariant_status, ("ready", "blockRegistry")),
+        "debugBlocksReady": _nested_bool(invariant_status, ("ready", "debugBlocks")),
+        "systemBlocksReady": system_readiness["systemBlocksReady"],
+        "systemRailingReady": system_readiness["systemRailingReady"],
+        "airInvariantReady": system_readiness["airInvariantReady"],
+        "systemBlockCount": system_readiness["systemBlockCount"],
+        "systemBlocksCreated": system_readiness["systemBlocksCreated"],
+        "systemBlocksUpdated": system_readiness["systemBlocksUpdated"],
+        "systemBlocksMissing": system_readiness["systemBlocksMissing"],
+        "systemBlocksDrifted": system_readiness["systemBlocksDrifted"],
+        "systemBlocks": system_status,
         "schema_bootstrap_requested": bool(run_schema),
         "schema_bootstrap_executed": bool(schema_result.get("executed")),
         "schema_bootstrap_ok": bool(schema_result.get("ok")),
@@ -1601,6 +1682,489 @@ def _nested_bool(payload: Mapping[str, Any] | Any, path: Sequence[str]) -> bool 
     return _safe_bool(value, False)
 
 
+def _mapping_value_by_names(
+    payload: Mapping[str, Any] | Any,
+    names: Sequence[str],
+    *,
+    max_depth: int = 6,
+) -> Any:
+    """Find the first matching key in a bounded, cycle-safe mapping walk."""
+    if not isinstance(payload, Mapping):
+        return None
+
+    wanted = tuple(str(name) for name in names)
+    queue: list[tuple[Mapping[str, Any], int]] = [(payload, 0)]
+    seen: set[int] = set()
+
+    while queue:
+        current, depth = queue.pop(0)
+        current_id = id(current)
+
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        for name in wanted:
+            try:
+                if name in current:
+                    value = current.get(name)
+                    if value is not None:
+                        return value
+            except Exception:
+                continue
+
+        if depth >= max_depth:
+            continue
+
+        preferred_children = (
+            "summary",
+            "post_status",
+            "postStatus",
+            "seed",
+            "seedInvariant",
+            "seed_invariant",
+            "defaultWorldInvariant",
+            "invariantAfterRepair",
+            "seedInvariantFinal",
+            "bootstrap",
+            "systemBlocks",
+            "system_blocks",
+        )
+
+        for child_name in preferred_children:
+            try:
+                child = current.get(child_name)
+            except Exception:
+                child = None
+
+            if isinstance(child, Mapping):
+                queue.append((child, depth + 1))
+
+    return None
+
+
+def _extract_system_block_status(payload: Mapping[str, Any] | Any) -> dict[str, Any]:
+    """Extract the canonical registry-scoped system-block status mapping."""
+    if not isinstance(payload, Mapping):
+        return {}
+
+    queue: list[tuple[Mapping[str, Any], int]] = [(payload, 0)]
+    seen: set[int] = set()
+
+    while queue:
+        current, depth = queue.pop(0)
+        current_id = id(current)
+
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        keys = set(current.keys())
+        if (
+            "air" in keys
+            and "mirrors" in keys
+            and ("ready" in keys or "registryId" in keys or "registry_id" in keys)
+        ):
+            return dict(current)
+
+        for key in ("systemBlocks", "system_blocks"):
+            candidate = current.get(key)
+            if isinstance(candidate, Mapping):
+                candidate_keys = set(candidate.keys())
+                if "air" in candidate_keys or "mirrors" in candidate_keys:
+                    return dict(candidate)
+                if depth < 6:
+                    queue.append((candidate, depth + 1))
+
+        if depth >= 6:
+            continue
+
+        for key in (
+            "seedInvariant",
+            "seed_invariant",
+            "defaultWorldInvariant",
+            "invariantAfterRepair",
+            "seedInvariantFinal",
+            "post_status",
+            "postStatus",
+            "seed",
+            "bootstrap",
+        ):
+            child = current.get(key)
+            if isinstance(child, Mapping):
+                queue.append((child, depth + 1))
+
+    return {}
+
+
+def _system_block_status_counts(status: Mapping[str, Any] | None) -> dict[str, int]:
+    """Normalize persistent system-block mirror counters."""
+    status_dict = _to_plain_dict(status)
+    mirrors = status_dict.get("mirrors") or []
+
+    if not isinstance(mirrors, Sequence) or isinstance(mirrors, (str, bytes, bytearray)):
+        mirrors = []
+
+    inferred = {
+        "mirrors": len(mirrors),
+        "readyMirrors": 0,
+        "created": 0,
+        "updated": 0,
+        "missing": 0,
+        "drifted": 0,
+    }
+
+    for raw_mirror in mirrors:
+        mirror = _to_plain_dict(raw_mirror)
+        action = _safe_str(mirror.get("action"), "").lower()
+
+        if _safe_bool(mirror.get("ready"), False):
+            inferred["readyMirrors"] += 1
+        if _safe_bool(mirror.get("created"), False):
+            inferred["created"] += 1
+        if _safe_bool(mirror.get("updated"), False):
+            inferred["updated"] += 1
+        if action in {"missing", "would_create"}:
+            inferred["missing"] += 1
+        if mirror.get("driftBefore") or action in {"drifted", "would_update", "updated"}:
+            inferred["drifted"] += 1
+
+    counts = _to_plain_dict(status_dict.get("counts"))
+
+    return {
+        key: max(0, _safe_int(counts.get(key), default))
+        for key, default in inferred.items()
+    }
+
+
+def _system_railing_ready(status: Mapping[str, Any] | None) -> bool:
+    """Return whether the canonical Railing mirror is active and drift-free."""
+    status_dict = _to_plain_dict(status)
+    direct = status_dict.get("systemRailingReady")
+    if direct is not None:
+        return _safe_bool(direct, False)
+
+    mirrors = status_dict.get("mirrors") or []
+    if not isinstance(mirrors, Sequence) or isinstance(mirrors, (str, bytes, bytearray)):
+        return False
+
+    for raw_mirror in mirrors:
+        mirror = _to_plain_dict(raw_mirror)
+        system_id = _safe_str(mirror.get("systemBlockId"), "").lower()
+        runtime_id = _safe_str(mirror.get("runtimeBlockTypeId"), "").lower()
+
+        if DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID in {system_id, runtime_id}:
+            return bool(
+                _safe_bool(mirror.get("ready"), False)
+                and not mirror.get("driftAfter")
+                and _safe_str(mirror.get("action"), "").lower()
+                not in {"missing", "drifted", "invalid", "conflict", "error", "rolled_back"}
+            )
+
+    return False
+
+
+def _air_invariant_ready(status: Mapping[str, Any] | None) -> bool:
+    """Return whether Air remains reserved and absent from BlockType storage."""
+    status_dict = _to_plain_dict(status)
+    direct = status_dict.get("airInvariantReady")
+    if direct is not None:
+        return _safe_bool(direct, False)
+
+    air = _to_plain_dict(status_dict.get("air"))
+    return bool(
+        _safe_bool(air.get("ready"), False)
+        and _safe_int(air.get("illegalRowCount"), 0) == 0
+    )
+
+
+def _system_blocks_ready(status: Mapping[str, Any] | None) -> bool:
+    """Require aggregate, Air and Railing readiness together."""
+    status_dict = _to_plain_dict(status)
+    aggregate = status_dict.get("systemBlocksReady", status_dict.get("ready"))
+    return bool(
+        _safe_bool(aggregate, False)
+        and _air_invariant_ready(status_dict)
+        and _system_railing_ready(status_dict)
+    )
+
+
+def _extract_system_block_readiness(payload: Mapping[str, Any] | Any) -> dict[str, Any]:
+    """Normalize system-block readiness from script, bootstrap or seed payloads."""
+    data = _to_plain_dict(payload)
+    status = _extract_system_block_status(data)
+    counts = _system_block_status_counts(status)
+
+    def first_bool(*names: str) -> bool | None:
+        value = _mapping_value_by_names(data, names)
+        if value is None:
+            return None
+        return _safe_bool(value, False)
+
+    def first_int(*names: str) -> int | None:
+        value = _mapping_value_by_names(data, names)
+        if value is None:
+            return None
+        return max(0, _safe_int(value, 0))
+
+    system_ready = first_bool("systemBlocksReady", "system_blocks_ready")
+    air_ready = first_bool("airInvariantReady", "air_invariant_ready")
+    railing_ready = first_bool("systemRailingReady", "system_railing_ready")
+
+    if system_ready is None:
+        system_ready = _system_blocks_ready(status)
+    if air_ready is None:
+        air_ready = _air_invariant_ready(status)
+    if railing_ready is None:
+        railing_ready = _system_railing_ready(status)
+
+    mirror_count = first_int("systemBlockCount", "system_block_count")
+    created = first_int("systemBlocksCreated", "system_blocks_created")
+    updated = first_int("systemBlocksUpdated", "system_blocks_updated")
+    missing = first_int("systemBlocksMissing", "system_blocks_missing")
+    drifted = first_int("systemBlocksDrifted", "system_blocks_drifted")
+
+    return {
+        "systemBlocksReady": bool(system_ready and air_ready and railing_ready),
+        "airInvariantReady": bool(air_ready),
+        "systemRailingReady": bool(railing_ready),
+        "systemBlockCount": counts["mirrors"] if mirror_count is None else mirror_count,
+        "systemBlocksCreated": counts["created"] if created is None else created,
+        "systemBlocksUpdated": counts["updated"] if updated is None else updated,
+        "systemBlocksMissing": counts["missing"] if missing is None else missing,
+        "systemBlocksDrifted": counts["drifted"] if drifted is None else drifted,
+        "systemBlocks": status,
+    }
+
+
+def _find_default_block_registry_inner() -> Any | None:
+    """Find the configured default BlockRegistry inside the active app context."""
+    db = _get_db()
+    models = _get_model_classes()
+    BlockRegistry = models.get("BlockRegistry")
+
+    if BlockRegistry is None:
+        return None
+
+    registry_id = _env_str(
+        "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID",
+        DEFAULT_BLOCK_REGISTRY_ID,
+    )
+    registry_version = _env_str(
+        "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION",
+        DEFAULT_BLOCK_REGISTRY_VERSION,
+    )
+
+    registry = _query_first_by_fields(
+        db.session,
+        BlockRegistry,
+        registry_id=registry_id,
+        registry_version=registry_version,
+    )
+
+    if registry is None:
+        registry = _query_first_by_fields(
+            db.session,
+            BlockRegistry,
+            registry_id=registry_id,
+        )
+
+    return registry
+
+
+def _ensure_default_block_registry_inner() -> Any:
+    """Create or restore the configured default registry for fallback seeding."""
+    db = _get_db()
+    models = _get_model_classes()
+    BlockRegistry = models.get("BlockRegistry")
+
+    if BlockRegistry is None:
+        raise RuntimeError("BlockRegistry model is unavailable.")
+
+    registry = _find_default_block_registry_inner()
+    registry_id = _env_str(
+        "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID",
+        DEFAULT_BLOCK_REGISTRY_ID,
+    )
+    registry_version = _env_str(
+        "VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION",
+        DEFAULT_BLOCK_REGISTRY_VERSION,
+    )
+
+    if registry is None:
+        factory = getattr(BlockRegistry, "create_debug_registry", None)
+        if callable(factory) and registry_id == DEFAULT_BLOCK_REGISTRY_ID and registry_version == DEFAULT_BLOCK_REGISTRY_VERSION:
+            try:
+                registry = factory(is_default=True)
+            except TypeError:
+                registry = factory()
+        else:
+            create = getattr(BlockRegistry, "create", None)
+            if callable(create):
+                registry = create(
+                    registry_id=registry_id,
+                    registry_version=registry_version,
+                    label=f"{registry_id} {registry_version}",
+                    status="active",
+                    is_default=True,
+                    created_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+                    metadata_json={
+                        "seededBy": "bootstrap_db.py.system_blocks",
+                        "createdAt": _utc_now_iso(),
+                    },
+                )
+            else:
+                registry = BlockRegistry(
+                    registry_id=registry_id,
+                    registry_version=registry_version,
+                    label=f"{registry_id} {registry_version}",
+                    status="active",
+                    is_default=True,
+                    metadata_json={
+                        "seededBy": "bootstrap_db.py.system_blocks",
+                        "createdAt": _utc_now_iso(),
+                    },
+                )
+
+        db.session.add(registry)
+        db.session.flush()
+    else:
+        restore = getattr(registry, "restore", None)
+        is_deleted = _safe_bool(getattr(registry, "is_deleted", False), False)
+        status = _safe_str(getattr(registry, "status", ""), "").lower()
+
+        if callable(restore) and (is_deleted or status != "active"):
+            restore(updated_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID)
+        else:
+            _set_attr_if_supported(registry, "status", "active")
+            _set_attr_if_supported(registry, "deleted_at", None)
+            _set_attr_if_supported(registry, "archived_at", None)
+
+        _set_attr_if_supported(registry, "registry_version", registry_version)
+        _set_attr_if_supported(registry, "is_default", True)
+        _set_attr_if_supported(
+            registry,
+            "updated_by_user_id",
+            DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+        )
+        _merge_metadata_json(
+            registry,
+            {
+                "seededBy": "bootstrap_db.py.system_blocks",
+                "updatedAt": _utc_now_iso(),
+            },
+        )
+        db.session.flush()
+
+    if getattr(registry, "id", None) is None:
+        raise RuntimeError("Default BlockRegistry has no database id after flush.")
+
+    return registry
+
+
+def _build_system_block_status_inner() -> dict[str, Any]:
+    """Build read-only registry-scoped Air/Railing status."""
+    registry = _find_default_block_registry_inner()
+
+    if registry is None:
+        return {
+            "ready": False,
+            "status": "registry_missing",
+            "air": {"ready": False, "illegalRowCount": 0},
+            "mirrors": [],
+            "counts": {
+                "mirrors": 0,
+                "readyMirrors": 0,
+                "created": 0,
+                "updated": 0,
+                "missing": 1,
+                "drifted": 0,
+            },
+            "errors": ["Default BlockRegistry is missing."],
+        }
+
+    try:
+        from src.system_blocks.bootstrap import (
+            build_system_block_bootstrap_status_for_registry,
+        )
+
+        return _to_plain_dict(
+            build_system_block_bootstrap_status_for_registry(registry)
+        )
+    except Exception as exc:
+        return {
+            "ready": False,
+            "status": "unavailable",
+            "registryId": _safe_str(getattr(registry, "registry_id", ""), ""),
+            "registryVersion": _safe_str(getattr(registry, "registry_version", ""), ""),
+            "air": {"ready": False, "illegalRowCount": 0},
+            "mirrors": [],
+            "errors": [
+                f"System-block status unavailable: {_safe_exception_message(exc)}"
+            ],
+        }
+
+
+def _build_system_block_status_if_available(app: Any) -> dict[str, Any]:
+    """Build system-block status with the required Flask app context."""
+    if _has_app_context():
+        return _build_system_block_status_inner()
+
+    with app.app_context():
+        return _build_system_block_status_inner()
+
+
+def _run_system_block_repair_inner(*, commit: bool = True) -> dict[str, Any]:
+    """Reconcile Air/Railing in the default registry without duplicating domain logic."""
+    db = _get_db()
+
+    try:
+        registry = _ensure_default_block_registry_inner()
+
+        from src.system_blocks.bootstrap import ensure_system_blocks_for_registry
+
+        raw_result = ensure_system_blocks_for_registry(
+            registry,
+            created_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+            updated_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+        )
+        data = _to_plain_dict(raw_result)
+
+        if not data:
+            to_dict = getattr(raw_result, "to_dict", None)
+            if callable(to_dict):
+                data = _to_plain_dict(to_dict())
+
+        readiness = _extract_system_block_readiness(data)
+        if not readiness["systemBlocksReady"]:
+            raise RuntimeError(
+                "System-block reconciliation did not produce a ready Air/Railing state."
+            )
+
+        db.session.flush()
+        if commit:
+            db.session.commit()
+
+        data.setdefault("executed", True)
+        data.setdefault("status", "completed")
+        return data
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def _run_system_block_repair(app: Any, *, commit: bool = True) -> dict[str, Any]:
+    """Run system-block repair with an app context."""
+    if _has_app_context():
+        return _run_system_block_repair_inner(commit=commit)
+
+    with app.app_context():
+        return _run_system_block_repair_inner(commit=commit)
+
+
 def _append_unique_errors(target: list[dict[str, Any]], items: Sequence[Any]) -> None:
     """Append error/warning items without obvious duplicates."""
     seen = set()
@@ -1651,6 +2215,17 @@ def _bootstrap_indicates_seed_not_ready(result: Mapping[str, Any] | Any) -> bool
     if data.get("default_world_ready") is False or data.get("defaultWorldReady") is False:
         return True
 
+    for key in (
+        "system_blocks_ready",
+        "systemBlocksReady",
+        "system_railing_ready",
+        "systemRailingReady",
+        "air_invariant_ready",
+        "airInvariantReady",
+    ):
+        if key in data and data.get(key) is False:
+            return True
+
     seed = data.get("seed")
     if isinstance(seed, Mapping):
         if seed.get("ok") is False:
@@ -1660,6 +2235,10 @@ def _bootstrap_indicates_seed_not_ready(result: Mapping[str, Any] | Any) -> bool
 
         world = seed.get("world")
         if isinstance(world, Mapping) and world.get("exists") is False:
+            return True
+
+        system_blocks = seed.get("systemBlocks") or seed.get("system_blocks")
+        if isinstance(system_blocks, Mapping) and not _system_blocks_ready(system_blocks):
             return True
 
         invariant = seed.get("defaultWorldInvariant") or seed.get("invariantAfterRepair")
@@ -1675,6 +2254,12 @@ def _bootstrap_indicates_seed_not_ready(result: Mapping[str, Any] | Any) -> bool
         if post_status.get("seedReady") is False:
             return True
         if post_status.get("defaultWorldReady") is False:
+            return True
+        if post_status.get("systemBlocksReady") is False:
+            return True
+        if post_status.get("systemRailingReady") is False:
+            return True
+        if post_status.get("airInvariantReady") is False:
             return True
 
         seed_payload = post_status.get("seed")
@@ -1751,6 +2336,16 @@ def make_script_result(
                 "defaultProjectReady": summary.get("defaultProjectReady", bootstrap_result.get("defaultProjectReady")),
                 "defaultUniverseReady": summary.get("defaultUniverseReady", bootstrap_result.get("defaultUniverseReady")),
                 "defaultWorldReady": summary.get("defaultWorldReady", bootstrap_result.get("defaultWorldReady")),
+                "blockRegistryReady": summary.get("blockRegistryReady", bootstrap_result.get("blockRegistryReady")),
+                "debugBlocksReady": summary.get("debugBlocksReady", bootstrap_result.get("debugBlocksReady")),
+                "systemBlocksReady": summary.get("systemBlocksReady", bootstrap_result.get("systemBlocksReady")),
+                "systemRailingReady": summary.get("systemRailingReady", bootstrap_result.get("systemRailingReady")),
+                "airInvariantReady": summary.get("airInvariantReady", bootstrap_result.get("airInvariantReady")),
+                "systemBlockCount": summary.get("systemBlockCount", bootstrap_result.get("systemBlockCount")),
+                "systemBlocksCreated": summary.get("systemBlocksCreated", bootstrap_result.get("systemBlocksCreated")),
+                "systemBlocksUpdated": summary.get("systemBlocksUpdated", bootstrap_result.get("systemBlocksUpdated")),
+                "systemBlocksMissing": summary.get("systemBlocksMissing", bootstrap_result.get("systemBlocksMissing")),
+                "systemBlocksDrifted": summary.get("systemBlocksDrifted", bootstrap_result.get("systemBlocksDrifted")),
                 "schemaBootstrapRequested": summary.get("schemaBootstrapRequested"),
                 "schemaBootstrapExecuted": summary.get("schemaBootstrapExecuted"),
                 "schemaBootstrapOk": summary.get("schemaBootstrapOk"),
@@ -1785,6 +2380,12 @@ def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
             summary.setdefault("defaultProjectReady", plain.get("default_project_ready", plain.get("defaultProjectReady")))
             summary.setdefault("defaultUniverseReady", plain.get("default_universe_ready", plain.get("defaultUniverseReady")))
             summary.setdefault("defaultWorldReady", plain.get("default_world_ready", plain.get("defaultWorldReady")))
+            summary.setdefault("blockRegistryReady", plain.get("block_registry_ready", plain.get("blockRegistryReady")))
+            summary.setdefault("debugBlocksReady", plain.get("debug_blocks_ready", plain.get("debugBlocksReady")))
+            system_readiness = _extract_system_block_readiness(plain)
+            for key, value in system_readiness.items():
+                if key != "systemBlocks":
+                    summary.setdefault(key, value)
             summary.setdefault("schemaRepairRequested", bool(plain.get("schema_repair_requested")))
             summary.setdefault("schemaRepairExecuted", bool(plain.get("schema_repair_executed")))
             summary.setdefault("schemaRepairOk", plain.get("schema_repair_ok"))
@@ -1807,6 +2408,13 @@ def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
         "defaultProjectReady": data.get("default_project_ready", data.get("defaultProjectReady")),
         "defaultUniverseReady": data.get("default_universe_ready", data.get("defaultUniverseReady")),
         "defaultWorldReady": data.get("default_world_ready", data.get("defaultWorldReady")),
+        "blockRegistryReady": data.get("block_registry_ready", data.get("blockRegistryReady")),
+        "debugBlocksReady": data.get("debug_blocks_ready", data.get("debugBlocksReady")),
+        **{
+            key: value
+            for key, value in _extract_system_block_readiness(data).items()
+            if key != "systemBlocks"
+        },
         "schemaBootstrapRequested": bool(data.get("schema_bootstrap_requested")),
         "schemaBootstrapExecuted": bool(data.get("schema_bootstrap_executed")),
         "schemaBootstrapOk": data.get("schema_bootstrap_ok"),
@@ -1847,6 +2455,18 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
         default_project_ready = status.get("defaultProjectReady")
         default_universe_ready = status.get("defaultUniverseReady")
         default_world_ready = status.get("defaultWorldReady")
+        system_status = _extract_system_block_status(status)
+        if not system_status:
+            system_status = _extract_system_block_status(invariant_status)
+        if not system_status:
+            system_status = _build_system_block_status_inner()
+        system_readiness = _extract_system_block_readiness(
+            {
+                "status": status,
+                "seedInvariant": invariant_status,
+                "systemBlocks": system_status,
+            }
+        )
 
         if default_project_ready is None:
             default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
@@ -1855,7 +2475,12 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
         if default_world_ready is None:
             default_world_ready = _nested_bool(invariant_status, ("ready", "world"))
 
-        ok = bool(schema_ready and seed_ready and default_world_ready is not False)
+        ok = bool(
+            schema_ready
+            and seed_ready
+            and default_world_ready is not False
+            and system_readiness["systemBlocksReady"]
+        )
 
         errors = [] if ok else [
             {
@@ -1879,6 +2504,17 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
             "defaultProjectReady": default_project_ready,
             "defaultUniverseReady": default_universe_ready,
             "defaultWorldReady": default_world_ready,
+            "blockRegistryReady": status.get("blockRegistryReady"),
+            "debugBlocksReady": status.get("debugBlocksReady"),
+            "systemBlocksReady": system_readiness["systemBlocksReady"],
+            "systemRailingReady": system_readiness["systemRailingReady"],
+            "airInvariantReady": system_readiness["airInvariantReady"],
+            "systemBlockCount": system_readiness["systemBlockCount"],
+            "systemBlocksCreated": system_readiness["systemBlocksCreated"],
+            "systemBlocksUpdated": system_readiness["systemBlocksUpdated"],
+            "systemBlocksMissing": system_readiness["systemBlocksMissing"],
+            "systemBlocksDrifted": system_readiness["systemBlocksDrifted"],
+            "systemBlocks": system_status,
             "schema_bootstrap_requested": False,
             "seed_bootstrap_requested": False,
             "schema_bootstrap_executed": False,
@@ -1902,7 +2538,12 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
 
     except Exception as exc:
         schema_audit = _inspect_database_schema_inner()
-        ok = bool(schema_audit.get("ok"))
+        system_status = _build_system_block_status_inner()
+        system_readiness = _extract_system_block_readiness(system_status)
+        ok = bool(
+            schema_audit.get("ok")
+            and system_readiness["systemBlocksReady"]
+        )
 
         errors = [] if ok else [
             {
@@ -1929,6 +2570,17 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
             "defaultProjectReady": None,
             "defaultUniverseReady": None,
             "defaultWorldReady": None,
+            "blockRegistryReady": None,
+            "debugBlocksReady": None,
+            "systemBlocksReady": system_readiness["systemBlocksReady"],
+            "systemRailingReady": system_readiness["systemRailingReady"],
+            "airInvariantReady": system_readiness["airInvariantReady"],
+            "systemBlockCount": system_readiness["systemBlockCount"],
+            "systemBlocksCreated": system_readiness["systemBlocksCreated"],
+            "systemBlocksUpdated": system_readiness["systemBlocksUpdated"],
+            "systemBlocksMissing": system_readiness["systemBlocksMissing"],
+            "systemBlocksDrifted": system_readiness["systemBlocksDrifted"],
+            "systemBlocks": system_status,
             "schema_bootstrap_requested": False,
             "seed_bootstrap_requested": False,
             "schema_bootstrap_executed": False,
@@ -2052,7 +2704,23 @@ def _run_preferred_or_fallback_bootstrap(
                 default_project_ready = _nested_bool(invariant_after, ("ready", "project"))
                 default_universe_ready = _nested_bool(invariant_after, ("ready", "universe"))
                 default_world_ready = _nested_bool(invariant_after, ("ready", "world"))
-                seed_ready = bool(seed_repair_result.get("ok")) and default_world_ready is not False
+                system_status_after = _extract_system_block_status(seed_repair_result)
+                if not system_status_after:
+                    system_status_after = _extract_system_block_status(invariant_after)
+                if not system_status_after:
+                    system_status_after = _build_system_block_status_inner()
+                system_readiness_after = _extract_system_block_readiness(
+                    {
+                        "seedRepair": seed_repair_result,
+                        "seedInvariant": invariant_after,
+                        "systemBlocks": system_status_after,
+                    }
+                )
+                seed_ready = bool(
+                    seed_repair_result.get("ok")
+                    and default_world_ready is not False
+                    and system_readiness_after["systemBlocksReady"]
+                )
                 schema_ready = bool(schema_audit_after_seed_repair.get("ok"))
 
                 bootstrap_result["schemaReady"] = schema_ready
@@ -2060,8 +2728,22 @@ def _run_preferred_or_fallback_bootstrap(
                 bootstrap_result["defaultProjectReady"] = default_project_ready
                 bootstrap_result["defaultUniverseReady"] = default_universe_ready
                 bootstrap_result["defaultWorldReady"] = default_world_ready
+                bootstrap_result["systemBlocksReady"] = system_readiness_after["systemBlocksReady"]
+                bootstrap_result["systemRailingReady"] = system_readiness_after["systemRailingReady"]
+                bootstrap_result["airInvariantReady"] = system_readiness_after["airInvariantReady"]
+                bootstrap_result["systemBlockCount"] = system_readiness_after["systemBlockCount"]
+                bootstrap_result["systemBlocksCreated"] = system_readiness_after["systemBlocksCreated"]
+                bootstrap_result["systemBlocksUpdated"] = system_readiness_after["systemBlocksUpdated"]
+                bootstrap_result["systemBlocksMissing"] = system_readiness_after["systemBlocksMissing"]
+                bootstrap_result["systemBlocksDrifted"] = system_readiness_after["systemBlocksDrifted"]
+                bootstrap_result["systemBlocks"] = system_status_after
 
-                if schema_ready and seed_ready and default_world_ready:
+                if (
+                    schema_ready
+                    and seed_ready
+                    and default_world_ready
+                    and system_readiness_after["systemBlocksReady"]
+                ):
                     bootstrap_result["ok"] = True
                     bootstrap_result["status"] = "completed"
                     bootstrap_result["errors"] = [
@@ -2073,6 +2755,9 @@ def _run_preferred_or_fallback_bootstrap(
                                 "seed" in _safe_str(item.get("code"), "").lower()
                                 or "world" in _safe_str(item.get("code"), "").lower()
                                 or "invariant" in _safe_str(item.get("code"), "").lower()
+                                or "system" in _safe_str(item.get("code"), "").lower()
+                                or "railing" in _safe_str(item.get("code"), "").lower()
+                                or "air" in _safe_str(item.get("code"), "").lower()
                             )
                         )
                     ]
@@ -2090,7 +2775,10 @@ def _run_preferred_or_fallback_bootstrap(
                     bootstrap_result.setdefault("errors", []).append(
                         {
                             "code": "seed_invariant_repair_fallback_failed",
-                            "message": "Seed invariant repair fallback did not produce a ready default world.",
+                            "message": (
+                                "Seed invariant repair fallback did not produce a ready "
+                                "default world and Air/Railing system-block state."
+                            ),
                             "details": {
                                 "seedRepair": seed_repair_result,
                                 "invariantAfter": invariant_after,
@@ -2149,6 +2837,27 @@ def _run_preferred_or_fallback_bootstrap(
             bootstrap_result.setdefault("defaultProjectReady", _nested_bool(invariant_status, ("ready", "project")))
             bootstrap_result.setdefault("defaultUniverseReady", _nested_bool(invariant_status, ("ready", "universe")))
             bootstrap_result.setdefault("defaultWorldReady", _nested_bool(invariant_status, ("ready", "world")))
+            final_system_status = _extract_system_block_status(bootstrap_result)
+            if not final_system_status:
+                final_system_status = _extract_system_block_status(invariant_status)
+            if not final_system_status:
+                final_system_status = _build_system_block_status_inner()
+            final_system_readiness = _extract_system_block_readiness(
+                {
+                    "bootstrap": bootstrap_result,
+                    "seedInvariant": invariant_status,
+                    "systemBlocks": final_system_status,
+                }
+            )
+            bootstrap_result["systemBlocksReady"] = final_system_readiness["systemBlocksReady"]
+            bootstrap_result["systemRailingReady"] = final_system_readiness["systemRailingReady"]
+            bootstrap_result["airInvariantReady"] = final_system_readiness["airInvariantReady"]
+            bootstrap_result["systemBlockCount"] = final_system_readiness["systemBlockCount"]
+            bootstrap_result["systemBlocksCreated"] = final_system_readiness["systemBlocksCreated"]
+            bootstrap_result["systemBlocksUpdated"] = final_system_readiness["systemBlocksUpdated"]
+            bootstrap_result["systemBlocksMissing"] = final_system_readiness["systemBlocksMissing"]
+            bootstrap_result["systemBlocksDrifted"] = final_system_readiness["systemBlocksDrifted"]
+            bootstrap_result["systemBlocks"] = final_system_status
 
             if effective_seed and bootstrap_result.get("defaultWorldReady") is False:
                 bootstrap_result.setdefault("errors", []).append(
@@ -2156,6 +2865,19 @@ def _run_preferred_or_fallback_bootstrap(
                         "code": "default_world_not_ready_after_bootstrap",
                         "message": "Default concrete world is not ready after bootstrap.",
                         "details": invariant_status,
+                    }
+                )
+                bootstrap_result["ok"] = False
+
+            if effective_seed and not final_system_readiness["systemBlocksReady"]:
+                bootstrap_result.setdefault("errors", []).append(
+                    {
+                        "code": "system_blocks_not_ready_after_bootstrap",
+                        "message": (
+                            "Air invariant or built-in Railing mirror is not ready "
+                            "after bootstrap."
+                        ),
+                        "details": final_system_status,
                     }
                 )
                 bootstrap_result["ok"] = False
@@ -2235,7 +2957,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="seed",
         action="store_true",
         default=DEFAULT_SEED,
-        help="Run default seed bootstrap. Default: enabled.",
+        help=(
+            "Run default seed bootstrap, including built-in Air/Railing "
+            "system-block reconciliation. Default: enabled."
+        ),
     )
     seed_group.add_argument(
         "--no-seed",
@@ -2280,7 +3005,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=seed_repair_default,
         help=(
-            "Repair partial seed invariants such as missing world_spawn. "
+            "Repair partial seed invariants such as missing world_spawn or "
+            "a missing/drifted system_railing mirror. "
             "Default follows VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS, true if unset."
         ),
     )
