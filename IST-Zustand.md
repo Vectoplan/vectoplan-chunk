@@ -3,10 +3,39 @@
 
 ## Status dieser aktualisierten Fassung
 
-Stand: 2026-07-12  
-Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Default-Welt, App-Provisioning, bestätigter Editor-Chunk-Anbindung und betriebsfähiger eingebauter Systemblock-Schicht.
+Stand: 2026-07-13  
+Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Default-Welt, App-Provisioning, bestätigter Editor-Chunk-Anbindung, betriebsfähiger eingebauter Systemblock-Schicht sowie zusätzlich implementiertem und über `/debug/earth` erfolgreich geprüftem Earth-v1-Kern für globale Referenzpunkte, CRS-Transformation, periodische X-Topologie, lokales Speicherraster, Spawnauflösung und Air-only-Chunkgenerierung.
 
 Diese Aktualisierung **kürzt die bisherige IST-Dokumentation nicht**. Die vollständige bisherige Bestandsaufnahme bleibt weiter unten als historische Basis enthalten. Ergänzt wurden der inzwischen bestätigte Systemblock-Katalog, Air- und Railing-Invarianten, die persistente Registry-Spiegelung, die neuen Blockrouten und die verifizierte Editor-/Admin-Sichtbarkeit.
+
+Zusätzlich wurde der neue Earth-v1-Slice dokumentiert. Dieser ergänzt den
+bestehenden `flat`-Provider, ersetzt ihn aber nicht. Der bisherige
+PostgreSQL-/Snapshot-/Event-/Command-Stand bleibt vollständig erhalten. Neu
+hinzugekommen sind die neutralen Koordinatenmodule, die Georeferenzierungs-
+und CRS-Schicht, der konkrete Earth-Provider, der persistierbare globale
+Referenzvertrag im World-Modell sowie eine temporäre Debug-Route für den
+vollständigen In-Memory-Smoke-Test.
+
+Wichtig für die Einordnung:
+
+```text
+Bestehender produktiver Default
+→ WorldInstance = world_spawn
+→ providerId = flat
+→ templateId = flat
+→ providerWorldId = flat
+
+Neu implementierter Earth-v1-Kern
+→ Provider-ID = earth
+→ Template-ID = earth
+→ Provider-World-ID = earth
+→ konkrete Test-WorldInstance = world_spawn
+→ genau ein globaler Referenzpunkt
+→ alle Chunks und Spawnpositionen bleiben lokal
+→ Debug-Route erfolgreich
+→ produktiver Provider-Resolver noch nicht vollständig integriert
+```
+
 
 ### Neu bestätigter Stand seit der historischen Basisfassung
 
@@ -6068,4 +6097,1620 @@ Die Formulierung „Admin-Blöcke werden angezeigt“ ist für die Oberfläche v
 Der eingebaute Systemblock system_railing wird zusammen mit den Debug-Blöcken
 in der normalen Welt-Blockpalette ausgegeben. Air bleibt korrekt separat,
 unsichtbar und nicht persistent.
+```
+---
+
+## 27. Aktualisierung 2026-07-13 – Earth-v1-Koordinaten-, Georeferenzierungs- und Provider-Slice
+
+Dieser Abschnitt erweitert den bisherigen IST-Zustand um den neu
+implementierten Earth-v1-Kern.
+
+Die bisherige Flat-, PostgreSQL-, Snapshot-, Event-, Command-, App-Provisioning-
+und Systemblock-Dokumentation bleibt vollständig gültig. Earth v1 ist eine
+zusätzliche Providerfähigkeit und keine rückwirkende Umdeutung des bisherigen
+Default-Providers.
+
+### 27.1 Aktueller Gesamtstatus des Earth-v1-Slices
+
+Der Earth-v1-Kern ist im aktuellen Stand technisch ausführbar und über eine
+temporäre Flask-Debug-Route erfolgreich getestet.
+
+Bestätigt ist:
+
+```text
+Earth-Debug-Blueprint registriert
+→ Blueprint = earth_debug
+→ Route = GET /debug/earth
+→ HTTP 200
+
+pyproj verfügbar
+→ CRS-Auflösung funktioniert
+→ PROJ-Datenbank verfügbar
+→ EPSG:4979 verfügbar
+→ EPSG:4978 verfügbar
+
+Earth-Manifest gültig
+→ providerId = earth
+→ templateId = earth
+→ providerWorldId = earth
+→ worldType = earth
+
+Konkreter Provider erzeugt
+→ worldId = world_spawn
+→ providerId = earth
+→ templateId = earth
+→ providerWorldId = earth
+
+Globaler Referenzpunkt aufgelöst
+→ CRS = EPSG:4979
+→ Dimension = 3
+→ Höhe vorhanden
+→ Earth-Grid-Frame erzeugt
+
+Speicherursprung abgeleitet
+→ chunk-ausgerichtet
+→ nicht als zweiter globaler Referenzpunkt persistiert
+
+Globale Zielkoordinate auf lokal umgerechnet
+→ lokale X/Y/Z-Position vorhanden
+
+Lokale Position auf global zurückgerechnet
+→ Roundtrip praktisch exakt
+
+Spawn aufgelöst
+→ lokale persistierbare Position
+
+Chunk generiert
+→ chunkKey = 0:0:0
+→ chunkSize = 16
+→ cellCount = 4096
+→ Air-only
+→ nicht materialisiert
+```
+
+Aktuell noch nicht vollständig bestätigt beziehungsweise integriert:
+
+```text
+Produktive World-State-Provider-Auswahl flat/earth
+Produktive Worlds-API für Earth-Erstellung
+Laden des Earth-Referenzvertrags aus PostgreSQL in den Provider
+Earth-Snapshot-Lookup über kanonische X-Adressen
+Earth-Commands über die produktive Command-Route
+SetBlock/RemoveBlock direkt über die Weltnaht
+Persistenter Earth-Spawn über die produktive Worlds-API
+Automatische Referenzsperre nach erstem Snapshot/Event
+App-Provisioning mit providerId = earth
+Editor-End-to-End gegen eine persistierte Earth-WorldInstance
+```
+
+### 27.2 Fachliche Grundidee von Earth v1
+
+Earth v1 bleibt geometrisch eine flache Block-/Chunk-Welt.
+
+Die globale Referenzierung verändert nicht das bestehende lokale
+Speichermodell:
+
+```text
+globale Koordinate mit explizitem CRS
+→ Transformation in kanonisches Earth-CRS
+→ Abbildung auf ein global einheitliches Earth-Raster
+→ Ableitung eines chunk-ausgerichteten lokalen Speicherursprungs
+→ lokale Block-, Chunk-, Objekt- und Spawnkoordinaten
+```
+
+Persistiert werden weiterhin lokale Koordinaten.
+
+Global persistiert wird nur:
+
+```text
+genau ein GlobalReferencePoint pro konkreter Earth-WorldInstance
+```
+
+Nicht je Entität persistiert werden:
+
+```text
+keine globalen Blockkoordinaten
+keine globalen Chunkkoordinaten
+keine globalen Eventkoordinaten
+keine globalen Commandkoordinaten
+keine globalen Objektkoordinaten
+keine globalen Spielerkoordinaten
+keine globalen Spawnkoordinaten
+```
+
+Globale Werte werden bei Bedarf berechnet aus:
+
+```text
+GlobalReferencePoint
++ EarthGridDefinition
++ abgeleitetem EarthGridFrame
++ lokaler Position
+```
+
+### 27.3 Wichtige Earth-v1-Invarianten
+
+Zentrale Regeln:
+
+```text
+1. flat bleibt bestehender Standardprovider.
+2. earth ist ein zusätzlicher Provider.
+3. world_spawn bleibt eine konkrete WorldInstance.
+4. earth darf nicht als konkrete world_id verwendet werden.
+5. Eine Earth-World besitzt genau einen globalen Referenzpunkt.
+6. Der Referenzpunkt benötigt ein explizites CRS.
+7. Das CRS darf nicht aus Zahlenwerten geraten werden.
+8. Vertrauenswürdige Importmetadaten dürfen ein CRS explizit liefern.
+9. Der Referenzpunkt darf vor Materialisierung geändert werden.
+10. Nach Materialisierung ist normales Reanchoring gesperrt.
+11. Spawnverschiebung ist kein Reanchoring.
+12. X ist periodisch.
+13. Z ist in Earth v1 begrenzt und nicht periodisch.
+14. Y ist lokal nicht periodisch.
+15. X wird vor Chunk-Key, Snapshot-Lookup und Persistenz kanonisiert.
+16. Periodische X-Aliase dürfen keinen zweiten physischen Chunk erzeugen.
+17. Alle Earth-Projekte verwenden dieselbe Rasterphase.
+18. Projektindividuelle Rasterrotation ist nicht erlaubt.
+19. Regionale Runtime-CRS sind in Earth v1 nicht erlaubt.
+20. Der Speicherframe wird aus der Referenz abgeleitet und nicht als Wahrheit dupliziert.
+```
+
+### 27.4 Neue Architekturpakete
+
+Der Earth-v1-Slice besteht aus vier Ebenen:
+
+```text
+src/coordinates
+→ neutrale lokale Koordinaten- und Topologiemathematik
+
+src/georeferencing
+→ globale Koordinaten, CRS, Transformation und Earth-Raster
+
+src/world/earth
+→ konkreter Earth-Provider, Manifest, Validator und Generator
+
+models/world.py + routes/earth_debug.py
+→ Persistenzvertrag und ausführbarer HTTP-Smoke-Test
+```
+
+### 27.5 Neues Paket `src/coordinates`
+
+Aktuelle Struktur:
+
+```text
+services/vectoplan-chunk/src/coordinates/
+├── __init__.py
+├── errors.py
+├── models.py
+├── chunk_math.py
+└── topology.py
+```
+
+#### 27.5.1 `src/coordinates/errors.py`
+
+Rolle:
+
+```text
+Frameworkunabhängige Fehlerverträge für Koordinaten und Topologie.
+```
+
+Enthält insbesondere Fehler für:
+
+```text
+ungültige Koordinaten
+Dimensionsfehler
+int64-Überläufe
+ungültige Chunk-/Zellpositionen
+ungültige Chunkgrößen
+periodische Normalisierung
+Nord-/Süd-Grenzüberschreitung
+inkonsistente Topologie
+```
+
+Wichtige Eigenschaft:
+
+```text
+Fehler besitzen stabile Codes, Details und serialisierbare Problem-Payloads.
+```
+
+#### 27.5.2 `src/coordinates/models.py`
+
+Rolle:
+
+```text
+Unveränderliche lokale Koordinaten- und Adressverträge.
+```
+
+Wichtige Typen:
+
+```text
+LocalBlockPosition
+LocalMetricPosition
+ChunkPosition
+LocalCellPosition
+ChunkAddress
+ResolvedCellAddress
+NormalizedBlockPosition
+NormalizedChunkAddress
+NormalizationMetadata
+AxisConvention
+```
+
+Wichtige Regeln:
+
+```text
+Chunk-Key = x:y:z
+Chunk- und Blockkoordinaten verwenden signed int64
+Zellkoordinaten bleiben innerhalb der Chunkgröße
+lineare Zellreihenfolge = x-fastest-y-then-z
+```
+
+#### 27.5.3 `src/coordinates/chunk_math.py`
+
+Rolle:
+
+```text
+Zentrale, negative Koordinaten korrekt behandelnde Chunkmathematik.
+```
+
+Enthält:
+
+```text
+Floor-Division
+Floor-Modulo
+Blockachse in Chunkachse und lokale Zelle zerlegen
+Chunk und lokale Zelle wieder zu Blockposition zusammensetzen
+Zellindex berechnen
+Zellindex zurück in lokale Zellposition wandeln
+Chunkgrenzen berechnen
+Grenz-/Nachbaroffsets ableiten
+int64- und Zellanzahlprüfungen
+begrenzte Caches
+```
+
+Wichtige Regel:
+
+```text
+Negative Koordinaten nutzen mathematische Floor-Semantik,
+nicht Truncation gegen 0.
+```
+
+#### 27.5.4 `src/coordinates/topology.py`
+
+Rolle:
+
+```text
+Topologiestrategien für unendliche Flat-Welten und periodische Earth-Welten.
+```
+
+Enthält:
+
+```text
+UnboundedFlatTopology
+PeriodicXTopology
+NorthSouthPolicy
+Blockkanonisierung
+Chunkkanonisierung
+Nachbarberechnung
+Dirty-Chunk-Berechnung
+Batchkanonisierung
+Alias-Deduplizierung
+Weltnahtbehandlung
+```
+
+Earth-v1-Regel:
+
+```text
+X-Bereich ist halb-offen und zentriert.
+Antipodaler positiver Rand wird auf den negativen Rand kanonisiert.
+Z bleibt begrenzt.
+```
+
+#### 27.5.5 `src/coordinates/__init__.py`
+
+Rolle:
+
+```text
+Stabile Lazy-Import-Fassade des Koordinatenpakets.
+```
+
+Bietet:
+
+```text
+öffentliche Exporte
+Moduldiagnostik
+Preload
+Cacheinformationen
+zentralen Cache-Reset
+```
+
+### 27.6 Neues Paket `src/georeferencing`
+
+Aktuelle Struktur:
+
+```text
+services/vectoplan-chunk/src/georeferencing/
+├── __init__.py
+├── errors.py
+├── contracts.py
+├── crs.py
+├── transformer.py
+└── earth_grid.py
+```
+
+#### 27.6.1 `src/georeferencing/errors.py`
+
+Rolle:
+
+```text
+Stabile fachliche Fehler für CRS, Transformation und Earth-Referenzen.
+```
+
+Wichtige Fehlergruppen:
+
+```text
+CRS fehlt
+CRS ungültig
+CRS nicht unterstützt
+Achsenreihenfolge ungültig
+Einheit ungültig
+Transformation nicht verfügbar
+Ballpark-Transformation verboten
+bestmögliche Operation nicht verfügbar
+Transformationsgrid fehlt
+Genauigkeit unbekannt
+Roundtrip zu ungenau
+pyproj nicht verfügbar
+PROJ-Datenbank nicht verfügbar
+Earth-Referenz fehlt
+Earth-Referenz ungültig
+Earth-Referenz konfliktbehaftet
+Earth-Referenz gesperrt
+Coordinate-Frame-Revision konfliktbehaftet
+```
+
+#### 27.6.2 `src/georeferencing/contracts.py`
+
+Rolle:
+
+```text
+Unveränderliche und serialisierbare globale Georeferenzierungsverträge.
+```
+
+Wichtige Typen:
+
+```text
+GlobalCoordinate
+CrsDefinition
+CrsDefinitionFormat
+EarthGridReference
+GlobalReferencePoint
+TransformationPolicy
+TransformationAccuracy
+CoordinateTransformRequest
+CoordinateTransformResult
+EarthGridPosition
+ResolvedEarthAnchor
+```
+
+Wichtige Eigenschaften:
+
+```text
+Koordinaten verwenden Decimal
+2D und 3D werden explizit unterschieden
+CRS-Definitionen besitzen Fingerprints
+Referenzpunkte besitzen Fingerprints
+Transformationspolicy ist Bestandteil des Vertrages
+Roundtrip-Genauigkeit wird dokumentiert
+```
+
+#### 27.6.3 `src/georeferencing/crs.py`
+
+Rolle:
+
+```text
+Kontrollierte pyproj-/PROJ-Integration und kanonische CRS-Auflösung.
+```
+
+Wichtige Funktionen:
+
+```text
+resolve_crs(...)
+resolve_native_crs(...)
+inspect_crs(...)
+crs_equivalent(...)
+canonical_geographic_crs()
+canonical_geocentric_crs()
+configure_proj_network(...)
+ensure_crs_runtime_ready(...)
+crs_runtime_status()
+clear_crs_caches()
+```
+
+Kanonische CRS:
+
+```text
+EPSG:4979
+→ WGS 84 Geographic 3D
+→ Länge/Breite/Höhe
+
+EPSG:4978
+→ WGS 84 Geocentric
+→ geozentrische X/Y/Z-Meter
+```
+
+Persistenzregel:
+
+```text
+CRS wird kanonisch als WKT2:2019 beschrieben.
+Authority und Code bleiben zusätzliche Metadaten.
+```
+
+Netzwerkregel:
+
+```text
+PROJ-Netzwerk ist standardmäßig deaktiviert.
+Transformationsgrids werden nicht automatisch heruntergeladen.
+```
+
+#### 27.6.4 `src/georeferencing/transformer.py`
+
+Rolle:
+
+```text
+Strikte Auswahl und Ausführung konkreter CRS-Transformationen.
+```
+
+Wichtige Eigenschaften:
+
+```text
+TransformerGroup-Auswahl
+always_xy = true
+Ballpark standardmäßig verboten
+best_available standardmäßig erforderlich
+fehlende Grids werden diagnostiziert
+errcheck = true
+2D- und 3D-Unterstützung
+Roundtrip-Prüfung in Metern
+geodätische Fehlerberechnung für geografische CRS
+lineare Fehlerberechnung für projizierte/geozentrische CRS
+Identity-Pfad
+Batchtransformation
+thread-lokale Transformer-Caches
+generation-basierter Cache-Reset
+```
+
+Thread-Regel:
+
+```text
+Native pyproj-Transformer werden nicht zwischen Threads geteilt.
+```
+
+#### 27.6.5 `src/georeferencing/earth_grid.py`
+
+Rolle:
+
+```text
+Deterministische Abbildung zwischen globaler Referenz und lokalem Earth-Raster.
+```
+
+Wichtige Typen:
+
+```text
+EarthGridDefinition
+EarthGridFrame
+EarthGridMappingResult
+EarthStorageOrigin
+LocalEarthPosition
+GlobalToLocalResult
+LocalToGlobalResult
+```
+
+Default-Grid:
+
+```text
+worldWidthCells  = 40.000.000
+worldHeightCells = 20.000.000
+chunkSize        = 16
+metersPerCell    = 1
+centralMeridian  = 0°
+```
+
+Horizontale Abbildung:
+
+```text
+gridX = normalisierte Längendifferenz / 360° * worldWidthCells
+gridZ = Breitengrad / 180° * worldHeightCells
+```
+
+Vertikale Abbildung:
+
+```text
+gridY = ellipsoidische Höhe / metersPerCell
+```
+
+Speicherframe:
+
+```text
+exakte globale Referenz
+→ exakte gebrochene Earth-Grid-Position
+→ floor-snap auf globales Chunkraster
+→ chunk-ausgerichteter EarthStorageOrigin
+→ lokale Sub-Zell-Position der exakten Referenz
+```
+
+Wichtig:
+
+```text
+Der EarthStorageOrigin wird abgeleitet.
+Er ist keine zweite persistierte globale Referenz.
+```
+
+#### 27.6.6 `src/georeferencing/__init__.py`
+
+Rolle:
+
+```text
+Stabile öffentliche Georeferenzierungsfassade.
+```
+
+Bietet:
+
+```text
+thread-sichere Lazy-Imports
+explizite Runtime-Initialisierung
+gemeinsame Readiness
+Preload
+Cache-Diagnostik
+geordneten Cache-Reset
+nicht-sensitive Fehlerdiagnostik
+```
+
+Ein normaler Import lädt nicht automatisch:
+
+```text
+kein pyproj
+keine PROJ-Datenbank
+keinen Transformer
+keinen Earth-Grid-Readiness-Test
+```
+
+### 27.7 Neuer Provider `src/world/earth`
+
+Aktuelle Struktur:
+
+```text
+services/vectoplan-chunk/src/world/earth/
+├── __init__.py
+├── world.json
+├── validator.py
+├── generator.py
+└── provider.py
+```
+
+#### 27.7.1 `src/world/earth/__init__.py`
+
+Rolle:
+
+```text
+Stabile öffentliche Fassade des Earth-Providers.
+```
+
+Bietet:
+
+```text
+Providerkonstanten
+Lazy-Imports
+Manifestprüfung
+Modulstatus
+Provider-Readiness
+Cache-Diagnostik
+geordneten Cache-Reset
+Paketstatus-Reset
+```
+
+Stabile Identität:
+
+```text
+providerId      = earth
+templateId      = earth
+providerWorldId = earth
+worldType       = earth
+```
+
+#### 27.7.2 `src/world/earth/world.json`
+
+Rolle:
+
+```text
+Maschinenlesbarer, versionierter Earth-v1-Providervertrag.
+```
+
+Beschreibt:
+
+```text
+Provideridentität
+Gridgröße
+Chunkgröße
+X-Wrap
+Z-Grenzen
+CRS-Regeln
+Referenzkardinalität
+Speicherframe
+Generator
+Spawn
+Persistenzregeln
+Capabilities
+Flat-Kompatibilität
+Runtimeanforderungen
+Observability
+```
+
+Wichtige Manifestwerte:
+
+```text
+schemaVersion  = earth-world-definition.v1
+providerId     = earth
+generatorType  = earth-flat-periodic
+topologyType   = periodic-x-v1
+chunkSize      = 16
+worldWidth     = 40.000.000 Zellen
+worldHeight    = 20.000.000 Zellen
+```
+
+#### 27.7.3 `src/world/earth/validator.py`
+
+Rolle:
+
+```text
+Vollständiger Parser und Cross-Field-Validator für world.json.
+```
+
+Enthält:
+
+```text
+typisierte unveränderliche Definitionsverträge
+JSON-Pointer für Validierungsbefunde
+gesammelte Fehler und Warnungen
+strikten Modus für unbekannte Felder
+toleranten Warnmodus
+Manifestfingerprint
+Semantikfingerprint
+dateisignaturbasierten LRU-Cache
+Ableitung der EarthGridDefinition
+Readiness und Cache-Reset
+```
+
+Prüft unter anderem:
+
+```text
+Provideridentität
+Chunk-/Grid-Ausrichtung
+periodisches X
+begrenztes Z
+CRS-Pflicht
+genau eine Referenz
+keine globale Entity-Persistenz
+keine Projektrotation
+Spawn ist lokal
+Flat bleibt unverändert
+pyproj-/PROJ-Anforderungen
+```
+
+#### 27.7.4 `src/world/earth/generator.py`
+
+Rolle:
+
+```text
+Deterministischer Air-only-Basisgenerator für unmaterialisierte Earth-Chunks.
+```
+
+Wichtige Typen:
+
+```text
+EarthGeneratorConfig
+EarthGeneratedChunk
+EarthFlatPeriodicGenerator
+```
+
+Generatorregeln:
+
+```text
+Chunkadresse zuerst kanonisieren
+periodische X-Aliase deduplizieren
+Z-Grenze prüfen
+4096 Air-Zellen bei chunkSize 16
+Air = cellValue 0
+Palette = leer
+x-fastest-y-then-z
+nicht automatisch materialisieren
+snapshot-kompatibles Payload
+```
+
+Fingerprints:
+
+```text
+Config-Fingerprint
+Content-Fingerprint
+Generation-Fingerprint
+```
+
+Caches:
+
+```text
+Konfigurationscache
+Generatorcache
+Chunkinhaltcache
+Air-Zellarraycache
+Air-Content-Fingerprintcache
+```
+
+#### 27.7.5 `src/world/earth/provider.py`
+
+Rolle:
+
+```text
+WorldInstance-spezifische Verbindung aus Referenz, Grid-Frame,
+Topologie und Generator.
+```
+
+Wichtige Typen:
+
+```text
+EarthProviderCapabilities
+EarthWorldProvider
+```
+
+Aufgaben:
+
+```text
+konkrete world_id validieren
+Earth-Manifest laden
+EarthGridDefinition ableiten
+GlobalReferencePoint prüfen
+EarthGridFrame erzeugen
+PeriodicXTopology bereitstellen
+Generator konfigurieren
+Chunkadressen kanonisieren
+Chunks generieren
+globale Positionen lokal auflösen
+lokale Positionen global auflösen
+Default-Spawn bestimmen
+global adressierten Spawn lokal auflösen
+lokalen Spawn global berechnen
+Referenzwechsel vor Materialisierung erlauben
+Referenzwechsel nach Materialisierung sperren
+```
+
+Wichtige Identität:
+
+```text
+world_id          = konkrete Instanz, zum Beispiel world_spawn
+provider_id       = earth
+template_id       = earth
+provider_world_id = earth
+```
+
+### 27.8 Geänderte Persistenzdatei `models/world.py`
+
+Datei:
+
+```text
+services/vectoplan-chunk/models/world.py
+```
+
+Die Datei wurde erweitert, ohne den Flat-Default zu entfernen.
+
+Neue beziehungsweise gehärtete Earth-Fähigkeiten:
+
+```text
+Schemaerweiterung für Earth-Referenzvertrag
+providerId = earth zusätzlich erlaubt
+genau ein globaler Referenzvertrag für Earth
+Coordinate-Frame-Revision
+Referenzfingerprint
+Referenzsperre
+Referenz-Sperrgründe
+präzise lokale Spawnkoordinaten
+lokaler Spawn-Koordinatenraum
+Earth-Factory
+Earth-spezifische Validierung
+Earth-API-Payload
+```
+
+Neue beziehungsweise bestätigte Spalten in `world_instances`:
+
+```text
+spawn_coordinate_space
+spawn_x_precise
+spawn_y_precise
+spawn_z_precise
+coordinate_frame_revision
+global_reference_json
+global_reference_fingerprint
+global_reference_locked_at
+global_reference_lock_reasons_json
+global_reference_updated_at
+global_reference_updated_by_user_id
+```
+
+Bedeutung:
+
+```text
+global_reference_json
+→ genau ein kanonischer globaler Earth-Referenzvertrag
+
+global_reference_fingerprint
+→ Integritäts- und Cachebezug
+
+coordinate_frame_revision
+→ Version des lokalen Coordinate-Frames
+
+global_reference_locked_at
+→ Zeitpunkt der Referenzsperre
+
+global_reference_lock_reasons_json
+→ materialisierte Zustände, die Reanchoring verhindern
+
+spawn_*_precise
+→ präziser lokaler Spawn über NUMERIC/Decimal
+```
+
+Flat-Kompatibilität:
+
+```text
+Flat-Welten dürfen ohne global_reference_json bestehen.
+Flat bleibt Default.
+Flat verwendet Coordinate-Frame-Revision 0.
+```
+
+Earth-Regel:
+
+```text
+Earth-Welten benötigen global_reference_json.
+```
+
+### 27.9 Neue Debug-Route `routes/earth_debug.py`
+
+Datei:
+
+```text
+services/vectoplan-chunk/routes/earth_debug.py
+```
+
+Route:
+
+```text
+GET /debug/earth
+```
+
+Zweck:
+
+```text
+temporärer HTTP-Smoke-Test des Earth-v1-Kerns
+ohne produktiven Provider-Resolver
+ohne Persistenzänderung
+ohne Earth-Seeding
+ohne Snapshot-Schreibpfad
+```
+
+Getestete Komponenten:
+
+```text
+pyproj-/PROJ-Verfügbarkeit
+Earth-Manifest
+kanonisches CRS
+GlobalReferencePoint
+EarthWorldProvider
+EarthGridFrame
+Chunkgenerator
+global → lokal
+lokal → global
+Spawnauflösung
+```
+
+Unterstützte Queryparameter:
+
+```text
+refLon
+refLat
+refHeight
+lon
+lat
+height
+```
+
+Beispiel:
+
+```text
+GET /debug/earth
+  ?refLon=11.576123456
+  &refLat=48.137654321
+  &refHeight=560.237
+  &lon=11.577
+  &lat=48.138
+  &height=561
+```
+
+### 27.10 Geänderte Route-Registry `routes/__init__.py`
+
+Datei:
+
+```text
+services/vectoplan-chunk/routes/__init__.py
+```
+
+Neue Registrierung:
+
+```text
+routes.earth_debug:earth_debug_bp
+```
+
+Eigenschaften:
+
+```text
+category = debug
+required = false
+Dev-Route-Schalter = VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES
+```
+
+Neue Routing-Metadaten:
+
+```text
+earthDebugRouteEnabled
+```
+
+Bestätigte Startausgabe:
+
+```text
+Blueprint 'earth_debug' registered.
+Route count = 56
+/debug/earth ist in der URL-Map vorhanden.
+```
+
+### 27.11 Neue Runtime-Abhängigkeit
+
+Datei:
+
+```text
+services/vectoplan-chunk/requirements.txt
+```
+
+Für Earth-v1 erforderlich:
+
+```text
+pyproj>=3.7,<4.0
+```
+
+Bedeutung:
+
+```text
+pyproj
+→ Python-Schnittstelle
+
+PROJ
+→ native CRS-/Transformationsengine
+
+PROJ-Datenbank
+→ EPSG-Definitionen und Operationsmetadaten
+```
+
+Bestätigter vorheriger Fehler ohne Abhängigkeit:
+
+```text
+PyprojUnavailableError
+code = pyproj_unavailable
+```
+
+Nach Installation und Neubau:
+
+```text
+/debug/earth
+→ ok = true
+```
+
+### 27.12 Vollständig aktualisierte relevante Ordnerstruktur
+
+```text
+services/
+└── vectoplan-chunk/
+    ├── app.py
+    ├── wsgi.py
+    ├── config.py
+    ├── extensions.py
+    ├── Dockerfile
+    ├── entrypoint.sh
+    ├── requirements.txt
+    ├── IST-Zustand.md
+    │
+    ├── docs/
+    │   └── adr/
+    │       └── ADR-earth-world-v1.md
+    │
+    ├── scripts/
+    │   └── bootstrap_db.py
+    │
+    ├── routes/
+    │   ├── __init__.py
+    │   ├── projects.py
+    │   ├── worlds.py
+    │   ├── blocks.py
+    │   ├── chunks.py
+    │   ├── commands.py
+    │   ├── world_test.py
+    │   ├── earth_debug.py
+    │   └── editor.py
+    │
+    ├── models/
+    │   ├── __init__.py
+    │   ├── project.py
+    │   ├── universe.py
+    │   ├── world.py
+    │   ├── block.py
+    │   ├── chunk.py
+    │   ├── event.py
+    │   └── object.py
+    │
+    └── src/
+        ├── bootstrap/
+        │   ├── __init__.py
+        │   ├── startup.py
+        │   ├── settings.py
+        │   ├── runtime_checks.py
+        │   ├── db_locks.py
+        │   ├── schema_bootstrap.py
+        │   ├── default_seed.py
+        │   └── db_bootstrap.py
+        │
+        ├── coordinates/
+        │   ├── __init__.py
+        │   ├── errors.py
+        │   ├── models.py
+        │   ├── chunk_math.py
+        │   └── topology.py
+        │
+        ├── georeferencing/
+        │   ├── __init__.py
+        │   ├── errors.py
+        │   ├── contracts.py
+        │   ├── crs.py
+        │   ├── transformer.py
+        │   └── earth_grid.py
+        │
+        ├── system_blocks/
+        │   ├── __init__.py
+        │   ├── contracts.py
+        │   ├── catalog.py
+        │   ├── bootstrap.py
+        │   ├── IST-Zustand.md
+        │   ├── air/
+        │   │   ├── __init__.py
+        │   │   └── definition.py
+        │   └── railing/
+        │       ├── __init__.py
+        │       └── definition.py
+        │
+        ├── world/
+        │   ├── __init__.py
+        │   ├── errors.py
+        │   ├── models.py
+        │   ├── registry.py
+        │   ├── loader.py
+        │   ├── service.py
+        │   ├── serializer.py
+        │   ├── discovery.py
+        │   │
+        │   ├── flat/
+        │   │   ├── __init__.py
+        │   │   ├── world.json
+        │   │   ├── validator.py
+        │   │   ├── generator.py
+        │   │   └── provider.py
+        │   │
+        │   └── earth/
+        │       ├── __init__.py
+        │       ├── world.json
+        │       ├── validator.py
+        │       ├── generator.py
+        │       └── provider.py
+        │
+        └── world_state/
+            ├── __init__.py
+            ├── errors.py
+            ├── models.py
+            ├── defaults.py
+            ├── resolver.py
+            ├── service.py
+            ├── bootstrap.py
+            ├── provisioning.py
+            └── serializer.py
+```
+
+### 27.13 Architekturentscheidung `ADR-earth-world-v1.md`
+
+Datei:
+
+```text
+services/vectoplan-chunk/docs/adr/ADR-earth-world-v1.md
+```
+
+Dokumentiert:
+
+```text
+Earth bleibt geometrisch flach
+genau ein globaler Referenzpunkt pro Earth-WorldInstance
+lokale Persistenz
+global einheitliches Raster
+periodisches X
+begrenztes Z
+keine regionale CRS-Auswahl zur Laufzeit
+keine Projektrotation
+keine überlappenden Projektraster
+Spawnverschiebung ist kein Reanchoring
+Referenz ist nach Materialisierung unveränderlich
+CRS wird explizit geliefert und nie aus Zahlen geraten
+```
+
+### 27.14 Bestätigtes Ergebnis der Debug-Route
+
+Bestätigte Provideridentität:
+
+```text
+worldId         = world_spawn
+providerId      = earth
+templateId      = earth
+providerWorldId = earth
+```
+
+Bestätigter Referenzpunkt:
+
+```text
+schemaVersion   = earth-global-reference.schema.v1
+referenceVersion = 1
+CRS             = EPSG:4979
+Dimension       = 3
+
+longitude       = 11.576123456
+latitude        = 48.137654321
+height          = 560.237
+```
+
+Bestätigtes Grid:
+
+```text
+gridId          = vectoplan-earth-grid
+gridVersion     = 1
+projectionId    = vectoplan-periodic-equirectangular
+topologyType    = periodic-x-v1
+axisConvention  = x-east-y-up-z-north
+```
+
+Bestätigter Speicherursprung:
+
+```text
+x = 1.286.224
+y = 560
+z = 5.348.624
+```
+
+Chunk-Ausrichtung:
+
+```text
+1.286.224 / 16 = 80.389
+560 / 16       = 35
+5.348.624 / 16 = 334.289
+```
+
+Alle Achsen sind damit chunk-ausgerichtet.
+
+Lokale Position der exakten Referenz:
+
+```text
+x = 11,93955555555555555556
+y = 0,237
+z = 4,257888888888888888888
+```
+
+Getestete globale Zielkoordinate:
+
+```text
+longitude = 11.577
+latitude  = 48.138
+height    = 561
+```
+
+Aufgelöste lokale Position:
+
+```text
+x = 109,33333333333333333333
+y = 1
+z = 42,666666666666666666666
+```
+
+Roundtrip:
+
+```text
+Eingabe:
+latitude = 48.138
+
+Rückgabe:
+latitude = 48.13799999999999999999999999
+```
+
+Einordnung:
+
+```text
+Die Differenz liegt nur in der Decimal-Repräsentation.
+Der globale/lokale Roundtrip ist praktisch exakt.
+```
+
+Spawn:
+
+```text
+coordinateSpace = local_metric
+x = 109.33333333333333
+y = 1.0
+z = 42.666666666666664
+```
+
+Die kleinen Nachkommastellenabweichungen entstehen beim Übergang von
+`Decimal` zu Python-`float`.
+
+Generierter Chunk:
+
+```text
+chunkKey        = 0:0:0
+chunkSize       = 16
+cellCount       = 4096
+palette         = []
+nonAirCellCount = 0
+source          = generator
+materialized    = false
+```
+
+Kanonisierung:
+
+```text
+requestedChunk = 0:0:0
+canonicalChunk = 0:0:0
+canonicalized  = false
+wrapCountX     = 0
+```
+
+### 27.15 CRS-Achseneinordnung
+
+EPSG:4979 beschreibt seine nativen Achsen als:
+
+```text
+Geodetic latitude
+Geodetic longitude
+Ellipsoidal height
+```
+
+Die Runtime verwendet dennoch bewusst:
+
+```text
+x = longitude
+y = latitude
+z = height
+```
+
+Grund:
+
+```text
+always_xy = true
+```
+
+Für produktive API-Dokumentation sollte deshalb zusätzlich explizit angegeben
+werden:
+
+```text
+coordinateOrder = longitude-latitude-height
+alwaysXY = true
+```
+
+### 27.16 Bedeutung von `local_metric`
+
+`local_metric` ist im aktuellen Earth-v1-Modell eine lokale Engineposition.
+
+Wichtig:
+
+```text
+Y entspricht durch metersPerCell = 1 direkt einer Höhenmetereinheit.
+
+X und Z stammen aus einem normierten equirektangularen Raster.
+
+X ist nicht an jedem Breitengrad eine geodätisch exakte Meterdistanz.
+
+Das Raster ist für Chunk-, Block-, Editor- und Simulationskoordinaten gedacht.
+
+Präzise reale Distanzen müssen geodätisch oder im geeigneten Quell-CRS
+berechnet werden.
+```
+
+### 27.17 Aktueller Datenbankstand
+
+Das Datenbankschema besitzt die neuen Earth-bezogenen WorldInstance-Spalten.
+
+Bestätigt vorhanden:
+
+```text
+coordinate_frame_revision
+global_reference_json
+global_reference_fingerprint
+global_reference_locked_at
+global_reference_lock_reasons_json
+global_reference_updated_at
+global_reference_updated_by_user_id
+spawn_coordinate_space
+spawn_x_precise
+spawn_y_precise
+spawn_z_precise
+```
+
+Der derzeitige Default-Seed bleibt jedoch:
+
+```text
+worldId         = world_spawn
+providerId      = flat
+templateId      = flat
+providerWorldId = flat
+```
+
+Wichtige Einordnung:
+
+```text
+Der erfolgreiche /debug/earth-Aufruf erzeugt einen EarthWorldProvider
+für world_spawn im Speicher.
+
+Er ändert nicht automatisch den vorhandenen PostgreSQL-Datensatz
+world_spawn von flat auf earth.
+
+Damit sind bestehende produktive Flat-Routen und Daten unverändert.
+```
+
+### 27.18 Neue erweiterte Invarianten
+
+Zusätzlich zu den bisherigen Invarianten 1 bis 78 gelten nun:
+
+```text
+79. earth ist ein zusätzlicher Provider und ersetzt flat nicht.
+80. Der bestehende Default-Seed bleibt bis zur bewussten Umstellung flat.
+81. Eine konkrete Earth-WorldInstance benötigt world_id ungleich earth.
+82. providerId, templateId und providerWorldId einer Earth-Definition sind earth.
+83. Eine Earth-WorldInstance besitzt genau einen GlobalReferencePoint.
+84. Ein GlobalReferencePoint besitzt eine explizite CrsDefinition.
+85. CRS-Raten aus Zahlenwerten ist verboten.
+86. Globale Koordinaten werden als Decimal verarbeitet.
+87. EPSG:4979 ist das kanonische geografische 3D-CRS.
+88. EPSG:4978 ist das kanonische geozentrische CRS.
+89. CRS-Persistenz verwendet eine kanonische WKT-Definition.
+90. Transformationsoperationen verwenden always_xy=true.
+91. Ballpark-Transformationen sind standardmäßig verboten.
+92. best_available ist standardmäßig erforderlich.
+93. Fehlende Transformationsgrids werden nicht automatisch geladen.
+94. PROJ-Netzwerk ist standardmäßig deaktiviert.
+95. Native Transformer werden nicht zwischen Threads geteilt.
+96. Roundtrip-Genauigkeit wird in Metern geprüft.
+97. EarthGridDefinition ist global versioniert.
+98. Earth v1 verwendet ein einheitliches 40.000.000×20.000.000-Raster.
+99. Earth v1 verwendet chunkSize 16.
+100. X ist periodisch.
+101. Z ist begrenzt und nicht periodisch.
+102. Pole sind keine adressierbaren Zellen.
+103. X wird in einen halb-offenen zentrierten Bereich kanonisiert.
+104. Antipodale positive Randwerte werden auf den negativen Rand kanonisiert.
+105. Periodische Alias-Chunks besitzen denselben kanonischen Chunk-Key.
+106. Periodische Alias-Chunks besitzen denselben Generatorinhalt.
+107. Periodische Alias-Snapshots dürfen nicht doppelt persistiert werden.
+108. Der lokale Speicherursprung wird aus der Referenz abgeleitet.
+109. Der lokale Speicherursprung ist chunk-ausgerichtet.
+110. Der lokale Speicherursprung ist keine zweite globale Referenz.
+111. Die exakte Referenz darf innerhalb des Ursprungschunks gebrochen liegen.
+112. Block-, Chunk-, Event-, Command-, Objekt- und Spawnzustände bleiben lokal.
+113. Globale Entity-Koordinaten werden nicht redundant gespeichert.
+114. Spawnverschiebung ändert den GlobalReferencePoint nicht.
+115. Spawnverschiebung reanchort die Welt nicht.
+116. Eine 2D-Referenz erfindet keine absolute globale Höhe.
+117. Lokales Y darf bei 2D-Referenz weiter speicherbar bleiben.
+118. Normales Reanchoring ist nach Materialisierung gesperrt.
+119. Reanchoring nach Materialisierung benötigt eine eigene Migration.
+120. Der Earth-Generator erzeugt Air als cellValue 0.
+121. Der Earth-Generator erzeugt keine positive Palette für Air-only-Chunks.
+122. Der Earth-Generator materialisiert beim Lesen keinen Snapshot.
+123. EarthGeneratedChunk ist snapshot-kompatibel.
+124. Der Debug-Endpunkt ist kein produktiver Persistenzpfad.
+125. Der Debug-Endpunkt darf die DB nicht mutieren.
+126. Der Debug-Endpunkt bestätigt den Kern, nicht die produktive Resolver-Integration.
+127. pyproj ist eine erforderliche Earth-Runtimeabhängigkeit.
+128. routes.earth_debug ist eine optionale Dev-Route.
+129. VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES steuert world_test und earth_debug.
+130. Produktive Earth-Integration muss Snapshot-, Command- und Provider-Resolver-Pfade kanonisieren.
+```
+
+### 27.19 Bestätigte Tests
+
+Automatisch beziehungsweise manuell bestätigt:
+
+```text
+Koordinatenmodelle importieren
+Chunkmathematik für negative Werte
+periodische X-Normalisierung
+Z-Grenzen
+Weltnaht
+CRS EPSG:4979 laden
+CRS EPSG:4978 laden
+PROJ-Netzwerk deaktivieren
+Transformer auswählen
+Ballpark vermeiden
+global → geozentrisch
+Roundtrip-Präzision
+EarthGridDefinition erzeugen
+GlobalReferencePoint auflösen
+chunk-ausgerichteten StorageOrigin erzeugen
+global → lokal
+lokal → global
+2D-Höhenschutz
+Earth-Manifest validieren
+Generator konfigurieren
+4096 Air-Zellen erzeugen
+periodische Chunkaliase deduplizieren
+Generatorbatch deduplizieren
+EarthWorldProvider erzeugen
+world_spawn/earth-Identität trennen
+Default-Spawn bestimmen
+globalen Spawn lokal auflösen
+lokalen Spawn global auflösen
+Referenzwechsel vor Materialisierung
+Referenzsperre nach Materialisierung
+Flask-Blueprint registrieren
+GET /debug/earth
+HTTP 200
+vollständige JSON-Antwort
+```
+
+### 27.20 Noch offene produktive Integrationspunkte
+
+Noch nicht erledigt beziehungsweise nicht vollständig bestätigt:
+
+```text
+Provider-Registry erkennt earth in produktiven World-State-Pfaden
+World-State-Service lädt GlobalReferencePoint aus WorldInstance
+World-State-Service baut EarthWorldProvider aus DB-Daten
+World-Erstellung akzeptiert Earth-Referenzpayload
+World-PATCH behandelt Referenzvertrag und Sperrregeln produktiv
+Chunk-GET kanonisiert Earth-X vor Snapshot-Lookup
+Chunk-Batch dedupliziert periodische Aliasadressen
+Command-POST kanonisiert Earth-Blöcke vor DB-Schreibpfad
+Dirty-Chunks funktionieren an der globalen X-Naht
+Snapshot-Unique-Constraints schützen vor periodischen Duplikaten
+ChunkEvent speichert nur kanonische lokale Adressen
+WorldCommandLog speichert nur kanonische lokale Adressen
+Spawn-API akzeptiert globale Koordinate plus explizites CRS
+Spawn-API persistiert nur lokale präzise Position
+Materialisierung sperrt die Referenz automatisch
+App-Provisioning kann Earth bewusst auswählen
+Default-Seed kann optional eine Earth-Testwelt anlegen
+Editor kann eine persistierte Earth-Welt laden
+Editor kann über die Weltnaht navigieren
+SetBlock/RemoveBlock über die Weltnaht End-to-End
+Mehrblockobjekte über die Weltnaht
+Concurrent Commands auf periodischen Alias-Chunks
+Produktive Statusroute für Earth-Readiness
+```
+
+### 27.21 Empfohlene nächste Dateien beziehungsweise Integrationsschritte
+
+Priorität 1:
+
+```text
+src/world/registry.py
+src/world/loader.py
+src/world/service.py
+```
+
+Ziel:
+
+```text
+providerId = flat
+→ bestehender FlatProvider
+
+providerId = earth
+→ GlobalReferencePoint aus WorldInstance laden
+→ EarthWorldProvider erzeugen
+```
+
+Priorität 2:
+
+```text
+src/world_state/service.py
+src/world_state/resolver.py
+routes/worlds.py
+```
+
+Ziel:
+
+```text
+Earth-World erstellen
+Earth-Referenz lesen
+Earth-Referenz vor Materialisierung ändern
+Earth-Referenz nach Materialisierung sperren
+globalen Spawn entgegennehmen
+lokalen Spawn persistieren
+```
+
+Priorität 3:
+
+```text
+routes/chunks.py
+routes/commands.py
+models/chunk.py
+models/event.py
+```
+
+Ziel:
+
+```text
+X vor jedem Chunk-Key kanonisieren
+X vor Snapshot-Lookup kanonisieren
+X vor Snapshot-Write kanonisieren
+periodische Aliase deduplizieren
+Dirty-Chunks über Weltnaht korrekt bestimmen
+```
+
+Priorität 4:
+
+```text
+src/world_state/provisioning.py
+src/bootstrap/default_seed.py
+src/bootstrap/db_bootstrap.py
+```
+
+Ziel:
+
+```text
+Earth optional provisionieren
+Flat-Default unverändert lassen
+Earth-Testwelt explizit und idempotent erzeugen
+Referenzvertrag sicher persistieren
+```
+
+### 27.22 Aktualisierter Gesamtbefund
+
+Der aktuelle Gesamtbefund lautet:
+
+```text
+Der bestehende Flat-/PostgreSQL-/Snapshot-/Command-/Systemblock-Stand bleibt
+funktionsfähig und unverändert.
+
+Zusätzlich ist ein vollständiger Earth-v1-Kern vorhanden:
+
+→ neutrale Koordinatenmodelle
+→ korrekte Chunkmathematik
+→ periodische X-Topologie
+→ explizite CRS-Verträge
+→ pyproj-/PROJ-Integration
+→ strikte Transformer
+→ versioniertes Earth-Raster
+→ genau ein globaler Referenzpunkt
+→ abgeleiteter lokaler Speicherframe
+→ lokale Spawnauflösung
+→ Air-only-Earth-Generator
+→ WorldInstance-spezifischer Earth-Provider
+→ persistenzfähiger Referenzvertrag im World-Modell
+→ registrierte Debug-Route
+→ erfolgreicher HTTP-Smoke-Test
+```
+
+Technisch präzise Einordnung:
+
+```text
+Earth v1 ist als Kern implementiert und ausführbar.
+
+Der vollständige produktive DB-/World-State-/Snapshot-/Command-Resolverpfad
+ist noch nicht vollständig auf providerId=earth umgestellt.
+
+Der erfolgreiche Debug-Test bestätigt die Mathematik, CRS-Schicht,
+Providerkonstruktion, Spawnauflösung und Chunkgenerierung.
+
+Er bestätigt noch nicht automatisch eine persistierte produktive Earth-Welt.
 ```

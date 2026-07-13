@@ -1,0 +1,233 @@
+{
+  "$comment": "services/vectoplan-chunk/src/world/earth/world.json",
+  "schemaVersion": "earth-world-definition.v1",
+  "definitionVersion": 1,
+  "providerContractVersion": "earth-provider.v1",
+  "providerId": "earth",
+  "templateId": "earth",
+  "providerWorldId": "earth",
+  "worldType": "earth",
+  "displayName": "Earth",
+  "description": "Globally referenced, locally persisted flat world with a periodic east-west topology.",
+  "enabled": true,
+  "generatorType": "earth-flat-periodic",
+  "generatorVersion": "1",
+  "topologyType": "periodic-x-v1",
+  "coordinateSystemId": "vectoplan-earth-grid-v1",
+  "axisConvention": "x-east-y-up-z-north",
+  "coordinateSpaces": {
+    "persisted": "local_world",
+    "chunk": "chunk",
+    "cell": "local_cell",
+    "subCell": "local_metric",
+    "globalInput": "explicit_crs",
+    "derivedEarthGrid": "earth_grid"
+  },
+  "gridId": "vectoplan-earth-grid",
+  "gridVersion": "1",
+  "grid": {
+    "gridId": "vectoplan-earth-grid",
+    "gridVersion": "1",
+    "projectionId": "vectoplan-periodic-equirectangular",
+    "projectionVersion": "1",
+    "topologyType": "periodic-x-v1",
+    "axisConvention": "x-east-y-up-z-north",
+    "worldWidthCells": 40000000,
+    "worldHeightCells": 20000000,
+    "halfWorldWidthCells": 20000000,
+    "halfWorldHeightCells": 10000000,
+    "chunkSize": 16,
+    "worldWidthChunks": 2500000,
+    "worldHeightChunks": 1250000,
+    "centralMeridianDeg": "0",
+    "poleExclusionEpsilonDeg": "0.000000000001",
+    "verticalMetersPerCell": "1",
+    "horizontalScalePolicy": "normalized-angular-v1",
+    "horizontalDistanceSemantics": "not-globally-metric",
+    "storageOriginPolicy": "global-chunk-origin-floor-v1",
+    "canonicalBlockXRange": {
+      "minimumInclusive": -20000000,
+      "maximumExclusive": 20000000
+    },
+    "globalBlockZRange": {
+      "minimumInclusive": -10000000,
+      "maximumExclusive": 10000000
+    },
+    "polesAddressable": false
+  },
+  "topology": {
+    "type": "periodic-x-v1",
+    "wrapAxes": [
+      "x"
+    ],
+    "nonWrapAxes": [
+      "y",
+      "z"
+    ],
+    "xCanonicalization": {
+      "range": "half-open-centered",
+      "minimumInclusive": -20000000,
+      "maximumExclusive": 20000000,
+      "antipodalCanonicalValue": -20000000,
+      "normalizeBeforeChunkKey": true,
+      "normalizeBeforePersistence": true,
+      "normalizeBeforeDatabaseLookup": true
+    },
+    "northSouth": {
+      "policy": "bounded",
+      "minimumGlobalBlockZInclusive": -10000000,
+      "maximumGlobalBlockZInclusive": 9999999,
+      "wrap": false,
+      "polesAddressable": false
+    },
+    "vertical": {
+      "policy": "unbounded-local",
+      "wrap": false
+    }
+  },
+  "chunk": {
+    "size": 16,
+    "shape": "cube",
+    "coordinateType": "signed-int64",
+    "cellCoordinateType": "signed-int32",
+    "keyFormat": "x:y:z",
+    "linearIndexOrder": "x-fastest-y-then-z",
+    "canonicalKeyRequired": true,
+    "periodicAliasesAllowed": false,
+    "duplicatePeriodicSnapshotsAllowed": false
+  },
+  "globalReference": {
+    "required": true,
+    "cardinality": "exactly-one",
+    "persisted": true,
+    "coordinatePrecision": "decimal-string",
+    "crsRequired": true,
+    "crsGuessingFromNumericValuesAllowed": false,
+    "trustedMetadataCrsReadAllowed": true,
+    "supportedCoordinateDimensions": [
+      2,
+      3
+    ],
+    "canonicalGeographicCrsId": "EPSG:4979",
+    "canonicalGeocentricCrsId": "EPSG:4978",
+    "allowBallparkTransformations": false,
+    "requireBestAvailableTransformation": true,
+    "alwaysXy": true,
+    "defaultMaximumRoundtripErrorM": "0.001",
+    "mutableBeforeMaterialization": true,
+    "mutableAfterMaterialization": false,
+    "normalReanchorAllowed": false,
+    "reanchorRequiresDedicatedMigration": true,
+    "materializationLockReasons": [
+      "chunk_snapshots",
+      "chunk_events",
+      "block_commands",
+      "imported_objects",
+      "persisted_spawn",
+      "player_state"
+    ]
+  },
+  "storageFrame": {
+    "persisted": false,
+    "cacheable": true,
+    "reproducibleFromGlobalReference": true,
+    "originPolicy": "global-chunk-origin-floor-v1",
+    "chunkAlignedAxes": [
+      "x",
+      "y",
+      "z"
+    ],
+    "referencePointMayBeSubCell": true,
+    "referenceLocalPositionDerived": true,
+    "rotationAllowed": false,
+    "regionalRuntimeCrsAllowed": false,
+    "perProjectGridPhaseAllowed": false
+  },
+  "generator": {
+    "type": "earth-flat-periodic",
+    "version": "1",
+    "deterministic": true,
+    "topologyAware": true,
+    "defaultBlockTypeId": "system_air",
+    "generationMode": "air-only-v1",
+    "terrainSurfaceGenerated": false,
+    "northSouthBoundaryGenerated": false,
+    "periodicXBoundaryGenerated": false,
+    "canonicalizeChunkBeforeGeneration": true,
+    "snapshotCompatible": true,
+    "eventReplayCompatible": true
+  },
+  "spawn": {
+    "persistedCoordinateSpace": "local_metric",
+    "defaultPolicy": "global-reference-point-as-local-position",
+    "globalCoordinateInputSupported": true,
+    "explicitCrsRequiredForGlobalInput": true,
+    "moveChangesGlobalReference": false,
+    "moveReanchorsWorld": false,
+    "xCanonicalizedBeforePersistence": true,
+    "northSouthBoundsValidated": true,
+    "verticalRequiresResolvedReferenceHeight": false
+  },
+  "persistence": {
+    "blocksStoredGlobally": false,
+    "chunksStoredGlobally": false,
+    "eventsStoredGlobally": false,
+    "commandsStoredGlobally": false,
+    "objectsStoredGlobally": false,
+    "playersStoredGlobally": false,
+    "spawnStoredGlobally": false,
+    "derivedGlobalCoordinatesPersistedPerEntity": false,
+    "globalReferenceRecordCount": 1,
+    "canonicalizeBeforeWrite": true,
+    "canonicalizeBeforeRead": true,
+    "canonicalizeBeforeChunkKey": true,
+    "canonicalizeBeforeSnapshotLookup": true,
+    "canonicalizeDirtyChunks": true,
+    "deduplicateCanonicalDirtyChunks": true
+  },
+  "capabilities": {
+    "chunkGeneration": true,
+    "chunkSnapshots": true,
+    "chunkEvents": true,
+    "blockCommands": true,
+    "batchCommands": true,
+    "globalReference": true,
+    "globalToLocalConversion": true,
+    "localToGlobalConversion": true,
+    "globalSpawnInput": true,
+    "periodicX": true,
+    "periodicZ": false,
+    "normalReanchor": false,
+    "terrainImport": false,
+    "regionalCrs": false,
+    "projectGridRotation": false
+  },
+  "compatibility": {
+    "sharedChunkMath": true,
+    "sharedSnapshotFormat": true,
+    "sharedEventFormat": true,
+    "sharedCommandPath": true,
+    "flatProviderUnchanged": true,
+    "flatProviderDefaultBehaviorUnchanged": true,
+    "providerSelectionRequired": true
+  },
+  "runtime": {
+    "requiresPyproj": true,
+    "minimumPyprojVersion": "3.7.0",
+    "requiresProjDatabase": true,
+    "projNetworkEnabledByDefault": false,
+    "automaticGridDownloadAllowed": false,
+    "readinessRequiresCanonicalCrs": [
+      "EPSG:4979",
+      "EPSG:4978"
+    ]
+  },
+  "observability": {
+    "emitCanonicalizationMetrics": true,
+    "emitWrapCountMetrics": true,
+    "emitTransformerCacheMetrics": true,
+    "emitEarthFrameCacheMetrics": true,
+    "includeFullCrsDefinitionsInLogs": false,
+    "includeFullTransformPipelinesInLogs": false
+  }
+}

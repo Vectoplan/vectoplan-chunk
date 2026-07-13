@@ -74,3 +74,10 @@ pytest>=8.0,<10.0
 
 # Optional but useful for Flask route and app-factory tests.
 pytest-cov>=5.0,<8.0
+
+# -----------------------------------------------------------------------------
+# Geospatial / Coordinate Reference Systems
+# -----------------------------------------------------------------------------
+
+# CRS parsing and coordinate transformations backed by PROJ.
+pyproj>=3.7,<4.0

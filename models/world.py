@@ -21,8 +21,10 @@ Important design rules:
 - `world_id` is the stable public/API identifier inside one universe.
 - `world_id` is only unique per universe, not globally.
 - `world_spawn` or generated `chk_wld_...` is a concrete editable world.
-- `flat` is a provider/template world and must be stored as
+- `flat` and `earth` are provider/template worlds and must be stored as
   `template_id` / `provider_world_id`, not as the concrete `world_id`.
+- Earth WorldInstances persist exactly one global reference contract; blocks,
+  chunks, events, commands, objects, players and spawn remain local.
 - This model stores world configuration, not chunk cells.
 - Chunk cells are stored in ChunkSnapshot.
 - This model does not perform commits.
@@ -31,9 +33,12 @@ Important design rules:
 
 from __future__ import annotations
 
+import importlib
+import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
@@ -71,7 +76,17 @@ except Exception:  # pragma: no cover
     JSON_COLUMN_TYPE = db.JSON
 
 
-WORLD_INSTANCE_SCHEMA_VERSION = "world-instance.schema.v2"
+try:
+    NULLABLE_JSON_COLUMN_TYPE = (
+        JSONB(none_as_null=True)
+        .with_variant(db.JSON(none_as_null=True), "sqlite")
+        .with_variant(db.JSON(none_as_null=True), "mysql")
+    ) if JSONB is not None else db.JSON(none_as_null=True)
+except Exception:  # pragma: no cover
+    NULLABLE_JSON_COLUMN_TYPE = db.JSON(none_as_null=True)
+
+
+WORLD_INSTANCE_SCHEMA_VERSION = "world-instance.schema.v3"
 
 WORLD_STATUS_ACTIVE = "active"
 WORLD_STATUS_ARCHIVED = "archived"
@@ -135,6 +150,30 @@ DEFAULT_TEMPLATE_ID = "flat"
 DEFAULT_PROVIDER_ID = "flat"
 DEFAULT_PROVIDER_WORLD_ID = "flat"
 
+EARTH_TEMPLATE_ID = "earth"
+EARTH_PROVIDER_ID = "earth"
+EARTH_PROVIDER_WORLD_ID = "earth"
+EARTH_WORLD_NAME = "Earth Spawn World"
+
+EARTH_GENERATOR_TYPE = "earth-flat-periodic"
+EARTH_GENERATOR_VERSION = "1"
+EARTH_PROJECTION_TYPE = "vectoplan-periodic-equirectangular"
+EARTH_TOPOLOGY_TYPE = "periodic-x-v1"
+EARTH_COORDINATE_SYSTEM = "vectoplan-earth-grid-v1"
+EARTH_GRID_ID = "vectoplan-earth-grid"
+EARTH_GRID_VERSION = "1"
+
+PROVIDER_LIKE_WORLD_IDS = frozenset(
+    {
+        DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_WORLD_ID,
+        EARTH_TEMPLATE_ID,
+        EARTH_PROVIDER_ID,
+        EARTH_PROVIDER_WORLD_ID,
+    }
+)
+
 DEFAULT_GENERATOR_TYPE = "flat-world"
 DEFAULT_GENERATOR_VERSION = "1"
 DEFAULT_PROJECTION_TYPE = "flat-local-v1"
@@ -155,6 +194,14 @@ DEFAULT_SPAWN_Y = 2
 DEFAULT_SPAWN_Z = 0
 DEFAULT_SPAWN_YAW = 0.0
 DEFAULT_SPAWN_PITCH = 0.0
+DEFAULT_SPAWN_COORDINATE_SPACE = "local_block"
+EARTH_SPAWN_COORDINATE_SPACE = "local_metric"
+VALID_SPAWN_COORDINATE_SPACES = frozenset(
+    {
+        DEFAULT_SPAWN_COORDINATE_SPACE,
+        EARTH_SPAWN_COORDINATE_SPACE,
+    }
+)
 
 WORLD_ID_MAX_LENGTH = 96
 WORLD_SLUG_MAX_LENGTH = 120
@@ -177,6 +224,11 @@ WORLD_BLOCK_REGISTRY_VERSION_MAX_LENGTH = 64
 WORLD_USER_ID_MAX_LENGTH = 128
 WORLD_SOURCE_SERVICE_MAX_LENGTH = 96
 WORLD_EXTERNAL_REF_MAX_LENGTH = 128
+WORLD_GLOBAL_REFERENCE_FINGERPRINT_LENGTH = 64
+WORLD_GLOBAL_REFERENCE_REASON_MAX_LENGTH = 256
+WORLD_SPAWN_COORDINATE_SPACE_MAX_LENGTH = 32
+WORLD_PRECISE_COORDINATE_PRECISION = 50
+WORLD_PRECISE_COORDINATE_SCALE = 20
 
 PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -327,11 +379,7 @@ def is_provider_like_world_id(value: Any) -> bool:
     if not text:
         return False
 
-    return text in {
-        DEFAULT_TEMPLATE_ID,
-        DEFAULT_PROVIDER_ID,
-        DEFAULT_PROVIDER_WORLD_ID,
-    }
+    return text in PROVIDER_LIKE_WORLD_IDS
 
 
 def normalize_world_id(value: Any) -> str:
@@ -579,14 +627,19 @@ def normalize_float(
     field_name: str,
     default: float,
 ) -> float:
-    """Normalize float configuration values."""
+    """Normalize finite float configuration values."""
     if value is None:
         value = default
 
     try:
-        return float(value)
+        float_value = float(value)
     except Exception as exc:
         raise ValueError(f"{field_name} must be a number.") from exc
+
+    if not math.isfinite(float_value):
+        raise ValueError(f"{field_name} must be finite.")
+
+    return float_value
 
 
 def normalize_positive_float(
@@ -606,6 +659,215 @@ def normalize_positive_float(
         raise ValueError(f"{field_name} must be greater than zero.")
 
     return float_value
+
+
+
+def normalize_spawn_coordinate_space(
+    value: Any,
+    *,
+    default: str = DEFAULT_SPAWN_COORDINATE_SPACE,
+) -> str:
+    """Normalize the persisted spawn coordinate-space identifier."""
+    if value is None:
+        value = default
+
+    try:
+        coordinate_space = str(value).strip().lower()
+    except Exception as exc:
+        raise ValueError("spawn_coordinate_space must be text-like.") from exc
+
+    if coordinate_space not in VALID_SPAWN_COORDINATE_SPACES:
+        allowed = ", ".join(sorted(VALID_SPAWN_COORDINATE_SPACES))
+        raise ValueError(
+            f"Invalid spawn_coordinate_space '{value}'. Allowed: {allowed}."
+        )
+
+    return coordinate_space
+
+
+def normalize_decimal_coordinate(
+    value: Any,
+    *,
+    field_name: str,
+    required: bool = True,
+) -> Optional[Decimal]:
+    """Normalize a finite coordinate into a bounded Decimal."""
+    if value is None:
+        if required:
+            raise ValueError(f"{field_name} is required.")
+        return None
+
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite decimal number.")
+
+    try:
+        if isinstance(value, Decimal):
+            decimal_value = value
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite.")
+            decimal_value = Decimal(str(value))
+        else:
+            decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{field_name} must be a finite decimal number."
+        ) from exc
+
+    if not decimal_value.is_finite():
+        raise ValueError(f"{field_name} must be finite.")
+
+    if len(decimal_value.as_tuple().digits) > WORLD_PRECISE_COORDINATE_PRECISION:
+        raise ValueError(
+            f"{field_name} must not exceed "
+            f"{WORLD_PRECISE_COORDINATE_PRECISION} significant digits."
+        )
+
+    exponent = decimal_value.as_tuple().exponent
+    if exponent < -WORLD_PRECISE_COORDINATE_SCALE:
+        quantum = Decimal(1).scaleb(-WORLD_PRECISE_COORDINATE_SCALE)
+        decimal_value = decimal_value.quantize(quantum)
+
+    return decimal_value
+
+
+def decimal_to_plain_text(value: Optional[Decimal]) -> Optional[str]:
+    """Serialize Decimal values without exponent notation."""
+    if value is None:
+        return None
+
+    decimal_value = normalize_decimal_coordinate(
+        value,
+        field_name="decimal",
+    )
+    assert decimal_value is not None
+
+    if decimal_value == 0:
+        return "0"
+
+    text = format(decimal_value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def decimal_floor_to_int(value: Decimal, *, field_name: str) -> int:
+    """Return the containing integer block for a precise local coordinate."""
+    decimal_value = normalize_decimal_coordinate(
+        value,
+        field_name=field_name,
+    )
+    assert decimal_value is not None
+    return int(decimal_value.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def normalize_sha256(value: Any, *, field_name: str) -> str:
+    """Normalize a lowercase SHA-256 fingerprint."""
+    text = normalize_required_text(
+        value,
+        field_name=field_name,
+        max_length=WORLD_GLOBAL_REFERENCE_FINGERPRINT_LENGTH,
+    ).lower()
+
+    if len(text) != WORLD_GLOBAL_REFERENCE_FINGERPRINT_LENGTH or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(f"{field_name} must be a SHA-256 fingerprint.")
+
+    return text
+
+
+def normalize_reference_lock_reasons(value: Any) -> list[str]:
+    """Normalize persisted reference-lock reasons."""
+    if value is None:
+        return []
+
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
+        value,
+        Iterable,
+    ):
+        raise ValueError(
+            "global_reference_lock_reasons_json must be a list of strings."
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for index, item in enumerate(value):
+        reason = normalize_required_text(
+            item,
+            field_name=f"global_reference_lock_reasons[{index}]",
+            max_length=WORLD_GLOBAL_REFERENCE_REASON_MAX_LENGTH,
+        )
+        if reason in seen:
+            continue
+        seen.add(reason)
+        normalized.append(reason)
+
+    return normalized
+
+
+def _import_first_available(*module_names: str) -> Any:
+    """Import the first available module without hiding the final failure."""
+    last_error: Optional[BaseException] = None
+
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except (ImportError, ModuleNotFoundError) as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        f"Could not import any required module: {', '.join(module_names)}."
+    ) from last_error
+
+
+def coerce_global_reference(value: Any) -> Any:
+    """Coerce a mapping or contract object into GlobalReferencePoint."""
+    contracts = _import_first_available(
+        "src.georeferencing.contracts",
+        "georeferencing.contracts",
+    )
+    reference_type = getattr(contracts, "GlobalReferencePoint")
+
+    if isinstance(value, reference_type):
+        return value
+
+    if isinstance(value, Mapping):
+        return reference_type.from_mapping(value)
+
+    raise ValueError(
+        "global_reference must be a GlobalReferencePoint or JSON object."
+    )
+
+
+def normalize_global_reference_storage(
+    value: Any,
+) -> tuple[Dict[str, Any], str, int]:
+    """Return canonical JSON, fingerprint and frame revision."""
+    reference = coerce_global_reference(value)
+    payload = reference.to_persistence_dict()
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            "GlobalReferencePoint.to_persistence_dict() must return an object."
+        )
+
+    fingerprint = normalize_sha256(
+        reference.fingerprint,
+        field_name="global_reference_fingerprint",
+    )
+    revision = normalize_positive_int(
+        reference.reference_version,
+        field_name="coordinate_frame_revision",
+        default=1,
+    )
+
+    return (
+        normalize_metadata(payload),
+        fingerprint,
+        revision,
+    )
 
 
 def validate_vertical_bounds(*, min_y: int, surface_y: int, max_y: int) -> None:
@@ -923,6 +1185,40 @@ class WorldInstance(db.Model):
         default=DEFAULT_SPAWN_PITCH,
     )
 
+    spawn_coordinate_space = db.Column(
+        db.String(WORLD_SPAWN_COORDINATE_SPACE_MAX_LENGTH),
+        nullable=False,
+        default=DEFAULT_SPAWN_COORDINATE_SPACE,
+        index=True,
+    )
+
+    spawn_x_precise = db.Column(
+        db.Numeric(
+            WORLD_PRECISE_COORDINATE_PRECISION,
+            WORLD_PRECISE_COORDINATE_SCALE,
+            asdecimal=True,
+        ),
+        nullable=True,
+    )
+
+    spawn_y_precise = db.Column(
+        db.Numeric(
+            WORLD_PRECISE_COORDINATE_PRECISION,
+            WORLD_PRECISE_COORDINATE_SCALE,
+            asdecimal=True,
+        ),
+        nullable=True,
+    )
+
+    spawn_z_precise = db.Column(
+        db.Numeric(
+            WORLD_PRECISE_COORDINATE_PRECISION,
+            WORLD_PRECISE_COORDINATE_SCALE,
+            asdecimal=True,
+        ),
+        nullable=True,
+    )
+
     source_service = db.Column(
         db.String(WORLD_SOURCE_SERVICE_MAX_LENGTH),
         nullable=True,
@@ -951,6 +1247,46 @@ class WorldInstance(db.Model):
         JSON_COLUMN_TYPE,
         nullable=False,
         default=dict,
+    )
+
+    coordinate_frame_revision = db.Column(
+        db.Integer,
+        nullable=False,
+        default=0,
+    )
+
+    global_reference_json = db.Column(
+        NULLABLE_JSON_COLUMN_TYPE,
+        nullable=True,
+    )
+
+    global_reference_fingerprint = db.Column(
+        db.String(WORLD_GLOBAL_REFERENCE_FINGERPRINT_LENGTH),
+        nullable=True,
+        index=True,
+    )
+
+    global_reference_locked_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+
+    global_reference_lock_reasons_json = db.Column(
+        JSON_COLUMN_TYPE,
+        nullable=False,
+        default=list,
+    )
+
+    global_reference_updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=True,
+    )
+
+    global_reference_updated_by_user_id = db.Column(
+        db.String(WORLD_USER_ID_MAX_LENGTH),
+        nullable=True,
+        index=True,
     )
 
     created_at = db.Column(
@@ -1058,6 +1394,47 @@ class WorldInstance(db.Model):
             name="ck_world_instances_cell_size_positive",
         ),
         db.CheckConstraint(
+            "spawn_coordinate_space IN ('local_block', 'local_metric')",
+            name="ck_world_instances_spawn_coordinate_space_valid",
+        ),
+        db.CheckConstraint(
+            "("
+            "spawn_x_precise IS NULL AND "
+            "spawn_y_precise IS NULL AND "
+            "spawn_z_precise IS NULL"
+            ") OR ("
+            "spawn_x_precise IS NOT NULL AND "
+            "spawn_y_precise IS NOT NULL AND "
+            "spawn_z_precise IS NOT NULL"
+            ")",
+            name="ck_world_instances_precise_spawn_all_or_none",
+        ),
+        db.CheckConstraint(
+            "coordinate_frame_revision >= 0",
+            name="ck_world_instances_coordinate_frame_revision_nonnegative",
+        ),
+        db.CheckConstraint(
+            "("
+            "global_reference_json IS NULL AND "
+            "global_reference_fingerprint IS NULL AND "
+            "coordinate_frame_revision = 0"
+            ") OR ("
+            "global_reference_json IS NOT NULL AND "
+            "global_reference_fingerprint IS NOT NULL AND "
+            "coordinate_frame_revision >= 1"
+            ")",
+            name="ck_world_instances_global_reference_consistent",
+        ),
+        db.CheckConstraint(
+            "global_reference_locked_at IS NULL OR "
+            "global_reference_json IS NOT NULL",
+            name="ck_world_instances_reference_lock_requires_reference",
+        ),
+        db.CheckConstraint(
+            "provider_id <> 'earth' OR global_reference_json IS NOT NULL",
+            name="ck_world_instances_earth_requires_reference",
+        ),
+        db.CheckConstraint(
             "min_y <= surface_y",
             name="ck_world_instances_min_y_lte_surface_y",
         ),
@@ -1096,6 +1473,12 @@ class WorldInstance(db.Model):
             "ix_world_instances_source_external",
             "source_service",
             "external_ref",
+        ),
+        db.Index(
+            "ix_world_instances_reference_state",
+            "provider_id",
+            "global_reference_fingerprint",
+            "coordinate_frame_revision",
         ),
     )
 
@@ -1139,8 +1522,15 @@ class WorldInstance(db.Model):
         spawn_x: int = DEFAULT_SPAWN_X,
         spawn_y: int = DEFAULT_SPAWN_Y,
         spawn_z: int = DEFAULT_SPAWN_Z,
+        spawn_x_precise: Any = None,
+        spawn_y_precise: Any = None,
+        spawn_z_precise: Any = None,
+        spawn_coordinate_space: Optional[str] = None,
         spawn_yaw: float = DEFAULT_SPAWN_YAW,
         spawn_pitch: float = DEFAULT_SPAWN_PITCH,
+        global_reference: Any = None,
+        global_reference_locked_at: Optional[datetime] = None,
+        global_reference_lock_reasons: Optional[Iterable[str]] = None,
         source_service: Optional[str] = None,
         external_ref: Optional[str] = None,
         created_by_user_id: Optional[str] = None,
@@ -1149,6 +1539,9 @@ class WorldInstance(db.Model):
     ) -> "WorldInstance":
         """
         Create a WorldInstance without adding it to a session.
+
+        Earth instances must provide exactly one global reference contract.
+        Flat instances remain unchanged and do not carry a global reference.
 
         Repository/service code is responsible for:
         - checking project/universe existence,
@@ -1164,6 +1557,12 @@ class WorldInstance(db.Model):
         normalized_universe_db_id = normalize_db_id(
             universe_db_id,
             field_name="universe_db_id",
+        )
+
+        normalized_template_id = normalize_template_id(template_id)
+        normalized_provider_id = normalize_provider_id(provider_id)
+        normalized_provider_world_id = normalize_provider_world_id(
+            provider_world_id
         )
 
         public_world_id = normalize_concrete_world_id(
@@ -1210,9 +1609,205 @@ class WorldInstance(db.Model):
             max_y=normalized_max_y,
         )
 
+        is_earth_provider = normalized_provider_id == EARTH_PROVIDER_ID
+
+        if is_earth_provider:
+            if (
+                normalized_template_id != EARTH_TEMPLATE_ID
+                or normalized_provider_world_id
+                != EARTH_PROVIDER_WORLD_ID
+            ):
+                raise ValueError(
+                    "Earth worlds require template_id, provider_id and "
+                    "provider_world_id to all be 'earth'."
+                )
+            if global_reference is None:
+                raise ValueError(
+                    "Earth worlds require exactly one global_reference."
+                )
+
+            earth_contract_values = {
+                "generator_type": (
+                    normalize_required_text(
+                        generator_type,
+                        field_name="generator_type",
+                        max_length=WORLD_GENERATOR_TYPE_MAX_LENGTH,
+                    ),
+                    EARTH_GENERATOR_TYPE,
+                ),
+                "generator_version": (
+                    normalize_version_text(
+                        generator_version,
+                        field_name="generator_version",
+                        max_length=WORLD_GENERATOR_VERSION_MAX_LENGTH,
+                        default=EARTH_GENERATOR_VERSION,
+                    ),
+                    EARTH_GENERATOR_VERSION,
+                ),
+                "projection_type": (
+                    normalize_required_text(
+                        projection_type,
+                        field_name="projection_type",
+                        max_length=WORLD_PROJECTION_TYPE_MAX_LENGTH,
+                    ),
+                    EARTH_PROJECTION_TYPE,
+                ),
+                "topology_type": (
+                    normalize_required_text(
+                        topology_type,
+                        field_name="topology_type",
+                        max_length=WORLD_TOPOLOGY_TYPE_MAX_LENGTH,
+                    ),
+                    EARTH_TOPOLOGY_TYPE,
+                ),
+                "coordinate_system": (
+                    normalize_required_text(
+                        coordinate_system,
+                        field_name="coordinate_system",
+                        max_length=WORLD_COORDINATE_SYSTEM_MAX_LENGTH,
+                    ),
+                    EARTH_COORDINATE_SYSTEM,
+                ),
+                "chunk_size": (
+                    normalized_chunk_size,
+                    DEFAULT_CHUNK_SIZE,
+                ),
+                "cell_size": (
+                    normalized_cell_size,
+                    DEFAULT_CELL_SIZE,
+                ),
+            }
+            mismatches = {
+                field_name: {
+                    "actual": actual,
+                    "expected": expected,
+                }
+                for field_name, (actual, expected)
+                in earth_contract_values.items()
+                if actual != expected
+            }
+            if mismatches:
+                raise ValueError(
+                    "Earth worlds must use the fixed Earth-v1 provider, "
+                    f"geometry and grid contract: {mismatches}."
+                )
+        elif global_reference is not None:
+            raise ValueError(
+                "global_reference is only supported for the earth provider."
+            )
+
+        default_spawn_space = (
+            EARTH_SPAWN_COORDINATE_SPACE
+            if is_earth_provider
+            else DEFAULT_SPAWN_COORDINATE_SPACE
+        )
+        normalized_spawn_space = normalize_spawn_coordinate_space(
+            spawn_coordinate_space,
+            default=default_spawn_space,
+        )
+        if (
+            is_earth_provider
+            and normalized_spawn_space
+            != EARTH_SPAWN_COORDINATE_SPACE
+        ):
+            raise ValueError(
+                "Earth spawn must be persisted in local_metric coordinates."
+            )
+
+        precise_values = (
+            spawn_x_precise,
+            spawn_y_precise,
+            spawn_z_precise,
+        )
+        any_precise = any(value is not None for value in precise_values)
+        all_precise = all(value is not None for value in precise_values)
+
+        if any_precise and not all_precise:
+            raise ValueError(
+                "spawn_x_precise, spawn_y_precise and spawn_z_precise "
+                "must be provided together."
+            )
+
+        if is_earth_provider and not any_precise:
+            reference = coerce_global_reference(global_reference)
+            provider_module = _import_first_available(
+                "src.world.earth.provider",
+                "world.earth.provider",
+            )
+            validator_module = _import_first_available(
+                "src.world.earth.validator",
+                "world.earth.validator",
+            )
+            definition = validator_module.load_earth_world_definition()
+            provider = provider_module.get_earth_world_provider(
+                public_world_id,
+                reference,
+                definition=definition,
+            )
+            default_spawn = provider.default_spawn_position()
+            spawn_x_precise = default_spawn.x
+            spawn_y_precise = default_spawn.y
+            spawn_z_precise = default_spawn.z
+            any_precise = True
+            all_precise = True
+
+        normalized_spawn_x = normalize_int(
+            spawn_x,
+            field_name="spawn_x",
+            default=DEFAULT_SPAWN_X,
+        )
+        normalized_spawn_y = normalize_int(
+            spawn_y,
+            field_name="spawn_y",
+            default=DEFAULT_SPAWN_Y,
+        )
+        normalized_spawn_z = normalize_int(
+            spawn_z,
+            field_name="spawn_z",
+            default=DEFAULT_SPAWN_Z,
+        )
+
+        normalized_spawn_x_precise: Optional[Decimal] = None
+        normalized_spawn_y_precise: Optional[Decimal] = None
+        normalized_spawn_z_precise: Optional[Decimal] = None
+
+        if all_precise:
+            normalized_spawn_x_precise = normalize_decimal_coordinate(
+                spawn_x_precise,
+                field_name="spawn_x_precise",
+            )
+            normalized_spawn_y_precise = normalize_decimal_coordinate(
+                spawn_y_precise,
+                field_name="spawn_y_precise",
+            )
+            normalized_spawn_z_precise = normalize_decimal_coordinate(
+                spawn_z_precise,
+                field_name="spawn_z_precise",
+            )
+            assert normalized_spawn_x_precise is not None
+            assert normalized_spawn_y_precise is not None
+            assert normalized_spawn_z_precise is not None
+
+            normalized_spawn_x = decimal_floor_to_int(
+                normalized_spawn_x_precise,
+                field_name="spawn_x_precise",
+            )
+            normalized_spawn_y = decimal_floor_to_int(
+                normalized_spawn_y_precise,
+                field_name="spawn_y_precise",
+            )
+            normalized_spawn_z = decimal_floor_to_int(
+                normalized_spawn_z_precise,
+                field_name="spawn_z_precise",
+            )
+        elif normalized_spawn_space == EARTH_SPAWN_COORDINATE_SPACE:
+            normalized_spawn_x_precise = Decimal(normalized_spawn_x)
+            normalized_spawn_y_precise = Decimal(normalized_spawn_y)
+            normalized_spawn_z_precise = Decimal(normalized_spawn_z)
+
         now = utc_now()
 
-        return cls(
+        instance = cls(
             project_db_id=normalized_project_db_id,
             universe_db_id=normalized_universe_db_id,
             world_id=public_world_id,
@@ -1229,9 +1824,9 @@ class WorldInstance(db.Model):
             world_type=normalize_world_type(world_type),
             world_role=normalize_world_role(world_role),
             world_scope=normalize_world_scope(world_scope),
-            template_id=normalize_template_id(template_id),
-            provider_id=normalize_provider_id(provider_id),
-            provider_world_id=normalize_provider_world_id(provider_world_id),
+            template_id=normalized_template_id,
+            provider_id=normalized_provider_id,
+            provider_world_id=normalized_provider_world_id,
             generator_type=normalize_required_text(
                 generator_type,
                 field_name="generator_type",
@@ -1279,21 +1874,13 @@ class WorldInstance(db.Model):
                 max_length=WORLD_BLOCK_REGISTRY_VERSION_MAX_LENGTH,
                 default=DEFAULT_BLOCK_REGISTRY_VERSION,
             ),
-            spawn_x=normalize_int(
-                spawn_x,
-                field_name="spawn_x",
-                default=DEFAULT_SPAWN_X,
-            ),
-            spawn_y=normalize_int(
-                spawn_y,
-                field_name="spawn_y",
-                default=DEFAULT_SPAWN_Y,
-            ),
-            spawn_z=normalize_int(
-                spawn_z,
-                field_name="spawn_z",
-                default=DEFAULT_SPAWN_Z,
-            ),
+            spawn_x=normalized_spawn_x,
+            spawn_y=normalized_spawn_y,
+            spawn_z=normalized_spawn_z,
+            spawn_x_precise=normalized_spawn_x_precise,
+            spawn_y_precise=normalized_spawn_y_precise,
+            spawn_z_precise=normalized_spawn_z_precise,
+            spawn_coordinate_space=normalized_spawn_space,
             spawn_yaw=normalize_float(
                 spawn_yaw,
                 field_name="spawn_yaw",
@@ -1304,6 +1891,13 @@ class WorldInstance(db.Model):
                 field_name="spawn_pitch",
                 default=DEFAULT_SPAWN_PITCH,
             ),
+            coordinate_frame_revision=0,
+            global_reference_json=None,
+            global_reference_fingerprint=None,
+            global_reference_locked_at=None,
+            global_reference_lock_reasons_json=[],
+            global_reference_updated_at=None,
+            global_reference_updated_by_user_id=None,
             source_service=normalize_optional_text(
                 source_service,
                 field_name="source_service",
@@ -1327,9 +1921,40 @@ class WorldInstance(db.Model):
             metadata_json=normalize_metadata(metadata_json),
             created_at=now,
             updated_at=now,
-            archived_at=now if normalized_status == WORLD_STATUS_ARCHIVED else None,
-            deleted_at=now if normalized_status == WORLD_STATUS_DELETED else None,
+            archived_at=(
+                now
+                if normalized_status == WORLD_STATUS_ARCHIVED
+                else None
+            ),
+            deleted_at=(
+                now
+                if normalized_status == WORLD_STATUS_DELETED
+                else None
+            ),
         )
+
+        if global_reference is not None:
+            instance.set_global_reference(
+                global_reference,
+                allow_replace=False,
+                updated_by_user_id=created_by_user_id,
+                touch=False,
+            )
+
+        if global_reference_locked_at is not None:
+            if not instance.has_global_reference:
+                raise ValueError(
+                    "global_reference_locked_at requires global_reference."
+                )
+            instance.global_reference_locked_at = global_reference_locked_at
+            instance.global_reference_lock_reasons_json = (
+                normalize_reference_lock_reasons(
+                    global_reference_lock_reasons
+                )
+            )
+
+        return instance
+
 
     @classmethod
     def create_flat_spawn(
@@ -1412,6 +2037,163 @@ class WorldInstance(db.Model):
             created_by_user_id=created_by_user_id,
             metadata_json=merged_metadata,
         )
+
+    @classmethod
+    def create_earth_spawn(
+        cls,
+        *,
+        global_reference: Any,
+        project: Any = None,
+        universe: Any = None,
+        project_db_id: Optional[int] = None,
+        universe_db_id: Optional[int] = None,
+        world_id: str = DEFAULT_WORLD_ID,
+        slug: str = DEFAULT_WORLD_SLUG,
+        name: str = EARTH_WORLD_NAME,
+        created_by_user_id: Optional[str] = None,
+        metadata_json: Optional[Mapping[str, Any]] = None,
+        source_service: Optional[str] = "vectoplan-chunk-bootstrap",
+        external_ref: Optional[str] = None,
+        block_registry_id: str = DEFAULT_BLOCK_REGISTRY_ID,
+        block_registry_version: str = DEFAULT_BLOCK_REGISTRY_VERSION,
+        spawn_yaw: float = DEFAULT_SPAWN_YAW,
+        spawn_pitch: float = DEFAULT_SPAWN_PITCH,
+    ) -> "WorldInstance":
+        """
+        Create a concrete Earth spawn world without adding it to a session.
+
+        The global reference is validated through the Earth provider stack.
+        The default spawn is then derived from that exact reference and stored
+        locally in ``local_metric`` coordinates. No global spawn coordinate is
+        persisted.
+        """
+        resolved_project_db_id, resolved_universe_db_id = (
+            _resolve_project_universe_db_ids(
+                project=project,
+                universe=universe,
+                project_db_id=project_db_id,
+                universe_db_id=universe_db_id,
+            )
+        )
+
+        concrete_world_id = normalize_concrete_world_id(
+            world_id or DEFAULT_WORLD_ID,
+            default=DEFAULT_WORLD_ID,
+        )
+        reference = coerce_global_reference(global_reference)
+
+        provider_module = _import_first_available(
+            "src.world.earth.provider",
+            "world.earth.provider",
+        )
+        validator_module = _import_first_available(
+            "src.world.earth.validator",
+            "world.earth.validator",
+        )
+
+        definition = validator_module.load_earth_world_definition()
+        provider = provider_module.get_earth_world_provider(
+            concrete_world_id,
+            reference,
+            definition=definition,
+        )
+        default_spawn = provider.default_spawn_position()
+
+        merged_metadata = normalize_metadata(metadata_json)
+        merged_metadata.setdefault(
+            "schemaVersion",
+            WORLD_INSTANCE_SCHEMA_VERSION,
+        )
+        merged_metadata.setdefault(
+            "seededBy",
+            "WorldInstance.create_earth_spawn",
+        )
+        merged_metadata.setdefault("chunkWorldId", concrete_world_id)
+        merged_metadata.setdefault("templateId", EARTH_TEMPLATE_ID)
+        merged_metadata.setdefault("providerId", EARTH_PROVIDER_ID)
+        merged_metadata.setdefault(
+            "providerWorldId",
+            EARTH_PROVIDER_WORLD_ID,
+        )
+        merged_metadata.setdefault(
+            "globalReferenceFingerprint",
+            reference.fingerprint,
+        )
+        merged_metadata.setdefault(
+            "coordinateFrameRevision",
+            reference.reference_version,
+        )
+        merged_metadata.setdefault("earthGridId", reference.grid.grid_id)
+        merged_metadata.setdefault(
+            "earthGridVersion",
+            reference.grid.grid_version,
+        )
+        merged_metadata.setdefault(
+            "spawnCoordinateSpace",
+            EARTH_SPAWN_COORDINATE_SPACE,
+        )
+
+        return cls.create(
+            project_db_id=resolved_project_db_id,
+            universe_db_id=resolved_universe_db_id,
+            world_id=concrete_world_id,
+            slug=slug,
+            name=name,
+            status=WORLD_STATUS_ACTIVE,
+            world_type=WORLD_TYPE_RUNTIME,
+            world_role=WORLD_ROLE_DEFAULT_SPAWN,
+            world_scope=WORLD_SCOPE_PROJECT,
+            template_id=EARTH_TEMPLATE_ID,
+            provider_id=EARTH_PROVIDER_ID,
+            provider_world_id=EARTH_PROVIDER_WORLD_ID,
+            generator_type=EARTH_GENERATOR_TYPE,
+            generator_version=EARTH_GENERATOR_VERSION,
+            projection_type=EARTH_PROJECTION_TYPE,
+            topology_type=EARTH_TOPOLOGY_TYPE,
+            coordinate_system=EARTH_COORDINATE_SYSTEM,
+            chunk_size=definition.chunk.size,
+            cell_size=float(
+                definition.grid.vertical_meters_per_cell
+            ),
+            surface_y=DEFAULT_SURFACE_Y,
+            min_y=DEFAULT_MIN_Y,
+            max_y=DEFAULT_MAX_Y,
+            block_registry_id=block_registry_id,
+            block_registry_version=block_registry_version,
+            spawn_x=decimal_floor_to_int(
+                normalize_decimal_coordinate(
+                    default_spawn.x,
+                    field_name="default_spawn.x",
+                ),
+                field_name="default_spawn.x",
+            ),
+            spawn_y=decimal_floor_to_int(
+                normalize_decimal_coordinate(
+                    default_spawn.y,
+                    field_name="default_spawn.y",
+                ),
+                field_name="default_spawn.y",
+            ),
+            spawn_z=decimal_floor_to_int(
+                normalize_decimal_coordinate(
+                    default_spawn.z,
+                    field_name="default_spawn.z",
+                ),
+                field_name="default_spawn.z",
+            ),
+            spawn_x_precise=default_spawn.x,
+            spawn_y_precise=default_spawn.y,
+            spawn_z_precise=default_spawn.z,
+            spawn_coordinate_space=EARTH_SPAWN_COORDINATE_SPACE,
+            spawn_yaw=spawn_yaw,
+            spawn_pitch=spawn_pitch,
+            global_reference=reference,
+            source_service=source_service,
+            external_ref=external_ref or concrete_world_id,
+            created_by_user_id=created_by_user_id,
+            metadata_json=merged_metadata,
+        )
+
 
     @classmethod
     def create_for_universe(
@@ -1500,13 +2282,34 @@ class WorldInstance(db.Model):
         - blockRegistryId / block_registry_id
         - blockRegistryVersion / block_registry_version
         - spawn / spawnX/spawnY/spawnZ/spawnYaw/spawnPitch
+        - spawnCoordinateSpace / precise spawn coordinates
+        - globalReference / global_reference
         - metadata / metadataJson / metadata_json
         """
         if not isinstance(payload, Mapping):
             raise ValueError("World create payload must be a JSON object.")
 
         metadata_value = _payload_metadata_value(payload)
-        spawn = payload.get("spawn") if isinstance(payload.get("spawn"), Mapping) else {}
+        spawn = (
+            payload.get("spawn")
+            if isinstance(payload.get("spawn"), Mapping)
+            else {}
+        )
+        global_reference = _payload_get(
+            payload,
+            "globalReference",
+            "global_reference",
+        )
+        spawn_coordinate_space = _payload_get(
+            spawn,
+            "coordinateSpace",
+            "coordinate_space",
+            default=_payload_get(
+                payload,
+                "spawnCoordinateSpace",
+                "spawn_coordinate_space",
+            ),
+        )
 
         raw_world_id = (
             payload.get("chunkWorldId")
@@ -1514,6 +2317,60 @@ class WorldInstance(db.Model):
             or payload.get("worldId")
             or payload.get("world_id")
         )
+
+        requested_provider_id = normalize_provider_id(
+            _payload_get(
+                payload,
+                "providerId",
+                "provider_id",
+                default=DEFAULT_PROVIDER_ID,
+            )
+        )
+        earth_requested = requested_provider_id == EARTH_PROVIDER_ID
+
+        provider_defaults = {
+            "template_id": (
+                EARTH_TEMPLATE_ID
+                if earth_requested
+                else DEFAULT_TEMPLATE_ID
+            ),
+            "provider_id": requested_provider_id,
+            "provider_world_id": (
+                EARTH_PROVIDER_WORLD_ID
+                if earth_requested
+                else DEFAULT_PROVIDER_WORLD_ID
+            ),
+            "generator_type": (
+                EARTH_GENERATOR_TYPE
+                if earth_requested
+                else DEFAULT_GENERATOR_TYPE
+            ),
+            "generator_version": (
+                EARTH_GENERATOR_VERSION
+                if earth_requested
+                else DEFAULT_GENERATOR_VERSION
+            ),
+            "projection_type": (
+                EARTH_PROJECTION_TYPE
+                if earth_requested
+                else DEFAULT_PROJECTION_TYPE
+            ),
+            "topology_type": (
+                EARTH_TOPOLOGY_TYPE
+                if earth_requested
+                else DEFAULT_TOPOLOGY_TYPE
+            ),
+            "coordinate_system": (
+                EARTH_COORDINATE_SYSTEM
+                if earth_requested
+                else DEFAULT_COORDINATE_SYSTEM
+            ),
+            "spawn_coordinate_space": (
+                EARTH_SPAWN_COORDINATE_SPACE
+                if earth_requested
+                else DEFAULT_SPAWN_COORDINATE_SPACE
+            ),
+        }
 
         return cls.create(
             project_db_id=project_db_id,
@@ -1525,14 +2382,14 @@ class WorldInstance(db.Model):
             world_type=payload.get("worldType") or payload.get("world_type") or WORLD_TYPE_RUNTIME,
             world_role=payload.get("worldRole") or payload.get("world_role") or WORLD_ROLE_DEFAULT_SPAWN,
             world_scope=payload.get("worldScope") or payload.get("world_scope") or WORLD_SCOPE_PROJECT,
-            template_id=payload.get("templateId") or payload.get("template_id") or DEFAULT_TEMPLATE_ID,
-            provider_id=payload.get("providerId") or payload.get("provider_id") or DEFAULT_PROVIDER_ID,
-            provider_world_id=payload.get("providerWorldId") or payload.get("provider_world_id") or DEFAULT_PROVIDER_WORLD_ID,
-            generator_type=payload.get("generatorType") or payload.get("generator_type") or DEFAULT_GENERATOR_TYPE,
-            generator_version=payload.get("generatorVersion") or payload.get("generator_version") or DEFAULT_GENERATOR_VERSION,
-            projection_type=payload.get("projectionType") or payload.get("projection_type") or DEFAULT_PROJECTION_TYPE,
-            topology_type=payload.get("topologyType") or payload.get("topology_type") or DEFAULT_TOPOLOGY_TYPE,
-            coordinate_system=payload.get("coordinateSystem") or payload.get("coordinate_system") or DEFAULT_COORDINATE_SYSTEM,
+            template_id=payload.get("templateId") or payload.get("template_id") or provider_defaults["template_id"],
+            provider_id=requested_provider_id,
+            provider_world_id=payload.get("providerWorldId") or payload.get("provider_world_id") or provider_defaults["provider_world_id"],
+            generator_type=payload.get("generatorType") or payload.get("generator_type") or provider_defaults["generator_type"],
+            generator_version=payload.get("generatorVersion") or payload.get("generator_version") or provider_defaults["generator_version"],
+            projection_type=payload.get("projectionType") or payload.get("projection_type") or provider_defaults["projection_type"],
+            topology_type=payload.get("topologyType") or payload.get("topology_type") or provider_defaults["topology_type"],
+            coordinate_system=payload.get("coordinateSystem") or payload.get("coordinate_system") or provider_defaults["coordinate_system"],
             chunk_size=payload.get("chunkSize") or payload.get("chunk_size") or DEFAULT_CHUNK_SIZE,
             cell_size=payload.get("cellSize") or payload.get("cell_size") or DEFAULT_CELL_SIZE,
             surface_y=payload.get("surfaceY") if "surfaceY" in payload else payload.get("surface_y", DEFAULT_SURFACE_Y),
@@ -1544,10 +2401,45 @@ class WorldInstance(db.Model):
             spawn_x=payload.get("spawnX") if "spawnX" in payload else payload.get("spawn_x", spawn.get("x", DEFAULT_SPAWN_X)),
             spawn_y=payload.get("spawnY") if "spawnY" in payload else payload.get("spawn_y", spawn.get("y", DEFAULT_SPAWN_Y)),
             spawn_z=payload.get("spawnZ") if "spawnZ" in payload else payload.get("spawn_z", spawn.get("z", DEFAULT_SPAWN_Z)),
+            spawn_x_precise=_payload_get(
+                spawn,
+                "preciseX",
+                "xPrecise",
+                default=_payload_get(
+                    payload,
+                    "spawnXPrecise",
+                    "spawn_x_precise",
+                ),
+            ),
+            spawn_y_precise=_payload_get(
+                spawn,
+                "preciseY",
+                "yPrecise",
+                default=_payload_get(
+                    payload,
+                    "spawnYPrecise",
+                    "spawn_y_precise",
+                ),
+            ),
+            spawn_z_precise=_payload_get(
+                spawn,
+                "preciseZ",
+                "zPrecise",
+                default=_payload_get(
+                    payload,
+                    "spawnZPrecise",
+                    "spawn_z_precise",
+                ),
+            ),
+            spawn_coordinate_space=(
+                spawn_coordinate_space
+                or provider_defaults["spawn_coordinate_space"]
+            ),
             spawn_yaw=payload.get("spawnYaw") if "spawnYaw" in payload else payload.get("spawn_yaw", spawn.get("yaw", DEFAULT_SPAWN_YAW)),
             spawn_pitch=payload.get("spawnPitch") if "spawnPitch" in payload else payload.get("spawn_pitch", spawn.get("pitch", DEFAULT_SPAWN_PITCH)),
             source_service=payload.get("sourceService") or payload.get("source_service"),
             external_ref=payload.get("externalRef") or payload.get("external_ref"),
+            global_reference=global_reference,
             created_by_user_id=created_by_user_id,
             metadata_json=metadata_value,
         )
@@ -1565,8 +2457,30 @@ class WorldInstance(db.Model):
         return self.status == WORLD_STATUS_DELETED or self.deleted_at is not None
 
     @property
+    def is_earth_world(self) -> bool:
+        """Return whether this concrete world uses the Earth provider."""
+        return (
+            str(self.provider_id or "").strip().lower()
+            == EARTH_PROVIDER_ID
+        )
+
+    @property
+    def has_global_reference(self) -> bool:
+        """Return whether a complete global reference contract is stored."""
+        return bool(
+            self.global_reference_json
+            and self.global_reference_fingerprint
+            and int(self.coordinate_frame_revision or 0) >= 1
+        )
+
+    @property
+    def is_global_reference_locked(self) -> bool:
+        """Return whether normal reference replacement is forbidden."""
+        return self.global_reference_locked_at is not None
+
+    @property
     def project_public_id(self) -> Optional[str]:
-        """Return the parent project's public id if the relationship is available."""
+        """Return the parent project's public id if available."""
         try:
             project = getattr(self, "project", None)
             return getattr(project, "project_id", None)
@@ -1575,7 +2489,7 @@ class WorldInstance(db.Model):
 
     @property
     def universe_public_id(self) -> Optional[str]:
-        """Return the parent universe's public id if the relationship is available."""
+        """Return the parent universe's public id if available."""
         try:
             universe = getattr(self, "universe", None)
             return getattr(universe, "universe_id", None)
@@ -1609,6 +2523,11 @@ class WorldInstance(db.Model):
             "surfaceY": self.surface_y,
             "minY": self.min_y,
             "maxY": self.max_y,
+            "coordinateFrameRevision": int(
+                self.coordinate_frame_revision or 0
+            ),
+            "globalReferenceRequired": self.is_earth_world,
+            "globalReferencePresent": self.has_global_reference,
         }
 
     @property
@@ -1632,11 +2551,48 @@ class WorldInstance(db.Model):
 
     @property
     def spawn_position(self) -> Dict[str, int]:
-        """Return spawn position."""
+        """Return the legacy containing-block spawn position."""
         return {
             "x": int(self.spawn_x),
             "y": int(self.spawn_y),
             "z": int(self.spawn_z),
+        }
+
+    @property
+    def spawn_precise_position(self) -> Dict[str, Optional[str]]:
+        """Return the precise local spawn as decimal strings."""
+        precise_values = (
+            self.spawn_x_precise,
+            self.spawn_y_precise,
+            self.spawn_z_precise,
+        )
+
+        if all(value is None for value in precise_values):
+            return {
+                "x": str(int(self.spawn_x)),
+                "y": str(int(self.spawn_y)),
+                "z": str(int(self.spawn_z)),
+            }
+
+        if any(value is None for value in precise_values):
+            raise ValueError(
+                "Precise spawn coordinates must be all null or all populated."
+            )
+
+        return {
+            "x": decimal_to_plain_text(self.spawn_x_precise),
+            "y": decimal_to_plain_text(self.spawn_y_precise),
+            "z": decimal_to_plain_text(self.spawn_z_precise),
+        }
+
+    @property
+    def spawn_metric_position(self) -> Dict[str, float]:
+        """Return the precise local spawn as metric floats."""
+        position = self.spawn_precise_position
+        return {
+            "x": float(position["x"]),
+            "y": float(position["y"]),
+            "z": float(position["z"]),
         }
 
     @property
@@ -1649,11 +2605,137 @@ class WorldInstance(db.Model):
 
     @property
     def spawn_context(self) -> Dict[str, Any]:
-        """Return combined spawn context."""
+        """Return combined local spawn context."""
         return {
+            "coordinateSpace": normalize_spawn_coordinate_space(
+                self.spawn_coordinate_space,
+                default=(
+                    EARTH_SPAWN_COORDINATE_SPACE
+                    if self.is_earth_world
+                    else DEFAULT_SPAWN_COORDINATE_SPACE
+                ),
+            ),
             "position": self.spawn_position,
+            "precisePosition": self.spawn_precise_position,
+            "metricPosition": self.spawn_metric_position,
             "rotation": self.spawn_rotation,
+            "globalReferenceChanged": False,
+            "worldReanchored": False,
         }
+
+    def get_global_reference_point(self) -> Any:
+        """Return the validated GlobalReferencePoint contract."""
+        if not self.has_global_reference:
+            return None
+
+        reference = coerce_global_reference(
+            normalize_metadata(self.global_reference_json)
+        )
+        expected_fingerprint = normalize_sha256(
+            self.global_reference_fingerprint,
+            field_name="global_reference_fingerprint",
+        )
+
+        if reference.fingerprint != expected_fingerprint:
+            raise ValueError(
+                "Stored global reference fingerprint does not match payload."
+            )
+
+        if (
+            int(reference.reference_version)
+            != int(self.coordinate_frame_revision)
+        ):
+            raise ValueError(
+                "Stored global reference revision does not match "
+                "coordinate_frame_revision."
+            )
+
+        return reference
+
+    def global_reference_context(
+        self,
+        *,
+        include_crs_definition: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the safe global reference API context."""
+        reference = self.get_global_reference_point()
+        if reference is None:
+            return None
+
+        payload = reference.to_dict(
+            include_crs_definition=include_crs_definition,
+            numeric_coordinates=False,
+        )
+        payload["locked"] = self.is_global_reference_locked
+        payload["lockedAt"] = datetime_to_iso(
+            self.global_reference_locked_at
+        )
+        payload["lockReasons"] = normalize_reference_lock_reasons(
+            self.global_reference_lock_reasons_json
+        )
+        payload["updatedAt"] = datetime_to_iso(
+            self.global_reference_updated_at
+        )
+        payload["updatedByUserId"] = (
+            self.global_reference_updated_by_user_id
+        )
+        return payload
+
+    @property
+    def coordinate_frame_context(self) -> Dict[str, Any]:
+        """Return stable coordinate-frame metadata."""
+        reference = self.get_global_reference_point()
+        grid_context = None
+
+        if reference is not None:
+            grid_context = reference.grid.to_dict()
+
+        return {
+            "revision": int(self.coordinate_frame_revision or 0),
+            "referencePresent": reference is not None,
+            "referenceFingerprint": (
+                self.global_reference_fingerprint
+            ),
+            "referenceLocked": self.is_global_reference_locked,
+            "referenceLockedAt": datetime_to_iso(
+                self.global_reference_locked_at
+            ),
+            "referenceLockReasons": normalize_reference_lock_reasons(
+                self.global_reference_lock_reasons_json
+            ),
+            "grid": grid_context,
+            "persistedEntityCoordinates": "local",
+            "derivedGlobalCoordinatesPersistedPerEntity": False,
+        }
+
+    def build_earth_provider(self) -> Any:
+        """Build or retrieve the runtime Earth provider for this instance."""
+        if not self.is_earth_world:
+            raise ValueError(
+                "Only earth worlds have an EarthWorldProvider."
+            )
+
+        reference = self.get_global_reference_point()
+        if reference is None:
+            raise ValueError(
+                "Earth world is missing its global reference."
+            )
+
+        provider_module = _import_first_available(
+            "src.world.earth.provider",
+            "world.earth.provider",
+        )
+        validator_module = _import_first_available(
+            "src.world.earth.validator",
+            "world.earth.validator",
+        )
+        definition = validator_module.load_earth_world_definition()
+
+        return provider_module.get_earth_world_provider(
+            self.world_id,
+            reference,
+            definition=definition,
+        )
 
     def build_world_context_key(self) -> str:
         """Build a stable debug/context key for logs and traces."""
@@ -1675,6 +2757,13 @@ class WorldInstance(db.Model):
             "chunks": f"{prefix}/projects/{project_id}/worlds/{world_id}/chunks",
             "chunksBatch": f"{prefix}/projects/{project_id}/worlds/{world_id}/chunks/batch",
             "commands": f"{prefix}/projects/{project_id}/worlds/{world_id}/commands",
+            "globalReference": (
+                f"{prefix}/projects/{project_id}/worlds/{world_id}/global-reference"
+            ),
+            "coordinateTransforms": (
+                f"{prefix}/projects/{project_id}/worlds/{world_id}/coordinates"
+            ),
+            "spawn": f"{prefix}/projects/{project_id}/worlds/{world_id}/spawn",
         }
 
     def touch(self, *, updated_by_user_id: Optional[str] = None) -> None:
@@ -1697,6 +2786,284 @@ class WorldInstance(db.Model):
             raise ValueError(
                 f"World '{self.world_id}' is deleted and cannot be modified."
             )
+
+    def ensure_global_reference_mutable(self) -> None:
+        """Raise when the Earth reference may no longer be replaced."""
+        self.ensure_not_deleted()
+
+        if not self.is_earth_world:
+            raise ValueError(
+                "Global references are only supported for earth worlds."
+            )
+
+        if self.is_global_reference_locked:
+            reasons = ", ".join(
+                normalize_reference_lock_reasons(
+                    self.global_reference_lock_reasons_json
+                )
+            )
+            suffix = f" Reasons: {reasons}." if reasons else ""
+            raise ValueError(
+                f"Global reference for world '{self.world_id}' is locked."
+                f"{suffix}"
+            )
+
+    def set_global_reference(
+        self,
+        global_reference: Any,
+        *,
+        allow_replace: bool = False,
+        updated_by_user_id: Optional[str] = None,
+        touch: bool = True,
+    ) -> bool:
+        """
+        Persist the one global reference contract of an Earth world.
+
+        Returns ``True`` when state changed and ``False`` for an idempotent
+        identical reference.
+        """
+        self.ensure_not_deleted()
+
+        if not self.is_earth_world:
+            raise ValueError(
+                "global_reference can only be set for the earth provider."
+            )
+
+        reference = coerce_global_reference(global_reference)
+        payload, fingerprint, frame_revision = (
+            normalize_global_reference_storage(reference)
+        )
+
+        if reference.grid.grid_id != EARTH_GRID_ID:
+            raise ValueError(
+                f"Earth reference grid_id must be '{EARTH_GRID_ID}'."
+            )
+        if reference.grid.grid_version != EARTH_GRID_VERSION:
+            raise ValueError(
+                f"Earth reference grid_version must be '{EARTH_GRID_VERSION}'."
+            )
+        if reference.grid.projection_id != EARTH_PROJECTION_TYPE:
+            raise ValueError(
+                "Earth reference projection does not match world geometry."
+            )
+        if reference.grid.topology_type != EARTH_TOPOLOGY_TYPE:
+            raise ValueError(
+                "Earth reference topology does not match world geometry."
+            )
+
+        if self.has_global_reference:
+            current_fingerprint = normalize_sha256(
+                self.global_reference_fingerprint,
+                field_name="global_reference_fingerprint",
+            )
+
+            if current_fingerprint == fingerprint:
+                # Canonicalize old JSON without changing optimistic revision.
+                self.global_reference_json = payload
+                return False
+
+            self.ensure_global_reference_mutable()
+
+            if not allow_replace:
+                raise ValueError(
+                    "A different global reference already exists. "
+                    "Use the dedicated pre-materialization replacement path."
+                )
+
+            current_revision = int(self.coordinate_frame_revision or 0)
+            if frame_revision <= current_revision:
+                raise ValueError(
+                    "Replacement global reference revision must be greater "
+                    "than the current coordinate frame revision."
+                )
+
+        self.global_reference_json = payload
+        self.global_reference_fingerprint = fingerprint
+        self.coordinate_frame_revision = frame_revision
+        self.global_reference_updated_at = utc_now()
+        self.global_reference_updated_by_user_id = normalize_optional_text(
+            updated_by_user_id,
+            field_name="global_reference_updated_by_user_id",
+            max_length=WORLD_USER_ID_MAX_LENGTH,
+        )
+
+        if touch:
+            self.touch(updated_by_user_id=updated_by_user_id)
+
+        return True
+
+    def replace_global_reference_before_materialization(
+        self,
+        global_reference: Any,
+        *,
+        materialization_lock_reasons: Optional[Iterable[str]] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> bool:
+        """Replace an Earth reference only while no materialized state exists."""
+        reasons = normalize_reference_lock_reasons(
+            materialization_lock_reasons
+        )
+        if reasons:
+            raise ValueError(
+                "Global reference cannot be replaced after materialization. "
+                f"Lock reasons: {', '.join(reasons)}."
+            )
+
+        return self.set_global_reference(
+            global_reference,
+            allow_replace=True,
+            updated_by_user_id=updated_by_user_id,
+        )
+
+    def lock_global_reference(
+        self,
+        reasons: Iterable[str],
+        *,
+        updated_by_user_id: Optional[str] = None,
+        touch: bool = True,
+    ) -> None:
+        """Lock normal reanchoring after the first materialized state."""
+        self.ensure_not_deleted()
+
+        if not self.is_earth_world or not self.has_global_reference:
+            raise ValueError(
+                "Only a referenced earth world can lock its global reference."
+            )
+
+        normalized_reasons = normalize_reference_lock_reasons(reasons)
+        if not normalized_reasons:
+            raise ValueError(
+                "At least one global reference lock reason is required."
+            )
+
+        merged = normalize_reference_lock_reasons(
+            [
+                *normalize_reference_lock_reasons(
+                    self.global_reference_lock_reasons_json
+                ),
+                *normalized_reasons,
+            ]
+        )
+        self.global_reference_lock_reasons_json = merged
+        self.global_reference_locked_at = (
+            self.global_reference_locked_at or utc_now()
+        )
+        self.global_reference_updated_at = utc_now()
+        self.global_reference_updated_by_user_id = normalize_optional_text(
+            updated_by_user_id,
+            field_name="global_reference_updated_by_user_id",
+            max_length=WORLD_USER_ID_MAX_LENGTH,
+        )
+
+        if touch:
+            self.touch(updated_by_user_id=updated_by_user_id)
+
+    def clear_global_reference_before_materialization(
+        self,
+        *,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """
+        Clear a reference only for an unmaterialized world.
+
+        This is intended for an atomic provider migration. An Earth world
+        cannot be flushed while the reference is absent because the database
+        constraint requires it.
+        """
+        self.ensure_global_reference_mutable()
+        self.global_reference_json = None
+        self.global_reference_fingerprint = None
+        self.coordinate_frame_revision = 0
+        self.global_reference_updated_at = utc_now()
+        self.global_reference_updated_by_user_id = normalize_optional_text(
+            updated_by_user_id,
+            field_name="global_reference_updated_by_user_id",
+            max_length=WORLD_USER_ID_MAX_LENGTH,
+        )
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_spawn_metric_position(
+        self,
+        *,
+        x: Any,
+        y: Any,
+        z: Any,
+        yaw: Optional[float] = None,
+        pitch: Optional[float] = None,
+        updated_by_user_id: Optional[str] = None,
+        touch: bool = True,
+    ) -> None:
+        """Persist a precise local-metric spawn without changing the reference."""
+        self.ensure_not_deleted()
+
+        precise_x = normalize_decimal_coordinate(
+            x,
+            field_name="spawn_x_precise",
+        )
+        precise_y = normalize_decimal_coordinate(
+            y,
+            field_name="spawn_y_precise",
+        )
+        precise_z = normalize_decimal_coordinate(
+            z,
+            field_name="spawn_z_precise",
+        )
+        assert precise_x is not None
+        assert precise_y is not None
+        assert precise_z is not None
+
+        if self.is_earth_world:
+            earth_grid_module = _import_first_available(
+                "src.georeferencing.earth_grid",
+                "georeferencing.earth_grid",
+            )
+            local_position = earth_grid_module.LocalEarthPosition(
+                x=precise_x,
+                y=precise_y,
+                z=precise_z,
+            )
+            normalized = (
+                self.build_earth_provider()
+                .frame
+                .normalize_local_position(local_position)
+            )
+            precise_x = normalized.x
+            assert normalized.y is not None
+            precise_y = normalized.y
+            precise_z = normalized.z
+
+        self.spawn_coordinate_space = EARTH_SPAWN_COORDINATE_SPACE
+        self.spawn_x_precise = precise_x
+        self.spawn_y_precise = precise_y
+        self.spawn_z_precise = precise_z
+        self.spawn_x = decimal_floor_to_int(
+            precise_x,
+            field_name="spawn_x_precise",
+        )
+        self.spawn_y = decimal_floor_to_int(
+            precise_y,
+            field_name="spawn_y_precise",
+        )
+        self.spawn_z = decimal_floor_to_int(
+            precise_z,
+            field_name="spawn_z_precise",
+        )
+
+        if yaw is not None:
+            self.spawn_yaw = normalize_float(
+                yaw,
+                field_name="spawn_yaw",
+                default=DEFAULT_SPAWN_YAW,
+            )
+        if pitch is not None:
+            self.spawn_pitch = normalize_float(
+                pitch,
+                field_name="spawn_pitch",
+                default=DEFAULT_SPAWN_PITCH,
+            )
+
+        if touch:
+            self.touch(updated_by_user_id=updated_by_user_id)
 
     def rename(
         self,
@@ -1812,25 +3179,75 @@ class WorldInstance(db.Model):
         """
         Update provider/template mapping.
 
-        This should be used carefully. Existing materialized snapshots keep
-        their saved content. Unmaterialized chunks may change if the provider
-        mapping or generator changes.
+        Switching to or from ``earth`` requires a dedicated atomic migration
+        because the global-reference and storage-frame invariants must change
+        together. Flat-to-flat style mapping updates remain supported.
         """
         self.ensure_not_deleted()
-        self.template_id = normalize_template_id(template_id)
-        self.provider_id = normalize_provider_id(provider_id)
-        self.provider_world_id = normalize_provider_world_id(provider_world_id)
-        self.generator_type = normalize_required_text(
+
+        normalized_template_id = normalize_template_id(template_id)
+        normalized_provider_id = normalize_provider_id(provider_id)
+        normalized_provider_world_id = normalize_provider_world_id(
+            provider_world_id
+        )
+        normalized_generator_type = normalize_required_text(
             generator_type,
             field_name="generator_type",
             max_length=WORLD_GENERATOR_TYPE_MAX_LENGTH,
         )
-        self.generator_version = normalize_version_text(
+        normalized_generator_version = normalize_version_text(
             generator_version,
             field_name="generator_version",
             max_length=WORLD_GENERATOR_VERSION_MAX_LENGTH,
             default=DEFAULT_GENERATOR_VERSION,
         )
+
+        current_mapping = (
+            self.template_id,
+            self.provider_id,
+            self.provider_world_id,
+            self.generator_type,
+            self.generator_version,
+        )
+        proposed_mapping = (
+            normalized_template_id,
+            normalized_provider_id,
+            normalized_provider_world_id,
+            normalized_generator_type,
+            normalized_generator_version,
+        )
+
+        if (
+            self.provider_id == EARTH_PROVIDER_ID
+            or normalized_provider_id == EARTH_PROVIDER_ID
+        ):
+            expected_earth = (
+                EARTH_TEMPLATE_ID,
+                EARTH_PROVIDER_ID,
+                EARTH_PROVIDER_WORLD_ID,
+                EARTH_GENERATOR_TYPE,
+            )
+            proposed_earth = proposed_mapping[:4]
+
+            if proposed_earth != expected_earth:
+                raise ValueError(
+                    "Earth provider mapping must use the fixed Earth-v1 "
+                    "template, provider world and generator."
+                )
+
+            if proposed_mapping != current_mapping:
+                raise ValueError(
+                    "Switching or changing an Earth provider mapping requires "
+                    "a dedicated reference-aware migration."
+                )
+
+            return
+
+        self.template_id = normalized_template_id
+        self.provider_id = normalized_provider_id
+        self.provider_world_id = normalized_provider_world_id
+        self.generator_type = normalized_generator_type
+        self.generator_version = normalized_generator_version
         self.touch(updated_by_user_id=updated_by_user_id)
 
     def set_world_geometry(
@@ -1844,25 +3261,52 @@ class WorldInstance(db.Model):
         """
         Update world geometry metadata.
 
-        This does not migrate existing ChunkSnapshots. Migration/rebase logic
-        must be implemented separately.
+        Earth geometry is fixed by its versioned grid contract. Changing it
+        requires a dedicated reanchor/migration and is not a normal mutation.
         """
         self.ensure_not_deleted()
-        self.projection_type = normalize_required_text(
+
+        normalized_projection = normalize_required_text(
             projection_type,
             field_name="projection_type",
             max_length=WORLD_PROJECTION_TYPE_MAX_LENGTH,
         )
-        self.topology_type = normalize_required_text(
+        normalized_topology = normalize_required_text(
             topology_type,
             field_name="topology_type",
             max_length=WORLD_TOPOLOGY_TYPE_MAX_LENGTH,
         )
-        self.coordinate_system = normalize_required_text(
+        normalized_coordinate_system = normalize_required_text(
             coordinate_system,
             field_name="coordinate_system",
             max_length=WORLD_COORDINATE_SYSTEM_MAX_LENGTH,
         )
+
+        if self.is_earth_world:
+            expected = (
+                EARTH_PROJECTION_TYPE,
+                EARTH_TOPOLOGY_TYPE,
+                EARTH_COORDINATE_SYSTEM,
+            )
+            proposed = (
+                normalized_projection,
+                normalized_topology,
+                normalized_coordinate_system,
+            )
+            if proposed != expected or proposed != (
+                self.projection_type,
+                self.topology_type,
+                self.coordinate_system,
+            ):
+                raise ValueError(
+                    "Earth world geometry is immutable outside a dedicated "
+                    "coordinate-frame migration."
+                )
+            return
+
+        self.projection_type = normalized_projection
+        self.topology_type = normalized_topology
+        self.coordinate_system = normalized_coordinate_system
         self.touch(updated_by_user_id=updated_by_user_id)
 
     def set_chunk_grid(
@@ -1875,20 +3319,34 @@ class WorldInstance(db.Model):
         """
         Update chunk grid configuration.
 
-        This should generally only be used before chunks are materialized.
-        Existing ChunkSnapshots are not automatically migrated.
+        Earth grid phase, chunk size and cell scale are fixed by ``world.json``.
+        Existing Earth worlds require a dedicated data migration.
         """
         self.ensure_not_deleted()
-        self.chunk_size = normalize_positive_int(
+
+        normalized_chunk_size = normalize_positive_int(
             chunk_size,
             field_name="chunk_size",
             default=DEFAULT_CHUNK_SIZE,
         )
-        self.cell_size = normalize_positive_float(
+        normalized_cell_size = normalize_positive_float(
             cell_size,
             field_name="cell_size",
             default=DEFAULT_CELL_SIZE,
         )
+
+        if self.is_earth_world:
+            if (
+                normalized_chunk_size != int(self.chunk_size)
+                or normalized_cell_size != float(self.cell_size)
+            ):
+                raise ValueError(
+                    "Earth chunk-grid changes require a dedicated migration."
+                )
+            return
+
+        self.chunk_size = normalized_chunk_size
+        self.cell_size = normalized_cell_size
         self.touch(updated_by_user_id=updated_by_user_id)
 
     def set_vertical_bounds(
@@ -1988,11 +3446,48 @@ class WorldInstance(db.Model):
         pitch: Optional[float] = None,
         updated_by_user_id: Optional[str] = None,
     ) -> None:
-        """Set world spawn position and optional rotation."""
+        """Set a local spawn without changing the Earth reference."""
         self.ensure_not_deleted()
-        self.spawn_x = normalize_int(x, field_name="spawn_x", default=DEFAULT_SPAWN_X)
-        self.spawn_y = normalize_int(y, field_name="spawn_y", default=DEFAULT_SPAWN_Y)
-        self.spawn_z = normalize_int(z, field_name="spawn_z", default=DEFAULT_SPAWN_Z)
+
+        normalized_x = normalize_int(
+            x,
+            field_name="spawn_x",
+            default=DEFAULT_SPAWN_X,
+        )
+        normalized_y = normalize_int(
+            y,
+            field_name="spawn_y",
+            default=DEFAULT_SPAWN_Y,
+        )
+        normalized_z = normalize_int(
+            z,
+            field_name="spawn_z",
+            default=DEFAULT_SPAWN_Z,
+        )
+
+        if self.is_earth_world:
+            self.set_spawn_metric_position(
+                x=normalized_x,
+                y=normalized_y,
+                z=normalized_z,
+                yaw=yaw,
+                pitch=pitch,
+                updated_by_user_id=updated_by_user_id,
+                touch=True,
+            )
+            return
+
+        self.spawn_x = normalized_x
+        self.spawn_y = normalized_y
+        self.spawn_z = normalized_z
+        self.spawn_x_precise = Decimal(normalized_x)
+        self.spawn_y_precise = Decimal(normalized_y)
+        self.spawn_z_precise = Decimal(normalized_z)
+        self.spawn_coordinate_space = (
+            EARTH_SPAWN_COORDINATE_SPACE
+            if self.is_earth_world
+            else DEFAULT_SPAWN_COORDINATE_SPACE
+        )
 
         if yaw is not None:
             self.spawn_yaw = normalize_float(
@@ -2039,24 +3534,50 @@ class WorldInstance(db.Model):
         """
         Ensure required bootstrap/default-world fields are populated.
 
-        This is intentionally light-touch and does not change world_id.
+        Flat defaults remain unchanged. Earth worlds keep their fixed provider
+        and geometry contract and must already possess a global reference.
         """
-        if not self.template_id:
-            self.template_id = DEFAULT_TEMPLATE_ID
-        if not self.provider_id:
-            self.provider_id = DEFAULT_PROVIDER_ID
-        if not self.provider_world_id:
-            self.provider_world_id = DEFAULT_PROVIDER_WORLD_ID
-        if not self.generator_type:
-            self.generator_type = DEFAULT_GENERATOR_TYPE
-        if not self.generator_version:
-            self.generator_version = DEFAULT_GENERATOR_VERSION
-        if not self.projection_type:
-            self.projection_type = DEFAULT_PROJECTION_TYPE
-        if not self.topology_type:
-            self.topology_type = DEFAULT_TOPOLOGY_TYPE
-        if not self.coordinate_system:
-            self.coordinate_system = DEFAULT_COORDINATE_SYSTEM
+        self.ensure_not_deleted()
+
+        if self.is_earth_world:
+            self.template_id = EARTH_TEMPLATE_ID
+            self.provider_id = EARTH_PROVIDER_ID
+            self.provider_world_id = EARTH_PROVIDER_WORLD_ID
+            self.generator_type = EARTH_GENERATOR_TYPE
+            self.generator_version = (
+                self.generator_version or EARTH_GENERATOR_VERSION
+            )
+            self.projection_type = EARTH_PROJECTION_TYPE
+            self.topology_type = EARTH_TOPOLOGY_TYPE
+            self.coordinate_system = EARTH_COORDINATE_SYSTEM
+            self.spawn_coordinate_space = EARTH_SPAWN_COORDINATE_SPACE
+
+            if not self.has_global_reference:
+                raise ValueError(
+                    "Earth bootstrap defaults require a global reference."
+                )
+        else:
+            if not self.template_id:
+                self.template_id = DEFAULT_TEMPLATE_ID
+            if not self.provider_id:
+                self.provider_id = DEFAULT_PROVIDER_ID
+            if not self.provider_world_id:
+                self.provider_world_id = DEFAULT_PROVIDER_WORLD_ID
+            if not self.generator_type:
+                self.generator_type = DEFAULT_GENERATOR_TYPE
+            if not self.generator_version:
+                self.generator_version = DEFAULT_GENERATOR_VERSION
+            if not self.projection_type:
+                self.projection_type = DEFAULT_PROJECTION_TYPE
+            if not self.topology_type:
+                self.topology_type = DEFAULT_TOPOLOGY_TYPE
+            if not self.coordinate_system:
+                self.coordinate_system = DEFAULT_COORDINATE_SYSTEM
+            self.spawn_coordinate_space = normalize_spawn_coordinate_space(
+                self.spawn_coordinate_space,
+                default=DEFAULT_SPAWN_COORDINATE_SPACE,
+            )
+
         if not self.block_registry_id:
             self.block_registry_id = DEFAULT_BLOCK_REGISTRY_ID
         if not self.block_registry_version:
@@ -2072,6 +3593,22 @@ class WorldInstance(db.Model):
         if self.spawn_pitch is None:
             self.spawn_pitch = DEFAULT_SPAWN_PITCH
 
+        precise_values = (
+            self.spawn_x_precise,
+            self.spawn_y_precise,
+            self.spawn_z_precise,
+        )
+        if any(value is not None for value in precise_values):
+            if not all(value is not None for value in precise_values):
+                raise ValueError(
+                    "Precise spawn coordinates must be all null or all populated."
+                )
+        elif self.is_earth_world:
+            self.spawn_x_precise = Decimal(int(self.spawn_x or 0))
+            self.spawn_y_precise = Decimal(int(self.spawn_y or 0))
+            self.spawn_z_precise = Decimal(int(self.spawn_z or 0))
+
+        self.schema_version = WORLD_INSTANCE_SCHEMA_VERSION
         self.touch(updated_by_user_id=updated_by_user_id)
 
     def replace_metadata(
@@ -2137,6 +3674,10 @@ class WorldInstance(db.Model):
                 "blockRegistryId": self.block_registry_id,
                 "blockRegistryVersion": self.block_registry_version,
                 "spawn": self.spawn_context,
+                "coordinateFrame": self.coordinate_frame_context,
+                "globalReferenceFingerprint": (
+                    self.global_reference_fingerprint
+                ),
                 "provisionedAt": datetime_to_iso(utc_now()),
             },
             updated_by_user_id=updated_by_user_id,
@@ -2183,6 +3724,9 @@ class WorldInstance(db.Model):
         - sourceService / source_service
         - externalRef / external_ref
         - spawn / spawnX/spawnY/spawnZ/spawnYaw/spawnPitch
+        - spawnCoordinateSpace / precise spawn coordinates
+        - globalReference (idempotent only)
+        - globalReferenceLockReasons
         - metadata / metadataJson / metadata_json
         - metadataMerge
         - metadataRemoveKeys
@@ -2193,7 +3737,66 @@ class WorldInstance(db.Model):
 
         self.ensure_not_deleted()
 
+        earth_immutable_fields = {
+            "templateId",
+            "template_id",
+            "providerId",
+            "provider_id",
+            "providerWorldId",
+            "provider_world_id",
+            "generatorType",
+            "generator_type",
+            "generatorVersion",
+            "generator_version",
+            "projectionType",
+            "projection_type",
+            "topologyType",
+            "topology_type",
+            "coordinateSystem",
+            "coordinate_system",
+            "chunkSize",
+            "chunk_size",
+            "cellSize",
+            "cell_size",
+        }
+        if self.is_earth_world and any(
+            key in payload for key in earth_immutable_fields
+        ):
+            raise ValueError(
+                "Earth provider, geometry and chunk-grid fields are immutable "
+                "outside a dedicated coordinate-frame migration."
+            )
+
         changed = False
+
+        if "globalReference" in payload or "global_reference" in payload:
+            reference_value = (
+                payload.get("globalReference")
+                if "globalReference" in payload
+                else payload.get("global_reference")
+            )
+            changed = self.set_global_reference(
+                reference_value,
+                allow_replace=False,
+                updated_by_user_id=updated_by_user_id,
+                touch=False,
+            ) or changed
+
+        if (
+            "globalReferenceLockReasons" in payload
+            or "global_reference_lock_reasons" in payload
+        ):
+            reasons = (
+                payload.get("globalReferenceLockReasons")
+                if "globalReferenceLockReasons" in payload
+                else payload.get("global_reference_lock_reasons")
+            )
+            self.lock_global_reference(
+                reasons or [],
+                updated_by_user_id=updated_by_user_id,
+                touch=False,
+            )
+            changed = True
 
         if "name" in payload:
             self.name = normalize_required_text(
@@ -2413,57 +4016,193 @@ class WorldInstance(db.Model):
             )
             changed = True
 
-        spawn = payload.get("spawn") if isinstance(payload.get("spawn"), Mapping) else None
-        spawn_changed = spawn is not None
+        spawn = (
+            payload.get("spawn")
+            if isinstance(payload.get("spawn"), Mapping)
+            else None
+        )
+        precise_position = (
+            spawn.get("precisePosition")
+            if isinstance(spawn, Mapping)
+            and isinstance(spawn.get("precisePosition"), Mapping)
+            else {}
+        )
+        spawn_field_names = {
+            "spawn",
+            "spawnX",
+            "spawn_x",
+            "spawnY",
+            "spawn_y",
+            "spawnZ",
+            "spawn_z",
+            "spawnXPrecise",
+            "spawn_x_precise",
+            "spawnYPrecise",
+            "spawn_y_precise",
+            "spawnZPrecise",
+            "spawn_z_precise",
+            "spawnCoordinateSpace",
+            "spawn_coordinate_space",
+            "spawnYaw",
+            "spawn_yaw",
+            "spawnPitch",
+            "spawn_pitch",
+        }
+        spawn_changed = any(
+            key in payload for key in spawn_field_names
+        )
 
-        if spawn_changed or "spawnX" in payload or "spawn_x" in payload:
-            self.spawn_x = normalize_int(
-                payload.get("spawnX")
-                if "spawnX" in payload
-                else payload.get("spawn_x", spawn.get("x", self.spawn_x) if spawn else self.spawn_x),
-                field_name="spawn_x",
-                default=DEFAULT_SPAWN_X,
+        if spawn_changed:
+            requested_space = _payload_get(
+                spawn or {},
+                "coordinateSpace",
+                "coordinate_space",
+                default=_payload_get(
+                    payload,
+                    "spawnCoordinateSpace",
+                    "spawn_coordinate_space",
+                    default=(
+                        EARTH_SPAWN_COORDINATE_SPACE
+                        if self.is_earth_world
+                        else self.spawn_coordinate_space
+                    ),
+                ),
             )
-            changed = True
+            coordinate_space = normalize_spawn_coordinate_space(
+                requested_space,
+                default=(
+                    EARTH_SPAWN_COORDINATE_SPACE
+                    if self.is_earth_world
+                    else DEFAULT_SPAWN_COORDINATE_SPACE
+                ),
+            )
 
-        if spawn_changed or "spawnY" in payload or "spawn_y" in payload:
-            self.spawn_y = normalize_int(
-                payload.get("spawnY")
-                if "spawnY" in payload
-                else payload.get("spawn_y", spawn.get("y", self.spawn_y) if spawn else self.spawn_y),
-                field_name="spawn_y",
-                default=DEFAULT_SPAWN_Y,
-            )
-            changed = True
+            current_precise = self.spawn_precise_position
 
-        if spawn_changed or "spawnZ" in payload or "spawn_z" in payload:
-            self.spawn_z = normalize_int(
-                payload.get("spawnZ")
-                if "spawnZ" in payload
-                else payload.get("spawn_z", spawn.get("z", self.spawn_z) if spawn else self.spawn_z),
-                field_name="spawn_z",
-                default=DEFAULT_SPAWN_Z,
+            raw_x = _payload_get(
+                precise_position,
+                "x",
+                default=_payload_get(
+                    spawn or {},
+                    "preciseX",
+                    "xPrecise",
+                    "x",
+                    default=_payload_get(
+                        payload,
+                        "spawnXPrecise",
+                        "spawn_x_precise",
+                        "spawnX",
+                        "spawn_x",
+                        default=current_precise["x"],
+                    ),
+                ),
             )
-            changed = True
+            raw_y = _payload_get(
+                precise_position,
+                "y",
+                default=_payload_get(
+                    spawn or {},
+                    "preciseY",
+                    "yPrecise",
+                    "y",
+                    default=_payload_get(
+                        payload,
+                        "spawnYPrecise",
+                        "spawn_y_precise",
+                        "spawnY",
+                        "spawn_y",
+                        default=current_precise["y"],
+                    ),
+                ),
+            )
+            raw_z = _payload_get(
+                precise_position,
+                "z",
+                default=_payload_get(
+                    spawn or {},
+                    "preciseZ",
+                    "zPrecise",
+                    "z",
+                    default=_payload_get(
+                        payload,
+                        "spawnZPrecise",
+                        "spawn_z_precise",
+                        "spawnZ",
+                        "spawn_z",
+                        default=current_precise["z"],
+                    ),
+                ),
+            )
+            raw_yaw = _payload_get(
+                spawn or {},
+                "yaw",
+                default=_payload_get(
+                    payload,
+                    "spawnYaw",
+                    "spawn_yaw",
+                    default=self.spawn_yaw,
+                ),
+            )
+            raw_pitch = _payload_get(
+                spawn or {},
+                "pitch",
+                default=_payload_get(
+                    payload,
+                    "spawnPitch",
+                    "spawn_pitch",
+                    default=self.spawn_pitch,
+                ),
+            )
 
-        if spawn_changed or "spawnYaw" in payload or "spawn_yaw" in payload:
-            self.spawn_yaw = normalize_float(
-                payload.get("spawnYaw")
-                if "spawnYaw" in payload
-                else payload.get("spawn_yaw", spawn.get("yaw", self.spawn_yaw) if spawn else self.spawn_yaw),
-                field_name="spawn_yaw",
-                default=DEFAULT_SPAWN_YAW,
-            )
-            changed = True
+            if (
+                coordinate_space == EARTH_SPAWN_COORDINATE_SPACE
+                or self.is_earth_world
+            ):
+                self.set_spawn_metric_position(
+                    x=raw_x,
+                    y=raw_y,
+                    z=raw_z,
+                    yaw=raw_yaw,
+                    pitch=raw_pitch,
+                    updated_by_user_id=updated_by_user_id,
+                    touch=False,
+                )
+            else:
+                normalized_x = normalize_int(
+                    raw_x,
+                    field_name="spawn_x",
+                    default=DEFAULT_SPAWN_X,
+                )
+                normalized_y = normalize_int(
+                    raw_y,
+                    field_name="spawn_y",
+                    default=DEFAULT_SPAWN_Y,
+                )
+                normalized_z = normalize_int(
+                    raw_z,
+                    field_name="spawn_z",
+                    default=DEFAULT_SPAWN_Z,
+                )
+                self.spawn_coordinate_space = (
+                    DEFAULT_SPAWN_COORDINATE_SPACE
+                )
+                self.spawn_x = normalized_x
+                self.spawn_y = normalized_y
+                self.spawn_z = normalized_z
+                self.spawn_x_precise = Decimal(normalized_x)
+                self.spawn_y_precise = Decimal(normalized_y)
+                self.spawn_z_precise = Decimal(normalized_z)
+                self.spawn_yaw = normalize_float(
+                    raw_yaw,
+                    field_name="spawn_yaw",
+                    default=DEFAULT_SPAWN_YAW,
+                )
+                self.spawn_pitch = normalize_float(
+                    raw_pitch,
+                    field_name="spawn_pitch",
+                    default=DEFAULT_SPAWN_PITCH,
+                )
 
-        if spawn_changed or "spawnPitch" in payload or "spawn_pitch" in payload:
-            self.spawn_pitch = normalize_float(
-                payload.get("spawnPitch")
-                if "spawnPitch" in payload
-                else payload.get("spawn_pitch", spawn.get("pitch", self.spawn_pitch) if spawn else self.spawn_pitch),
-                field_name="spawn_pitch",
-                default=DEFAULT_SPAWN_PITCH,
-            )
             changed = True
 
         metadata_replace_key = None
@@ -2532,7 +4271,7 @@ class WorldInstance(db.Model):
         if is_provider_like_world_id(self.world_id):
             errors["worldId"] = (
                 "world_id must be a concrete editable world id. "
-                "`flat` belongs in template_id/provider_world_id."
+                "`flat` or `earth` belongs in template_id/provider_world_id."
             )
 
         try:
@@ -2655,6 +4394,115 @@ class WorldInstance(db.Model):
             except Exception as exc:
                 errors["externalRef"] = str(exc)
 
+        try:
+            normalize_spawn_coordinate_space(
+                self.spawn_coordinate_space,
+                default=(
+                    EARTH_SPAWN_COORDINATE_SPACE
+                    if self.is_earth_world
+                    else DEFAULT_SPAWN_COORDINATE_SPACE
+                ),
+            )
+        except Exception as exc:
+            errors["spawnCoordinateSpace"] = str(exc)
+
+        precise_values = (
+            self.spawn_x_precise,
+            self.spawn_y_precise,
+            self.spawn_z_precise,
+        )
+        if any(value is not None for value in precise_values):
+            if not all(value is not None for value in precise_values):
+                errors["spawnPrecisePosition"] = (
+                    "Precise spawn coordinates must be all null or all populated."
+                )
+            else:
+                for field_name, value in (
+                    ("spawnXPrecise", self.spawn_x_precise),
+                    ("spawnYPrecise", self.spawn_y_precise),
+                    ("spawnZPrecise", self.spawn_z_precise),
+                ):
+                    try:
+                        normalize_decimal_coordinate(
+                            value,
+                            field_name=field_name,
+                        )
+                    except Exception as exc:
+                        errors[field_name] = str(exc)
+
+        try:
+            normalize_reference_lock_reasons(
+                self.global_reference_lock_reasons_json
+            )
+        except Exception as exc:
+            errors["globalReferenceLockReasons"] = str(exc)
+
+        if self.is_earth_world:
+            expected_mapping = (
+                EARTH_TEMPLATE_ID,
+                EARTH_PROVIDER_ID,
+                EARTH_PROVIDER_WORLD_ID,
+                EARTH_GENERATOR_TYPE,
+                EARTH_PROJECTION_TYPE,
+                EARTH_TOPOLOGY_TYPE,
+                EARTH_COORDINATE_SYSTEM,
+            )
+            actual_mapping = (
+                self.template_id,
+                self.provider_id,
+                self.provider_world_id,
+                self.generator_type,
+                self.projection_type,
+                self.topology_type,
+                self.coordinate_system,
+            )
+            if actual_mapping != expected_mapping:
+                errors["earthProviderContract"] = (
+                    "Earth provider mapping and geometry must match Earth v1."
+                )
+
+            if not self.has_global_reference:
+                errors["globalReference"] = (
+                    "Earth worlds require exactly one global reference."
+                )
+            else:
+                try:
+                    reference = self.get_global_reference_point()
+                    if reference.grid.grid_id != EARTH_GRID_ID:
+                        errors["globalReferenceGridId"] = (
+                            f"Earth grid id must be '{EARTH_GRID_ID}'."
+                        )
+                    if reference.grid.grid_version != EARTH_GRID_VERSION:
+                        errors["globalReferenceGridVersion"] = (
+                            f"Earth grid version must be '{EARTH_GRID_VERSION}'."
+                        )
+                except Exception as exc:
+                    errors["globalReference"] = str(exc)
+
+            if (
+                self.spawn_coordinate_space
+                != EARTH_SPAWN_COORDINATE_SPACE
+            ):
+                errors["spawnCoordinateSpace"] = (
+                    "Earth spawn must be persisted in local_metric coordinates."
+                )
+        elif self.has_global_reference:
+            errors["globalReference"] = (
+                "Only earth worlds may persist a global reference."
+            )
+        elif int(self.coordinate_frame_revision or 0) != 0:
+            errors["coordinateFrameRevision"] = (
+                "Worlds without a global reference must use revision 0."
+            )
+
+        if (
+            self.global_reference_locked_at is not None
+            and not self.has_global_reference
+        ):
+            errors["globalReferenceLockedAt"] = (
+                "A reference lock requires a stored global reference."
+            )
+
         if self.revision is None or int(self.revision) < 1:
             errors["revision"] = "revision must be greater than or equal to 1."
 
@@ -2709,6 +4557,10 @@ class WorldInstance(db.Model):
             "blockRegistryId": self.block_registry_id,
             "blockRegistryVersion": self.block_registry_version,
             "spawn": self.spawn_context,
+            "coordinateFrame": self.coordinate_frame_context,
+            "globalReference": self.global_reference_context(
+                include_crs_definition=False
+            ),
             "sourceService": self.source_service,
             "externalRef": self.external_ref,
             "createdByUserId": self.created_by_user_id,
@@ -2728,6 +4580,9 @@ class WorldInstance(db.Model):
                 "runtimeWorld": self.world_type == WORLD_TYPE_RUNTIME,
                 "defaultSpawn": self.world_role == WORLD_ROLE_DEFAULT_SPAWN,
                 "providerLikeWorldId": is_provider_like_world_id(self.world_id),
+                "earthWorld": self.is_earth_world,
+                "globalReferencePresent": self.has_global_reference,
+                "globalReferenceLocked": self.is_global_reference_locked,
             },
         }
 
@@ -2739,6 +4594,11 @@ class WorldInstance(db.Model):
             result["projectDbId"] = self.project_db_id
             result["universeDbId"] = self.universe_db_id
             result["worldContextKey"] = self.build_world_context_key()
+            result["globalReferencePersistence"] = (
+                self.global_reference_context(
+                    include_crs_definition=True
+                )
+            )
 
         return result
 
@@ -2770,6 +4630,7 @@ __all__ = [
     "DEFAULT_PROJECTION_TYPE",
     "DEFAULT_PROVIDER_ID",
     "DEFAULT_PROVIDER_WORLD_ID",
+    "DEFAULT_SPAWN_COORDINATE_SPACE",
     "DEFAULT_SPAWN_PITCH",
     "DEFAULT_SPAWN_X",
     "DEFAULT_SPAWN_Y",
@@ -2781,7 +4642,22 @@ __all__ = [
     "DEFAULT_WORLD_ID",
     "DEFAULT_WORLD_NAME",
     "DEFAULT_WORLD_SLUG",
+    "EARTH_COORDINATE_SYSTEM",
+    "EARTH_GENERATOR_TYPE",
+    "EARTH_GENERATOR_VERSION",
+    "EARTH_GRID_ID",
+    "EARTH_GRID_VERSION",
+    "EARTH_PROJECTION_TYPE",
+    "EARTH_PROVIDER_ID",
+    "EARTH_PROVIDER_WORLD_ID",
+    "EARTH_SPAWN_COORDINATE_SPACE",
+    "EARTH_TEMPLATE_ID",
+    "EARTH_TOPOLOGY_TYPE",
+    "EARTH_WORLD_NAME",
     "JSON_COLUMN_TYPE",
+    "NULLABLE_JSON_COLUMN_TYPE",
+    "PROVIDER_LIKE_WORLD_IDS",
+    "VALID_SPAWN_COORDINATE_SPACES",
     "VALID_WORLD_ROLES",
     "VALID_WORLD_SCOPES",
     "VALID_WORLD_STATUSES",
@@ -2794,11 +4670,16 @@ __all__ = [
     "WORLD_STATUS_DELETED",
     "WORLD_TYPE_RUNTIME",
     "WorldInstance",
+    "coerce_global_reference",
     "datetime_to_iso",
+    "decimal_to_plain_text",
     "generate_world_id",
     "is_provider_like_world_id",
     "make_json_safe",
     "normalize_concrete_world_id",
+    "normalize_decimal_coordinate",
+    "normalize_global_reference_storage",
+    "normalize_spawn_coordinate_space",
     "normalize_world_id",
     "utc_now",
 ]
