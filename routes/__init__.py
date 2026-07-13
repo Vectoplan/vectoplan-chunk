@@ -26,6 +26,7 @@ Productive project-scoped API:
 
 Debug/development API:
 - routes.world_test:world_test_bp
+- routes.earth_debug:earth_debug_bp
 
 Legacy compatibility:
 - routes.editor:editor_bp, optional
@@ -64,7 +65,7 @@ from flask import Blueprint, Flask
 # Constants
 # -----------------------------------------------------------------------------
 
-ROUTES_REGISTRY_VERSION = "0.4.0"
+ROUTES_REGISTRY_VERSION = "0.5.0"
 
 DEFAULT_EXTENSION_NAMESPACE = "vectoplan_chunk"
 DEFAULT_ROUTING_STATE_KEY = "routing"
@@ -89,6 +90,7 @@ PRODUCTIVE_BLUEPRINT_MODULES = (
 
 DEBUG_BLUEPRINT_MODULES = (
     "routes.world_test",
+    "routes.earth_debug",
 )
 
 OPTIONAL_LEGACY_BLUEPRINT_MODULES = (
@@ -364,6 +366,7 @@ def _ensure_routing_state(app: Flask) -> dict[str, Any]:
     routing.setdefault("snapshotBackedChunksEnabled", True)
     routing.setdefault("commandWriteApiEnabled", True)
     routing.setdefault("worldTestDebugRouteEnabled", False)
+    routing.setdefault("earthDebugRouteEnabled", False)
     routing.setdefault("legacyRoutesEnabled", False)
     routing.setdefault("registeredBlueprintNames", set())
     routing.setdefault("records", [])
@@ -543,6 +546,17 @@ def get_blueprint_specs() -> tuple[BlueprintSpec, ...]:
             url_prefix=None,
             required=False,
             description="World discovery and provider chunk-generation debug route.",
+            category="debug",
+        ),
+        BlueprintSpec(
+            module_name="routes.earth_debug",
+            attribute_name="earth_debug_bp",
+            url_prefix=None,
+            required=False,
+            description=(
+                "Temporary Earth-v1 provider, coordinate conversion, spawn "
+                "and chunk-generation debug route."
+            ),
             category="debug",
         ),
         BlueprintSpec(
@@ -761,6 +775,7 @@ def _store_registration_metadata(app: Flask) -> None:
         routing["snapshotBackedChunksEnabled"] = True
         routing["commandWriteApiEnabled"] = "commands" in tracked_names
         routing["worldTestDebugRouteEnabled"] = "world_test" in tracked_names
+        routing["earthDebugRouteEnabled"] = "earth_debug" in tracked_names
         routing["legacyRoutesEnabled"] = "editor" in tracked_names
 
         # Also expose selected routing values at namespace top-level for older
@@ -775,6 +790,7 @@ def _store_registration_metadata(app: Flask) -> None:
         namespace["world_state_api_enabled"] = True
         namespace["snapshot_backed_chunks_enabled"] = True
         namespace["command_write_api_enabled"] = routing["commandWriteApiEnabled"]
+        namespace["earth_debug_route_enabled"] = routing["earthDebugRouteEnabled"]
 
     except Exception as exc:
         raise RuntimeError("Routing metadata could not be stored.") from exc
@@ -915,6 +931,7 @@ def get_routing_metadata(app: Flask) -> dict[str, Any]:
             "snapshotBackedChunksEnabled": routing.get("snapshotBackedChunksEnabled"),
             "commandWriteApiEnabled": routing.get("commandWriteApiEnabled"),
             "worldTestDebugRouteEnabled": routing.get("worldTestDebugRouteEnabled"),
+            "earthDebugRouteEnabled": routing.get("earthDebugRouteEnabled"),
             "legacyRoutesEnabled": routing.get("legacyRoutesEnabled"),
             "registeredBlueprintNames": get_registered_blueprint_names(app),
             "registeredBlueprintCount": routing.get("registeredBlueprintCount"),
