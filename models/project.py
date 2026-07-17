@@ -31,9 +31,13 @@ Design rules:
 - `id` is the internal database primary key.
 - `project_id` is the stable chunk-service public/API identifier.
 - `external_app_project_id` stores the vectoplan-app project public id.
+- `owner_type='user'` and `owner_id` store the external owner user id.
+- owner ids are service references and never foreign keys into auth/app databases.
+- new projects temporarily default to owner user id `1` until the caller supplies
+  the canonical auth user id. No local user row is created for that value.
 - `slug` is optional but globally unique when present.
 - deletion is soft-delete by default.
-- this model does not perform commits.
+- this model does not perform queries, flushes, commits or rollbacks.
 - repository/service/route layers own database transactions.
 """
 
@@ -42,7 +46,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from typing import Any, Dict, Final, Optional, Tuple
 from uuid import uuid4
 
 
@@ -81,6 +86,15 @@ except Exception:  # pragma: no cover
 
 PROJECT_SCHEMA_VERSION = "project.schema.v2"
 
+# Temporary persistence default only. This value is not a local user record and
+# not an authentication fallback. App/auth integration can override it per
+# project as soon as canonical external user ids are available.
+DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = "1"
+PROJECT_OWNER_TYPE_USER: Final[str] = "user"
+VALID_PROJECT_OWNER_TYPES: Final[frozenset[str]] = frozenset(
+    {PROJECT_OWNER_TYPE_USER}
+)
+
 PROJECT_STATUS_ACTIVE = "active"
 PROJECT_STATUS_ARCHIVED = "archived"
 PROJECT_STATUS_DELETED = "deleted"
@@ -109,6 +123,9 @@ PROJECT_EXTERNAL_URL_MAX_LENGTH = 512
 
 PUBLIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+OWNER_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]*$")
+CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+
 
 
 def utc_now() -> datetime:
@@ -306,6 +323,183 @@ def normalize_status(value: Any) -> str:
         raise ValueError(f"Invalid project status '{value}'. Allowed: {allowed}.")
 
     return status
+
+
+@lru_cache(maxsize=128)
+def _normalize_owner_type_cached(text: str) -> str:
+    """Validate a canonical owner type without caching arbitrary objects."""
+    normalized = text.strip().lower()
+    if not normalized:
+        raise ValueError("owner_type is required when owner_id is present.")
+    if len(normalized) > PROJECT_OWNER_TYPE_MAX_LENGTH:
+        raise ValueError(
+            f"owner_type must not exceed {PROJECT_OWNER_TYPE_MAX_LENGTH} characters."
+        )
+    if not OWNER_TYPE_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "owner_type must start with a lowercase letter and may only contain "
+            "lowercase letters, numbers, underscores, dashes, dots and colons."
+        )
+    if normalized not in VALID_PROJECT_OWNER_TYPES:
+        allowed = ", ".join(sorted(VALID_PROJECT_OWNER_TYPES))
+        raise ValueError(
+            f"Invalid owner_type '{normalized}'. Allowed: {allowed}."
+        )
+    return normalized
+
+
+def normalize_owner_type(value: Any) -> Optional[str]:
+    """Normalize an optional project owner type."""
+    if value is None:
+        return None
+    try:
+        text = str(value)
+    except Exception as exc:
+        raise ValueError("owner_type must be text-like.") from exc
+    if not text.strip():
+        return None
+    return _normalize_owner_type_cached(text)
+
+
+@lru_cache(maxsize=2048)
+def _normalize_external_user_id_cached(text: str, field_name: str) -> str:
+    """Validate a canonical external user id without caching caller objects."""
+    normalized = text.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required.")
+    if len(normalized) > PROJECT_USER_ID_MAX_LENGTH:
+        raise ValueError(
+            f"{field_name} must not exceed {PROJECT_USER_ID_MAX_LENGTH} characters."
+        )
+    if CONTROL_CHARACTER_PATTERN.search(normalized):
+        raise ValueError(f"{field_name} must not contain control characters.")
+    return normalized
+
+
+def normalize_external_user_id(
+    value: Any,
+    *,
+    field_name: str,
+    required: bool = False,
+) -> Optional[str]:
+    """
+    Normalize an external user id.
+
+    User ids are deliberately not restricted to UUIDs. Numeric placeholders,
+    UUIDs and future auth public ids remain valid as long as they are non-empty,
+    bounded strings without control characters.
+    """
+    if value is None:
+        if required:
+            raise ValueError(f"{field_name} is required.")
+        return None
+    try:
+        text = str(value)
+    except Exception as exc:
+        raise ValueError(f"{field_name} must be text-like.") from exc
+    if not text.strip():
+        if required:
+            raise ValueError(f"{field_name} is required.")
+        return None
+    return _normalize_external_user_id_cached(text, field_name)
+
+
+def normalize_owner_pair(
+    *,
+    owner_type: Any = None,
+    owner_id: Any = None,
+    owner_user_id: Any = None,
+    required: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normalize the atomic owner pair.
+
+    `ownerUserId` is the preferred external contract. The generic owner_type /
+    owner_id pair remains available for stored-model compatibility, but the
+    current schema intentionally accepts only user ownership.
+    """
+    normalized_owner_user_id = normalize_external_user_id(
+        owner_user_id,
+        field_name="owner_user_id",
+        required=False,
+    )
+    normalized_owner_id = normalize_external_user_id(
+        owner_id,
+        field_name="owner_id",
+        required=False,
+    )
+    normalized_owner_type = normalize_owner_type(owner_type)
+
+    if normalized_owner_user_id is not None:
+        if (
+            normalized_owner_id is not None
+            and normalized_owner_id != normalized_owner_user_id
+        ):
+            raise ValueError(
+                "owner_user_id and owner_id refer to different external users."
+            )
+        if (
+            normalized_owner_type is not None
+            and normalized_owner_type != PROJECT_OWNER_TYPE_USER
+        ):
+            raise ValueError(
+                "owner_user_id requires owner_type='user'."
+            )
+        normalized_owner_type = PROJECT_OWNER_TYPE_USER
+        normalized_owner_id = normalized_owner_user_id
+
+    if normalized_owner_id is not None and normalized_owner_type is None:
+        normalized_owner_type = PROJECT_OWNER_TYPE_USER
+
+    if (normalized_owner_type is None) != (normalized_owner_id is None):
+        raise ValueError(
+            "owner_type and owner_id must either both be set or both be empty."
+        )
+
+    if required and normalized_owner_id is None:
+        raise ValueError("owner_user_id is required for a project.")
+
+    return normalized_owner_type, normalized_owner_id
+
+
+def get_project_normalization_cache_info() -> Dict[str, Any]:
+    """Return diagnostics for pure normalization caches only."""
+    return {
+        "ownerType": _normalize_owner_type_cached.cache_info()._asdict(),
+        "externalUserId": _normalize_external_user_id_cached.cache_info()._asdict(),
+    }
+
+
+def reset_project_normalization_caches() -> Dict[str, Any]:
+    """Clear pure normalization caches; no ORM/database state is cached here."""
+    before = get_project_normalization_cache_info()
+    _normalize_owner_type_cached.cache_clear()
+    _normalize_external_user_id_cached.cache_clear()
+    return {
+        "cleared": True,
+        "before": before,
+        "after": get_project_normalization_cache_info(),
+    }
+
+
+def _payload_first(
+    payload: Mapping[str, Any],
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Return the first explicitly present payload value, preserving falsey values."""
+    for key in keys:
+        if key in payload:
+            return payload.get(key)
+    return default
+
+
+def _payload_present_key(payload: Mapping[str, Any], *keys: str) -> Optional[str]:
+    """Return the first present key without reading through truthiness."""
+    for key in keys:
+        if key in payload:
+            return key
+    return None
 
 
 def normalize_metadata(value: Any) -> Dict[str, Any]:
@@ -580,6 +774,15 @@ class Project(db.Model):
             "revision >= 1",
             name="ck_projects_revision_positive",
         ),
+        db.CheckConstraint(
+            "owner_type IS NULL OR owner_type = 'user'",
+            name="ck_projects_owner_type_valid",
+        ),
+        db.CheckConstraint(
+            "(owner_type IS NULL AND owner_id IS NULL) OR "
+            "(owner_type IS NOT NULL AND owner_id IS NOT NULL)",
+            name="ck_projects_owner_pair_complete",
+        ),
         db.Index(
             "ix_projects_status_created_at",
             "status",
@@ -628,7 +831,7 @@ class Project(db.Model):
         return (
             f"<Project id={self.id!r} project_id={self.project_id!r} "
             f"external_app_project_id={self.external_app_project_id!r} "
-            f"status={self.status!r}>"
+            f"owner_user_id={self.owner_user_id!r} status={self.status!r}>"
         )
 
     @classmethod
@@ -648,28 +851,66 @@ class Project(db.Model):
         external_url: Optional[str] = None,
         owner_type: Optional[str] = None,
         owner_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
         created_by_user_id: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
         metadata_json: Optional[Mapping[str, Any]] = None,
     ) -> "Project":
         """
         Create a Project instance without adding it to a session.
 
-        Repository/service code is responsible for:
-        - checking uniqueness
-        - adding to db.session
-        - committing or rolling back
+        Until the app/auth owner id is supplied, new projects use the external
+        placeholder user id ``"1"``. This stores only an opaque reference and
+        does not create or authenticate a user.
+
+        Repository/service code is responsible for uniqueness checks, adding
+        the instance to a session and owning the transaction boundary.
         """
         public_project_id = normalize_project_id(project_id or generate_project_id())
-
         normalized_name = normalize_required_text(
             name or public_project_id,
             field_name="name",
             max_length=PROJECT_NAME_MAX_LENGTH,
         )
-
         normalized_status = normalize_status(status)
-        now = utc_now()
+        normalized_external_app_project_id = normalize_external_app_project_id(
+            external_app_project_id
+        )
+        normalized_source_service = normalize_optional_text(
+            source_service,
+            field_name="source_service",
+            max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
+        )
+        if (
+            normalized_external_app_project_id is not None
+            and normalized_source_service is None
+        ):
+            normalized_source_service = "vectoplan-app"
 
+        if owner_type is None and owner_id is None and owner_user_id is None:
+            owner_user_id = DEFAULT_PROJECT_OWNER_USER_ID
+        normalized_owner_type, normalized_owner_id = normalize_owner_pair(
+            owner_type=owner_type,
+            owner_id=owner_id,
+            owner_user_id=owner_user_id,
+            required=True,
+        )
+        normalized_created_by = normalize_external_user_id(
+            created_by_user_id,
+            field_name="created_by_user_id",
+            required=False,
+        )
+        if normalized_created_by is None:
+            normalized_created_by = normalized_owner_id
+        normalized_updated_by = normalize_external_user_id(
+            updated_by_user_id,
+            field_name="updated_by_user_id",
+            required=False,
+        )
+        if normalized_updated_by is None:
+            normalized_updated_by = normalized_created_by
+
+        now = utc_now()
         return cls(
             project_id=public_project_id,
             slug=normalize_slug(slug),
@@ -697,39 +938,17 @@ class Project(db.Model):
                 field_name="spawn_world_id",
                 max_length=PROJECT_DEFAULT_WORLD_ID_MAX_LENGTH,
             ),
-            external_app_project_id=normalize_external_app_project_id(
-                external_app_project_id,
-            ),
-            source_service=normalize_optional_text(
-                source_service,
-                field_name="source_service",
-                max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
-            ),
+            external_app_project_id=normalized_external_app_project_id,
+            source_service=normalized_source_service,
             external_url=normalize_optional_text(
                 external_url,
                 field_name="external_url",
                 max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
             ),
-            owner_type=normalize_optional_text(
-                owner_type,
-                field_name="owner_type",
-                max_length=PROJECT_OWNER_TYPE_MAX_LENGTH,
-            ),
-            owner_id=normalize_optional_text(
-                owner_id,
-                field_name="owner_id",
-                max_length=PROJECT_OWNER_ID_MAX_LENGTH,
-            ),
-            created_by_user_id=normalize_optional_text(
-                created_by_user_id,
-                field_name="created_by_user_id",
-                max_length=PROJECT_USER_ID_MAX_LENGTH,
-            ),
-            updated_by_user_id=normalize_optional_text(
-                created_by_user_id,
-                field_name="updated_by_user_id",
-                max_length=PROJECT_USER_ID_MAX_LENGTH,
-            ),
+            owner_type=normalized_owner_type,
+            owner_id=normalized_owner_id,
+            created_by_user_id=normalized_created_by,
+            updated_by_user_id=normalized_updated_by,
             metadata_json=normalize_metadata(metadata_json),
             created_at=now,
             updated_at=now,
@@ -744,13 +963,10 @@ class Project(db.Model):
         project_id: str = "dev-project",
         default_universe_id: str = "dev-universe",
         default_world_id: str = "world_spawn",
+        owner_user_id: str = DEFAULT_PROJECT_OWNER_USER_ID,
         created_by_user_id: Optional[str] = None,
     ) -> "Project":
-        """
-        Create the default development project instance.
-
-        This is useful for idempotent local DB bootstrap.
-        """
+        """Create the default development project for idempotent DB bootstrap."""
         return cls.create(
             project_id=project_id,
             slug=project_id,
@@ -760,11 +976,13 @@ class Project(db.Model):
             default_world_id=default_world_id,
             spawn_world_id=default_world_id,
             source_service="vectoplan-chunk",
-            created_by_user_id=created_by_user_id,
+            owner_user_id=owner_user_id,
+            created_by_user_id=created_by_user_id or owner_user_id,
             metadata_json={
                 "seed": True,
                 "seedType": "development",
                 "createdBy": "vectoplan-chunk",
+                "ownerUserId": str(owner_user_id),
             },
         )
 
@@ -781,22 +999,28 @@ class Project(db.Model):
         spawn_world_id: Optional[str] = None,
         source_service: str = "vectoplan-app",
         external_url: Optional[str] = None,
+        owner_user_id: str = DEFAULT_PROJECT_OWNER_USER_ID,
         created_by_user_id: Optional[str] = None,
         metadata_json: Optional[Mapping[str, Any]] = None,
     ) -> "Project":
         """
         Create a chunk Project linked to a vectoplan-app project.
 
-        This method only creates the Project object. Universe/WorldInstance
-        creation belongs in the provisioning service/route transaction.
+        The App Project id and owner user id are opaque external references;
+        neither creates a database foreign key across service boundaries.
+        Universe/WorldInstance creation remains in the provisioning transaction.
         """
         normalized_app_project_id = normalize_external_app_project_id(
             app_project_public_id
         )
-
         if normalized_app_project_id is None:
             raise ValueError("app_project_public_id is required.")
 
+        normalized_owner_user_id = normalize_external_user_id(
+            owner_user_id,
+            field_name="owner_user_id",
+            required=True,
+        )
         if chunk_project_id is None:
             chunk_project_id = f"chk_prj_{normalized_app_project_id}_{uuid4().hex[:12]}"
 
@@ -804,11 +1028,11 @@ class Project(db.Model):
             {
                 "sourceService": source_service,
                 "externalAppProjectId": normalized_app_project_id,
+                "ownerUserId": normalized_owner_user_id,
                 "createdBy": "vectoplan-chunk.project-provisioning",
             },
             metadata_json,
         )
-
         return cls.create(
             project_id=chunk_project_id,
             slug=chunk_project_id,
@@ -820,7 +1044,8 @@ class Project(db.Model):
             external_app_project_id=normalized_app_project_id,
             source_service=source_service,
             external_url=external_url,
-            created_by_user_id=created_by_user_id,
+            owner_user_id=normalized_owner_user_id,
+            created_by_user_id=created_by_user_id or normalized_owner_user_id,
             metadata_json=metadata,
         )
 
@@ -831,74 +1056,73 @@ class Project(db.Model):
         *,
         created_by_user_id: Optional[str] = None,
     ) -> "Project":
-        """
-        Create a Project instance from an API-style payload.
-
-        Supported keys:
-        - projectId / project_id / chunkProjectId / chunk_project_id
-        - name / projectName
-        - slug
-        - description
-        - defaultUniverseId / default_universe_id
-        - defaultWorldId / default_world_id
-        - spawnWorldId / spawn_world_id
-        - externalAppProjectId / external_app_project_id / appProjectPublicId
-        - sourceService / source_service
-        - externalUrl / external_url
-        - ownerType / owner_type
-        - ownerId / owner_id
-        - metadata / metadataJson / metadata_json
-        """
+        """Create a Project from compatible camelCase/snake_case API keys."""
         if not isinstance(payload, Mapping):
             raise ValueError("Project create payload must be a JSON object.")
 
         metadata_value = _payload_metadata_value(payload)
-
-        app_project_public_id = (
-            payload.get("externalAppProjectId")
-            or payload.get("external_app_project_id")
-            or payload.get("appProjectPublicId")
-            or payload.get("app_project_public_id")
-            or payload.get("appProjectId")
-            or payload.get("app_project_id")
+        app_project_public_id = _payload_first(
+            payload,
+            "externalAppProjectId",
+            "external_app_project_id",
+            "appProjectPublicId",
+            "app_project_public_id",
+            "appProjectId",
+            "app_project_id",
+        )
+        project_id = _payload_first(
+            payload,
+            "chunkProjectId",
+            "chunk_project_id",
+            "projectId",
+            "project_id",
+        )
+        owner_user_id = _payload_first(
+            payload,
+            "ownerUserId",
+            "owner_user_id",
+            default=None,
         )
 
-        project_id = (
-            payload.get("chunkProjectId")
-            or payload.get("chunk_project_id")
-            or payload.get("projectId")
-            or payload.get("project_id")
-        )
+        # Actor fields are trusted method arguments, not user-controlled body
+        # fields. If omitted, create() safely falls back to the owner user id.
+        trusted_created_by = created_by_user_id
 
         return cls.create(
             project_id=project_id,
-            name=payload.get("name") or payload.get("projectName") or payload.get("project_name"),
-            slug=payload.get("slug"),
-            description=payload.get("description"),
-            default_universe_id=(
-                payload.get("defaultUniverseId")
-                or payload.get("default_universe_id")
-                or payload.get("universeId")
-                or payload.get("universe_id")
+            name=_payload_first(payload, "name", "projectName", "project_name"),
+            slug=_payload_first(payload, "slug"),
+            description=_payload_first(payload, "description"),
+            status=_payload_first(payload, "status", default=PROJECT_STATUS_ACTIVE),
+            default_universe_id=_payload_first(
+                payload,
+                "defaultUniverseId",
+                "default_universe_id",
+                "universeId",
+                "universe_id",
             ),
-            default_world_id=(
-                payload.get("defaultWorldId")
-                or payload.get("default_world_id")
-                or payload.get("worldId")
-                or payload.get("world_id")
+            default_world_id=_payload_first(
+                payload,
+                "defaultWorldId",
+                "default_world_id",
+                "worldId",
+                "world_id",
             ),
-            spawn_world_id=(
-                payload.get("spawnWorldId")
-                or payload.get("spawn_world_id")
-                or payload.get("worldId")
-                or payload.get("world_id")
+            spawn_world_id=_payload_first(
+                payload,
+                "spawnWorldId",
+                "spawn_world_id",
+                "worldId",
+                "world_id",
             ),
             external_app_project_id=app_project_public_id,
-            source_service=payload.get("sourceService") or payload.get("source_service"),
-            external_url=payload.get("externalUrl") or payload.get("external_url"),
-            owner_type=payload.get("ownerType") or payload.get("owner_type"),
-            owner_id=payload.get("ownerId") or payload.get("owner_id"),
-            created_by_user_id=created_by_user_id,
+            source_service=_payload_first(payload, "sourceService", "source_service"),
+            external_url=_payload_first(payload, "externalUrl", "external_url"),
+            owner_type=_payload_first(payload, "ownerType", "owner_type"),
+            owner_id=_payload_first(payload, "ownerId", "owner_id"),
+            owner_user_id=owner_user_id,
+            created_by_user_id=trusted_created_by,
+            updated_by_user_id=trusted_created_by,
             metadata_json=metadata_value,
         )
 
@@ -927,15 +1151,43 @@ class Project(db.Model):
         """Compatibility alias for external_app_project_id."""
         return self.external_app_project_id
 
+    @property
+    def has_owner(self) -> bool:
+        """Return whether the complete owner pair is present."""
+        return bool(self.owner_type and self.owner_id)
+
+    @property
+    def is_user_owned(self) -> bool:
+        """Return whether this project has a canonical external user owner."""
+        return self.owner_type == PROJECT_OWNER_TYPE_USER and bool(self.owner_id)
+
+    @property
+    def owner_user_id(self) -> Optional[str]:
+        """Preferred compatibility alias for a user-owned project's owner id."""
+        if not self.is_user_owned:
+            return None
+        return self.owner_id
+
+    @property
+    def owner_reference(self) -> Optional[Dict[str, str]]:
+        """Return a small service-reference object without resolving a user."""
+        if not self.has_owner:
+            return None
+        return {
+            "type": str(self.owner_type),
+            "id": str(self.owner_id),
+            "userId": self.owner_user_id,
+        }
+
     def touch(self, *, updated_by_user_id: Optional[str] = None) -> None:
         """Mark the project as updated and increment its optimistic revision."""
         self.updated_at = utc_now()
         self.revision = int(self.revision or 1) + 1
 
-        normalized_user_id = normalize_optional_text(
+        normalized_user_id = normalize_external_user_id(
             updated_by_user_id,
             field_name="updated_by_user_id",
-            max_length=PROJECT_USER_ID_MAX_LENGTH,
+            required=False,
         )
 
         if normalized_user_id is not None:
@@ -1079,48 +1331,134 @@ class Project(db.Model):
         source_service: Optional[str] = "vectoplan-app",
         external_url: Optional[str] = None,
         updated_by_user_id: Optional[str] = None,
+        allow_replace: bool = True,
     ) -> None:
-        """
-        Link or clear this chunk project to a vectoplan-app project.
-
-        This is not a database foreign key. It is a stable service-reference id.
-        """
+        """Link or clear the external App Project service reference."""
         self.ensure_not_deleted()
-        self.external_app_project_id = normalize_external_app_project_id(
-            external_app_project_id,
+        normalized_external_id = normalize_external_app_project_id(
+            external_app_project_id
         )
-        self.source_service = normalize_optional_text(
+        if (
+            not allow_replace
+            and self.external_app_project_id is not None
+            and normalized_external_id is not None
+            and self.external_app_project_id != normalized_external_id
+        ):
+            raise ValueError(
+                "Project is already linked to a different external app project."
+            )
+
+        normalized_source = normalize_optional_text(
             source_service,
             field_name="source_service",
             max_length=PROJECT_SOURCE_SERVICE_MAX_LENGTH,
         )
-        self.external_url = normalize_optional_text(
+        normalized_url = normalize_optional_text(
             external_url,
             field_name="external_url",
             max_length=PROJECT_EXTERNAL_URL_MAX_LENGTH,
         )
+        if (
+            self.external_app_project_id == normalized_external_id
+            and self.source_service == normalized_source
+            and self.external_url == normalized_url
+        ):
+            return
+
+        self.external_app_project_id = normalized_external_id
+        self.source_service = normalized_source
+        self.external_url = normalized_url
         self.touch(updated_by_user_id=updated_by_user_id)
+
+    def ensure_external_app_link(
+        self,
+        *,
+        external_app_project_id: str,
+        source_service: str = "vectoplan-app",
+        external_url: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Idempotently establish one immutable App Project link."""
+        self.set_external_app_link(
+            external_app_project_id=external_app_project_id,
+            source_service=source_service,
+            external_url=external_url,
+            updated_by_user_id=updated_by_user_id,
+            allow_replace=False,
+        )
 
     def set_owner(
         self,
         *,
-        owner_type: Optional[str],
-        owner_id: Optional[str],
+        owner_type: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+        updated_by_user_id: Optional[str] = None,
+        allow_clear: bool = False,
+    ) -> None:
+        """Set the complete project owner pair atomically."""
+        self.ensure_not_deleted()
+        wants_clear = (
+            owner_type is None and owner_id is None and owner_user_id is None
+        )
+        if wants_clear:
+            if not allow_clear:
+                raise ValueError(
+                    "Project ownership cannot be cleared unless allow_clear=True."
+                )
+            normalized_owner_type = None
+            normalized_owner_id = None
+        else:
+            normalized_owner_type, normalized_owner_id = normalize_owner_pair(
+                owner_type=owner_type,
+                owner_id=owner_id,
+                owner_user_id=owner_user_id,
+                required=True,
+            )
+
+        if (
+            self.owner_type == normalized_owner_type
+            and self.owner_id == normalized_owner_id
+        ):
+            return
+        self.owner_type = normalized_owner_type
+        self.owner_id = normalized_owner_id
+        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def set_owner_user(
+        self,
+        owner_user_id: str,
+        *,
         updated_by_user_id: Optional[str] = None,
     ) -> None:
-        """Set or clear project ownership metadata."""
-        self.ensure_not_deleted()
-        self.owner_type = normalize_optional_text(
-            owner_type,
-            field_name="owner_type",
-            max_length=PROJECT_OWNER_TYPE_MAX_LENGTH,
+        """Set or transfer ownership to one external user id."""
+        self.set_owner(
+            owner_user_id=owner_user_id,
+            updated_by_user_id=updated_by_user_id,
         )
-        self.owner_id = normalize_optional_text(
-            owner_id,
-            field_name="owner_id",
-            max_length=PROJECT_OWNER_ID_MAX_LENGTH,
+
+    def clear_owner(
+        self,
+        *,
+        updated_by_user_id: Optional[str] = None,
+    ) -> None:
+        """Explicit maintenance helper; normal project flows should keep an owner."""
+        self.set_owner(
+            updated_by_user_id=updated_by_user_id,
+            allow_clear=True,
         )
-        self.touch(updated_by_user_id=updated_by_user_id)
+
+    def is_owned_by_user(self, user_id: Any) -> bool:
+        """Compare against one external user id without database lookup."""
+        try:
+            normalized = normalize_external_user_id(
+                user_id,
+                field_name="user_id",
+                required=True,
+            )
+        except Exception:
+            return False
+        return self.owner_user_id == normalized
 
     def set_status(
         self,
@@ -1237,6 +1575,8 @@ class Project(db.Model):
             "chunkUniverseId": chunk_universe_id or self.default_universe_id,
             "chunkWorldId": chunk_world_id or self.spawn_world_id or self.default_world_id,
             "sourceService": self.source_service,
+            "ownerType": self.owner_type,
+            "ownerUserId": self.owner_user_id,
             "routeHints": make_json_safe(route_hints or {}),
             "appPayload": make_json_safe(app_payload or {}),
             "linkedAt": datetime_to_iso(utc_now()),
@@ -1270,8 +1610,8 @@ class Project(db.Model):
         - externalAppProjectId / external_app_project_id
         - sourceService / source_service
         - externalUrl / external_url
-        - ownerType / owner_type
-        - ownerId / owner_id
+        - ownerUserId / owner_user_id (preferred)
+        - ownerType / owner_type + ownerId / owner_id (atomic compatibility pair)
         - metadata / metadataJson / metadata_json
         - metadataMerge
         - metadataRemoveKeys
@@ -1371,25 +1711,66 @@ class Project(db.Model):
             )
             changed = True
 
-        if "ownerType" in payload or "owner_type" in payload:
-            self.owner_type = normalize_optional_text(
-                payload.get("ownerType")
-                if "ownerType" in payload
-                else payload.get("owner_type"),
-                field_name="owner_type",
-                max_length=PROJECT_OWNER_TYPE_MAX_LENGTH,
-            )
-            changed = True
+        owner_user_key = _payload_present_key(
+            payload,
+            "ownerUserId",
+            "owner_user_id",
+        )
+        owner_type_key = _payload_present_key(payload, "ownerType", "owner_type")
+        owner_id_key = _payload_present_key(payload, "ownerId", "owner_id")
 
-        if "ownerId" in payload or "owner_id" in payload:
-            self.owner_id = normalize_optional_text(
-                payload.get("ownerId")
-                if "ownerId" in payload
-                else payload.get("owner_id"),
-                field_name="owner_id",
-                max_length=PROJECT_OWNER_ID_MAX_LENGTH,
+        if owner_user_key is not None:
+            owner_user_value = payload.get(owner_user_key)
+            generic_owner_type = (
+                payload.get(owner_type_key) if owner_type_key is not None else None
             )
-            changed = True
+            generic_owner_id = (
+                payload.get(owner_id_key) if owner_id_key is not None else None
+            )
+            normalized_owner_type, normalized_owner_id = normalize_owner_pair(
+                owner_type=generic_owner_type,
+                owner_id=generic_owner_id,
+                owner_user_id=owner_user_value,
+                required=True,
+            )
+            if (
+                self.owner_type != normalized_owner_type
+                or self.owner_id != normalized_owner_id
+            ):
+                self.owner_type = normalized_owner_type
+                self.owner_id = normalized_owner_id
+                changed = True
+        elif owner_type_key is not None or owner_id_key is not None:
+            if (
+                owner_type_key is not None
+                and normalize_owner_type(payload.get(owner_type_key)) is None
+            ):
+                raise ValueError(
+                    "ownerType cannot be cleared independently; use a complete "
+                    "owner transfer instead."
+                )
+            proposed_owner_type = (
+                payload.get(owner_type_key)
+                if owner_type_key is not None
+                else self.owner_type
+            )
+            proposed_owner_id = (
+                payload.get(owner_id_key)
+                if owner_id_key is not None
+                else self.owner_id
+            )
+            normalized_owner_type, normalized_owner_id = normalize_owner_pair(
+                owner_type=proposed_owner_type,
+                owner_id=proposed_owner_id,
+                required=True,
+            )
+            if (
+                self.owner_type != normalized_owner_type
+                or self.owner_id != normalized_owner_id
+            ):
+                self.owner_type = normalized_owner_type
+                self.owner_id = normalized_owner_id
+                changed = True
 
         metadata_replace_key = None
         for candidate in ("metadataJson", "metadata_json", "metadata"):
@@ -1514,6 +1895,10 @@ class Project(db.Model):
                 )
             except Exception as exc:
                 errors["sourceService"] = str(exc)
+        elif self.external_app_project_id is not None:
+            errors["sourceService"] = (
+                "source_service is required when external_app_project_id is set."
+            )
 
         if self.external_url is not None:
             try:
@@ -1525,8 +1910,43 @@ class Project(db.Model):
             except Exception as exc:
                 errors["externalUrl"] = str(exc)
 
-        if self.revision is None or int(self.revision) < 1:
-            errors["revision"] = "revision must be greater than or equal to 1."
+        try:
+            normalize_owner_pair(
+                owner_type=self.owner_type,
+                owner_id=self.owner_id,
+                required=True,
+            )
+        except Exception as exc:
+            errors["ownerUserId"] = str(exc)
+
+        for field_name in ("created_by_user_id", "updated_by_user_id"):
+            value = getattr(self, field_name, None)
+            try:
+                normalize_external_user_id(
+                    value,
+                    field_name=field_name,
+                    required=field_name == "created_by_user_id",
+                )
+            except Exception as exc:
+                response_key = (
+                    "createdByUserId"
+                    if field_name == "created_by_user_id"
+                    else "updatedByUserId"
+                )
+                errors[response_key] = str(exc)
+
+        try:
+            if self.revision is None or int(self.revision) < 1:
+                errors["revision"] = (
+                    "revision must be greater than or equal to 1."
+                )
+        except Exception as exc:
+            errors["revision"] = f"revision must be an integer: {exc}"
+
+        if self.status == PROJECT_STATUS_ACTIVE and self.deleted_at is not None:
+            errors["deletedAt"] = "active projects must not have deleted_at set."
+        if self.status == PROJECT_STATUS_DELETED and self.deleted_at is None:
+            errors["deletedAt"] = "deleted projects must have deleted_at set."
 
         return errors
 
@@ -1559,6 +1979,8 @@ class Project(db.Model):
             "externalUrl": self.external_url,
             "ownerType": self.owner_type,
             "ownerId": self.owner_id,
+            "ownerUserId": self.owner_user_id,
+            "owner": make_json_safe(self.owner_reference),
             "createdByUserId": self.created_by_user_id,
             "updatedByUserId": self.updated_by_user_id,
             "createdAt": datetime_to_iso(self.created_at),
@@ -1570,6 +1992,8 @@ class Project(db.Model):
                 "archived": self.is_archived,
                 "deleted": self.is_deleted,
                 "linkedToAppProject": self.has_external_app_link,
+                "hasOwner": self.has_owner,
+                "userOwned": self.is_user_owned,
             },
         }
 
@@ -1584,3 +2008,34 @@ class Project(db.Model):
     def to_public_dict(self) -> Dict[str, Any]:
         """Serialize without internal database identifiers."""
         return self.to_dict(include_internal=False, include_metadata=True)
+
+
+__all__ = [
+    "PROJECT_SCHEMA_VERSION",
+    "DEFAULT_PROJECT_OWNER_USER_ID",
+    "PROJECT_OWNER_TYPE_USER",
+    "VALID_PROJECT_OWNER_TYPES",
+    "PROJECT_STATUS_ACTIVE",
+    "PROJECT_STATUS_ARCHIVED",
+    "PROJECT_STATUS_DELETED",
+    "VALID_PROJECT_STATUSES",
+    "Project",
+    "utc_now",
+    "datetime_to_iso",
+    "make_json_safe",
+    "normalize_optional_text",
+    "normalize_required_text",
+    "normalize_public_id",
+    "normalize_project_id",
+    "normalize_external_app_project_id",
+    "normalize_slug",
+    "normalize_status",
+    "normalize_external_user_id",
+    "normalize_owner_type",
+    "normalize_owner_pair",
+    "normalize_metadata",
+    "generate_project_id",
+    "get_project_normalization_cache_info",
+    "reset_project_normalization_caches",
+]
+

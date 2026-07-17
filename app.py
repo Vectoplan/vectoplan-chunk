@@ -9,17 +9,20 @@ Responsibilities:
 - initialize shared extensions such as SQLAlchemy and migrations
 - import/register SQLAlchemy models
 - optionally check database connectivity
-- register blueprints
-- run optional startup hooks
-- store service metadata under app.extensions
+- register the central route registry
+- verify/register the productive project-access blueprint
+- run optional read-only startup hooks
+- store service, routing and project-access metadata under app.extensions
 
 Important boundaries:
 - no chunk generation here
 - no command execution here
 - no repository logic here
 - no direct snapshot/event writes here
-- no direct project/world bootstrap writes here
+- no direct project/world/access bootstrap writes here
 - no direct database migrations here
+- no authentication or authorization enforcement here
+- no runtime schema creation or default seeding here
 
 Core runtime semantics:
 
@@ -45,10 +48,10 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Mapping
 
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Blueprint, Flask
 
 
 # -----------------------------------------------------------------------------
@@ -71,6 +74,22 @@ _DEFAULT_STARTUP_MODULE_CANDIDATES = (
 )
 
 _ROUTE_MODULE_NAME = "routes"
+
+APP_FACTORY_VERSION = "app-factory.v2"
+
+_PROJECT_ACCESS_BLUEPRINT_NAME = "project_access"
+_PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE = "project_access_bp"
+_PROJECT_ACCESS_ROUTE_MODULE_CANDIDATES = (
+    "routes.project_access",
+)
+_PROJECT_ACCESS_REQUIRED_RULES = (
+    "/project-access/_status",
+    "/projects/<project_id>/access",
+    "/projects/<project_id>/access/initialize",
+    "/projects/<project_id>/roles",
+    "/projects/<project_id>/groups",
+    "/projects/<project_id>/assignments",
+)
 
 
 # -----------------------------------------------------------------------------
@@ -596,6 +615,8 @@ def _apply_config(app: Flask, config_class: type) -> None:
     app.config.setdefault("SERVICE_NAME", _DEFAULT_SERVICE_NAME)
     app.config.setdefault("APP_NAME", _DEFAULT_APP_NAME)
     app.config.setdefault("APP_DISPLAY_NAME", _DEFAULT_APP_DISPLAY_NAME)
+    app.config.setdefault("VECTOPLAN_CHUNK_ENABLE_PROJECT_ACCESS_ROUTES", True)
+    app.config.setdefault("VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_ROUTES", True)
 
     metadata = _ensure_app_metadata_registry(app)
 
@@ -617,10 +638,26 @@ def _apply_config(app: Flask, config_class: type) -> None:
     metadata["startup_hook_name"] = None
     metadata["startup_skipped"] = False
     metadata["blueprints_registered"] = False
+    metadata["app_factory_version"] = APP_FACTORY_VERSION
     metadata["project_scoped_api_enabled"] = True
     metadata["world_state_api_enabled"] = True
+    metadata["project_access_api_enabled"] = _safe_bool_config(
+        app,
+        "VECTOPLAN_CHUNK_ENABLE_PROJECT_ACCESS_ROUTES",
+        True,
+    )
+    metadata["project_access_routes_required"] = _safe_bool_config(
+        app,
+        "VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_ROUTES",
+        True,
+    )
+    metadata["project_access_authz_enforced"] = False
+    metadata["project_access_blueprint_registered"] = False
+    metadata["project_access_blueprint_registration"] = None
     metadata["legacy_editor_compatibility_enabled"] = True
     metadata["database_startup_check"] = None
+    metadata["routing_snapshot"] = None
+    metadata["startup_routing_snapshot"] = None
 
     try:
         build_database_config = getattr(config_class, "build_database_config", None)
@@ -786,9 +823,290 @@ def _run_database_startup_check(app: Flask) -> None:
 # Blueprint registration
 # -----------------------------------------------------------------------------
 
+def _collect_registered_blueprint_names(app: Flask) -> list[str]:
+    """Return actual Flask blueprint names, independent of registry metadata."""
+    try:
+        blueprints = getattr(app, "blueprints", {})
+        return sorted(str(name) for name in blueprints.keys())
+    except Exception:
+        return []
+
+
+def _collect_route_rules(app: Flask) -> list[str]:
+    """Return the current URL rules without invoking route handlers."""
+    try:
+        return sorted({str(rule.rule) for rule in app.url_map.iter_rules()})
+    except Exception:
+        return []
+
+
+def _build_app_routing_snapshot(app: Flask) -> dict[str, Any]:
+    """Build compact, read-only routing diagnostics from the Flask app itself."""
+    blueprint_names = _collect_registered_blueprint_names(app)
+    rules = _collect_route_rules(app)
+    rule_set = set(rules)
+    missing_project_access_rules = [
+        rule for rule in _PROJECT_ACCESS_REQUIRED_RULES if rule not in rule_set
+    ]
+
+    return {
+        "blueprintCount": len(blueprint_names),
+        "blueprints": blueprint_names,
+        "routeCount": len(rules),
+        "projectAccess": {
+            "blueprintName": _PROJECT_ACCESS_BLUEPRINT_NAME,
+            "registered": _PROJECT_ACCESS_BLUEPRINT_NAME in blueprint_names,
+            "requiredRules": list(_PROJECT_ACCESS_REQUIRED_RULES),
+            "missingRequiredRules": missing_project_access_rules,
+            "ready": bool(
+                _PROJECT_ACCESS_BLUEPRINT_NAME in blueprint_names
+                and not missing_project_access_rules
+            ),
+            "authzEnforced": False,
+        },
+    }
+
+
+def _project_access_routes_enabled(app: Flask) -> bool:
+    """Return whether the prepared project-access HTTP surface is enabled."""
+    return _safe_bool_config(
+        app,
+        "VECTOPLAN_CHUNK_ENABLE_PROJECT_ACCESS_ROUTES",
+        True,
+    )
+
+
+def _project_access_routes_required(app: Flask) -> bool:
+    """Return whether missing project-access routes must block app creation."""
+    return _safe_bool_config(
+        app,
+        "VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_ROUTES",
+        True,
+    )
+
+
+def _is_blueprint_like(value: Any) -> bool:
+    """Return whether a value can safely be passed to register_blueprint()."""
+    if isinstance(value, Blueprint):
+        return True
+
+    try:
+        return bool(
+            _normalize_text(getattr(value, "name", None))
+            and callable(getattr(value, "register", None))
+        )
+    except Exception:
+        return False
+
+
+def _load_project_access_blueprint(
+    routes_module: ModuleType | None = None,
+) -> tuple[Any, str]:
+    """
+    Resolve ``project_access_bp`` from the central registry or route module.
+
+    This fallback keeps one-file rollout safe while ``routes/__init__.py`` may
+    still be on an older revision. Once the central registry contains the
+    blueprint, this function is not used during normal startup.
+    """
+    candidates: list[tuple[ModuleType, str]] = []
+
+    if routes_module is not None:
+        candidates.append((routes_module, _ROUTE_MODULE_NAME))
+
+    import_errors: list[str] = []
+
+    for module_name in _PROJECT_ACCESS_ROUTE_MODULE_CANDIDATES:
+        try:
+            candidates.append((_import_module(module_name), module_name))
+        except Exception as exc:
+            import_errors.append(
+                f"{module_name}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+
+    for module, source in candidates:
+        try:
+            blueprint = getattr(module, _PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE, None)
+        except Exception:
+            blueprint = None
+
+        if not _is_blueprint_like(blueprint):
+            continue
+
+        blueprint_name = _normalize_text(
+            getattr(blueprint, "name", None),
+            "",
+        )
+        if blueprint_name != _PROJECT_ACCESS_BLUEPRINT_NAME:
+            raise RuntimeError(
+                "Project-access blueprint has an unexpected name: "
+                f"{blueprint_name!r}; expected "
+                f"{_PROJECT_ACCESS_BLUEPRINT_NAME!r}."
+            )
+
+        return blueprint, source
+
+    details = " | ".join(import_errors) if import_errors else "no candidate exported it"
+    raise RuntimeError(
+        "Could not resolve routes.project_access:project_access_bp; " + details
+    )
+
+
+def _ensure_project_access_blueprint_registered(
+    app: Flask,
+    routes_module: ModuleType,
+) -> dict[str, Any]:
+    """
+    Verify or supplement registration of the productive access blueprint.
+
+    Exactly-once behavior is based on Flask's authoritative ``app.blueprints``
+    mapping. No route or database mutation is performed beyond normal blueprint
+    registration during app construction.
+    """
+    enabled = _project_access_routes_enabled(app)
+    required = _project_access_routes_required(app)
+    before_names = _collect_registered_blueprint_names(app)
+
+    diagnostics: dict[str, Any] = {
+        "enabled": enabled,
+        "required": required,
+        "authzEnforced": False,
+        "blueprintName": _PROJECT_ACCESS_BLUEPRINT_NAME,
+        "blueprintAttribute": _PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE,
+        "moduleCandidates": list(_PROJECT_ACCESS_ROUTE_MODULE_CANDIDATES),
+        "requiredRules": list(_PROJECT_ACCESS_REQUIRED_RULES),
+        "registeredBeforeSupplement": (
+            _PROJECT_ACCESS_BLUEPRINT_NAME in before_names
+        ),
+        "registered": False,
+        "registrationSource": None,
+        "supplementalRegistration": False,
+        "missingRequiredRules": [],
+        "error": None,
+    }
+
+    if not enabled:
+        diagnostics["registered"] = (
+            _PROJECT_ACCESS_BLUEPRINT_NAME in before_names
+        )
+        diagnostics["registrationSource"] = (
+            "central_registry_despite_disabled_gate"
+            if diagnostics["registered"]
+            else "disabled"
+        )
+        return diagnostics
+
+    if _PROJECT_ACCESS_BLUEPRINT_NAME in before_names:
+        diagnostics["registered"] = True
+        diagnostics["registrationSource"] = "routes.register_blueprints"
+    else:
+        try:
+            blueprint, source = _load_project_access_blueprint(routes_module)
+            app.register_blueprint(blueprint)
+            diagnostics["registered"] = True
+            diagnostics["registrationSource"] = source
+            diagnostics["supplementalRegistration"] = True
+            _safe_log_info(
+                app,
+                "Project-access blueprint registered by app-factory fallback "
+                "(source=%s).",
+                source,
+            )
+        except Exception as exc:
+            diagnostics["error"] = _safe_exception_message(exc)
+            diagnostics["errorType"] = exc.__class__.__name__
+            if required:
+                raise RuntimeError(
+                    "Required project-access blueprint registration failed."
+                ) from exc
+            _safe_log_warning(
+                app,
+                "Optional project-access blueprint registration failed: %s",
+                diagnostics["error"],
+            )
+
+    after_names = _collect_registered_blueprint_names(app)
+    diagnostics["registered"] = (
+        _PROJECT_ACCESS_BLUEPRINT_NAME in after_names
+    )
+
+    rule_set = set(_collect_route_rules(app))
+    diagnostics["missingRequiredRules"] = [
+        rule for rule in _PROJECT_ACCESS_REQUIRED_RULES if rule not in rule_set
+    ]
+    diagnostics["ready"] = bool(
+        diagnostics["registered"]
+        and not diagnostics["missingRequiredRules"]
+    )
+
+    if required and not diagnostics["ready"]:
+        raise RuntimeError(
+            "Project-access blueprint is not ready after registration; "
+            f"registered={diagnostics['registered']}, "
+            f"missingRules={diagnostics['missingRequiredRules']}."
+        )
+
+    return diagnostics
+
+
+def _refresh_route_registry_metadata(
+    app: Flask,
+    routes_module: ModuleType,
+    project_access_diagnostics: Mapping[str, Any],
+) -> None:
+    """Store central-registry and authoritative Flask routing diagnostics."""
+    metadata = _ensure_app_metadata_registry(app)
+    metadata["blueprints_registered"] = True
+    metadata["registered_blueprint_names"] = _collect_registered_blueprint_names(app)
+    metadata["project_access_blueprint_registered"] = bool(
+        project_access_diagnostics.get("registered")
+    )
+    metadata["project_access_blueprint_registration"] = dict(
+        project_access_diagnostics
+    )
+    metadata["routing_snapshot"] = _build_app_routing_snapshot(app)
+
+    get_registered_blueprint_names = getattr(
+        routes_module,
+        "get_registered_blueprint_names",
+        None,
+    )
+    if callable(get_registered_blueprint_names):
+        try:
+            metadata["route_registry_blueprint_names"] = list(
+                get_registered_blueprint_names(app)
+            )
+        except Exception as exc:
+            metadata["route_registry_blueprint_names_error"] = (
+                _safe_exception_message(exc)
+            )
+
+    get_routing_metadata = getattr(routes_module, "get_routing_metadata", None)
+    if callable(get_routing_metadata):
+        try:
+            route_metadata = get_routing_metadata(app)
+            if isinstance(route_metadata, dict):
+                route_metadata = dict(route_metadata)
+            else:
+                route_metadata = {"registryMetadata": route_metadata}
+            route_metadata["appFactorySupplement"] = {
+                "version": APP_FACTORY_VERSION,
+                "projectAccess": dict(project_access_diagnostics),
+                "authoritativeSnapshot": metadata["routing_snapshot"],
+            }
+            metadata["routing_metadata"] = route_metadata
+        except Exception as exc:
+            metadata["routing_metadata_error"] = _safe_exception_message(exc)
+
+
 def _register_blueprints(app: Flask) -> None:
     """
-    Import routes defensively and register blueprints.
+    Register central route blueprints and verify the project-access surface.
+
+    The central ``routes`` registry remains authoritative. The direct
+    ``routes.project_access`` import is only a rollout fallback for a registry
+    revision that does not yet list the new productive blueprint.
     """
     _ensure_service_root_on_sys_path()
 
@@ -811,23 +1129,15 @@ def _register_blueprints(app: Flask) -> None:
     except Exception as exc:
         raise RuntimeError("Blueprint registration failed.") from exc
 
-    try:
-        metadata = _ensure_app_metadata_registry(app)
-        metadata["blueprints_registered"] = True
-
-        get_registered_blueprint_names = getattr(
-            routes_module,
-            "get_registered_blueprint_names",
-            None,
-        )
-        if callable(get_registered_blueprint_names):
-            metadata["registered_blueprint_names"] = get_registered_blueprint_names(app)
-
-        get_routing_metadata = getattr(routes_module, "get_routing_metadata", None)
-        if callable(get_routing_metadata):
-            metadata["routing_metadata"] = get_routing_metadata(app)
-    except Exception:
-        pass
+    project_access_diagnostics = _ensure_project_access_blueprint_registered(
+        app,
+        routes_module,
+    )
+    _refresh_route_registry_metadata(
+        app,
+        routes_module,
+        project_access_diagnostics,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -903,11 +1213,14 @@ def _run_optional_startup_hooks(app: Flask) -> None:
     - bootstrap_app(app)
     - initialize_app(app)
 
-    Startup hooks are the correct place for:
-    - optional db.create_all in dev/test
-    - default project/universe/world seeding
-    - debug block seeding
+    Runtime startup hooks must remain read-only. They may perform:
+    - bounded path/file/route/model checks
+    - optional database connectivity checks
+    - cheap schema/access readiness inspection
     - health preflight checks
+
+    Schema creation, migrations, default seeding and repair belong exclusively
+    to the explicit DB-bootstrap command/container.
     """
     metadata = _ensure_app_metadata_registry(app)
     metadata["startup_attempted"] = True
@@ -915,6 +1228,7 @@ def _run_optional_startup_hooks(app: Flask) -> None:
     if not _should_run_startup_hooks(app):
         metadata["startup_skipped"] = True
         metadata["startup_skip_reason"] = "startup_hooks_disabled"
+        metadata["startup_routing_snapshot"] = _build_app_routing_snapshot(app)
         _safe_log_debug(app, "Startup hooks disabled by configuration.")
         return
 
@@ -923,6 +1237,7 @@ def _run_optional_startup_hooks(app: Flask) -> None:
     if startup_module is None or module_name is None:
         metadata["startup_skipped"] = True
         metadata["startup_skip_reason"] = "startup_module_not_found"
+        metadata["startup_routing_snapshot"] = _build_app_routing_snapshot(app)
         _safe_log_debug(
             app,
             "No startup module found; checked candidates: %s",
@@ -945,6 +1260,7 @@ def _run_optional_startup_hooks(app: Flask) -> None:
     if startup_function is None:
         metadata["startup_skipped"] = True
         metadata["startup_skip_reason"] = "startup_hook_not_found"
+        metadata["startup_routing_snapshot"] = _build_app_routing_snapshot(app)
         _safe_log_debug(
             app,
             "Startup module `%s` found, but no known startup function is defined.",
@@ -966,6 +1282,7 @@ def _run_optional_startup_hooks(app: Flask) -> None:
         metadata["startup_completed"] = True
         metadata["startup_skipped"] = False
         metadata["startup_skip_reason"] = None
+        metadata["startup_routing_snapshot"] = _build_app_routing_snapshot(app)
     except Exception:
         pass
 
@@ -1006,6 +1323,19 @@ def _register_root_probe(app: Flask) -> None:
                 "batch": "/projects/dev-project/worlds/world_spawn/chunks/batch",
                 "commands": "/projects/dev-project/worlds/world_spawn/commands",
             },
+            "projectAccessApi": {
+                "enabled": bool(metadata.get("project_access_api_enabled", True)),
+                "registered": bool(
+                    metadata.get("project_access_blueprint_registered", False)
+                ),
+                "authzEnforced": False,
+                "status": "/project-access/_status",
+                "summary": "/projects/dev-project/access",
+                "initialize": "/projects/dev-project/access/initialize",
+                "roles": "/projects/dev-project/roles",
+                "groups": "/projects/dev-project/groups",
+                "assignments": "/projects/dev-project/assignments",
+            },
             "debug": {
                 "worldTest": "/world-test",
                 "worldTestHealth": "/world-test/api/health",
@@ -1013,6 +1343,7 @@ def _register_root_probe(app: Flask) -> None:
                 "worldsStatus": "/worlds/_status",
                 "blocksStatus": "/blocks/_status",
                 "chunksStatus": "/chunks/_status",
+                "projectAccessStatus": "/project-access/_status",
             },
             "metadata": {
                 "namespace": metadata.get("namespace"),
@@ -1021,6 +1352,17 @@ def _register_root_probe(app: Flask) -> None:
                 "startupCompleted": metadata.get("startup_completed"),
                 "startupSkipped": metadata.get("startup_skipped"),
                 "databaseStartupCheck": metadata.get("database_startup_check"),
+                "appFactoryVersion": metadata.get("app_factory_version"),
+                "registeredBlueprintNames": metadata.get(
+                    "registered_blueprint_names"
+                ),
+                "projectAccessRegistration": metadata.get(
+                    "project_access_blueprint_registration"
+                ),
+                "routingSnapshot": metadata.get("routing_snapshot"),
+                "startupRoutingSnapshot": metadata.get(
+                    "startup_routing_snapshot"
+                ),
             },
         }
 
@@ -1048,9 +1390,10 @@ def create_app(config_object: type | str | None = None) -> Flask:
     7. validate config
     8. initialize extensions/db/migrations/models
     9. optionally check database connectivity
-    10. register blueprints
-    11. register root probe
-    12. run optional startup hooks
+    10. register central blueprints
+    11. verify/supplement project-access blueprint registration
+    12. register root probe
+    13. run optional read-only startup hooks
     """
     _ensure_service_root_on_sys_path()
     _load_environment_file()
@@ -1075,18 +1418,27 @@ def create_app(config_object: type | str | None = None) -> Flask:
         _run_optional_startup_hooks(app)
 
     metadata = _ensure_app_metadata_registry(app)
+    metadata["routing_snapshot"] = _build_app_routing_snapshot(app)
+    metadata["app_factory_ready"] = bool(
+        metadata["routing_snapshot"].get("projectAccess", {}).get("ready")
+        if _project_access_routes_enabled(app)
+        and _project_access_routes_required(app)
+        else True
+    )
 
     _safe_log_info(
         app,
         "Flask app `%s` initialized successfully "
-        "(config=%s, startup_module=%s, blueprints=%s).",
+        "(config=%s, startup_module=%s, blueprints=%s, "
+        "project_access_ready=%s).",
         app.config.get("APP_NAME", _DEFAULT_APP_NAME),
         config_class.__name__,
         metadata.get("startup_module_name"),
         metadata.get("registered_blueprint_names"),
+        metadata.get("routing_snapshot", {}).get("projectAccess", {}).get("ready"),
     )
 
     return app
 
 
-__all__ = ["create_app"]
+__all__ = ["APP_FACTORY_VERSION", "create_app"]

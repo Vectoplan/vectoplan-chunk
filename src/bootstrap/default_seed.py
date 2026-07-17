@@ -8,6 +8,8 @@ Responsibilities:
 - seed the default development Project,
 - seed the default development Universe,
 - seed the default editable WorldInstance,
+- persist the temporary default project owner user id,
+- seed the default project roles and owner role assignment,
 - seed the default runtime BlockRegistry,
 - optionally seed the default debug BlockType entries,
 - reconcile built-in system blocks into the runtime BlockRegistry,
@@ -37,7 +39,9 @@ Design rule:
 
 Target default graph:
 
-    Project(project_id="dev-project")
+    Project(project_id="dev-project", owner_user_id="1")
+      -> ProjectRole(owner/admin/editor/viewer)
+      -> ProjectRoleAssignment(owner -> user "1")
       -> Universe(universe_id="dev-universe")
           -> WorldInstance(world_id="world_spawn", provider_world_id="flat")
 
@@ -62,6 +66,7 @@ World-id rule:
 from __future__ import annotations
 
 from contextlib import nullcontext
+import importlib
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -148,11 +153,19 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v3"
+DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v4"
 
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
 DEFAULT_PROJECT_SLUG: Final[str] = "dev-project"
 DEFAULT_PROJECT_NAME: Final[str] = "Dev Project"
+DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = "1"
+DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID: Final[str] = "bootstrap"
+DEFAULT_PROJECT_ROLE_KEYS: Final[tuple[str, ...]] = (
+    "owner",
+    "admin",
+    "editor",
+    "viewer",
+)
 
 DEFAULT_UNIVERSE_ID: Final[str] = "dev-universe"
 DEFAULT_UNIVERSE_SLUG: Final[str] = "dev-universe"
@@ -253,12 +266,14 @@ class DefaultSeedResult:
     seed_debug_blocks_requested: bool = False
     seed_system_blocks_requested: bool = False
     seed_dev_project_requested: bool = False
+    seed_project_access_requested: bool = False
     seed_on_empty_only: bool = True
 
     lock_used: bool = False
     seed_skipped_because_complete: bool = False
 
     project_id: str | None = None
+    owner_user_id: str | None = None
     universe_id: str | None = None
     world_id: str | None = None
     template_id: str | None = None
@@ -268,6 +283,10 @@ class DefaultSeedResult:
     block_registry_version: str | None = None
 
     default_project_ready: bool | None = None
+    default_project_owner_ready: bool | None = None
+    default_project_roles_ready: bool | None = None
+    default_project_owner_assignment_ready: bool | None = None
+    default_project_access_ready: bool | None = None
     default_universe_ready: bool | None = None
     default_world_ready: bool | None = None
     block_registry_ready: bool | None = None
@@ -276,6 +295,13 @@ class DefaultSeedResult:
     system_blocks_ready: bool | None = None
     system_railing_ready: bool | None = None
     air_invariant_ready: bool | None = None
+
+    project_access_role_count: int = 0
+    project_access_assignment_count: int = 0
+    project_access_created: int = 0
+    project_access_updated: int = 0
+    project_access_reactivated: int = 0
+    project_access_reused: int = 0
 
     system_block_count: int = 0
     system_blocks_created: int = 0
@@ -831,27 +857,24 @@ def _safe_model_id(obj: Any) -> Any:
 
 
 def load_seed_model_classes() -> dict[str, Any]:
-    """Load required model classes lazily from model registry."""
+    """Load every model required by default world and access seeding."""
+    model_names = (
+        "Project",
+        "Universe",
+        "WorldInstance",
+        "BlockRegistry",
+        "BlockType",
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+
     try:
         from models import require_model_class, require_models_ready
 
-        try:
-            require_models_ready()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Model registry is not ready: {_safe_exception_message(exc)}"
-            ) from exc
-
-        model_names = (
-            "Project",
-            "Universe",
-            "WorldInstance",
-            "BlockRegistry",
-            "BlockType",
-        )
-
+        require_models_ready()
         result: dict[str, Any] = {}
-
         for model_name in model_names:
             try:
                 result[model_name] = require_model_class(model_name)
@@ -860,24 +883,414 @@ def load_seed_model_classes() -> dict[str, Any]:
                     f"Required seed model class is unavailable: {model_name}: "
                     f"{_safe_exception_message(exc)}"
                 ) from exc
-
         return result
-
-    except Exception:
+    except Exception as registry_exc:
         try:
-            from models import BlockRegistry, BlockType, Project, Universe, WorldInstance
+            from models import (
+                BlockRegistry,
+                BlockType,
+                Project,
+                ProjectGroup,
+                ProjectGroupMember,
+                ProjectRole,
+                ProjectRoleAssignment,
+                Universe,
+                WorldInstance,
+            )
 
-            return {
+            fallback = {
                 "Project": Project,
                 "Universe": Universe,
                 "WorldInstance": WorldInstance,
                 "BlockRegistry": BlockRegistry,
                 "BlockType": BlockType,
+                "ProjectRole": ProjectRole,
+                "ProjectGroup": ProjectGroup,
+                "ProjectGroupMember": ProjectGroupMember,
+                "ProjectRoleAssignment": ProjectRoleAssignment,
             }
+            missing = [name for name, value in fallback.items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    f"Fallback model imports returned None: {sorted(missing)}"
+                )
+            return fallback
         except Exception as exc:
             raise RuntimeError(
-                f"Could not import seed model classes: {_safe_exception_message(exc)}"
+                "Could not import default-seed model classes. "
+                f"Registry error: {_safe_exception_message(registry_exc)}; "
+                f"fallback error: {_safe_exception_message(exc)}"
             ) from exc
+
+
+# -----------------------------------------------------------------------------
+# Project-access bootstrap adapter
+# -----------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def load_project_access_seed_api() -> Mapping[str, Any]:
+    """
+    Load the project-access service lazily.
+
+    Only immutable Python references are cached. ORM rows, query results and
+    access summaries are never cached.
+    """
+    import_errors: list[str] = []
+    module = None
+
+    for import_path in ("src.project_access", "project_access"):
+        try:
+            candidate = importlib.import_module(import_path)
+            required = (
+                "ensure_project_access_initialized",
+                "build_project_access_summary",
+                "get_project_access_service_contract",
+                "clear_project_access_service_caches",
+            )
+            if not all(callable(getattr(candidate, name, None)) for name in required):
+                raise RuntimeError(
+                    "module does not expose the required project-access API"
+                )
+
+            package_ready = getattr(
+                candidate,
+                "require_project_access_package_ready",
+                None,
+            )
+            if callable(package_ready):
+                package_ready()
+
+            module = candidate
+            break
+        except Exception as exc:
+            import_errors.append(
+                f"{import_path}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+
+    if module is None:
+        raise RuntimeError(
+            "Could not import project-access seed API. " + " | ".join(import_errors)
+        )
+
+    exports: dict[str, Any] = {"module": module}
+    for export_name in (
+        "ensure_project_access_initialized",
+        "build_project_access_summary",
+        "get_project_access_service_contract",
+        "clear_project_access_service_caches",
+    ):
+        value = getattr(module, export_name, None)
+        if not callable(value):
+            raise RuntimeError(
+                f"Project-access export '{export_name}' is unavailable or not callable."
+            )
+        exports[export_name] = value
+
+    exports["moduleName"] = _safe_str(getattr(module, "__name__", None), "")
+    exports["modulePath"] = _safe_str(getattr(module, "__file__", None), "")
+    return exports
+
+
+def clear_default_seed_project_access_caches() -> None:
+    """Clear only pure project-access/default-seed integration caches."""
+    try:
+        api = load_project_access_seed_api()
+        clear_function = api.get("clear_project_access_service_caches")
+        if callable(clear_function):
+            clear_function()
+    except Exception:
+        pass
+
+    load_project_access_seed_api.cache_clear()
+
+
+def _empty_project_access_status(
+    *,
+    project: Any = None,
+    owner_user_id: Any = None,
+    error: str | None = None,
+    exception_type: str | None = None,
+) -> dict[str, Any]:
+    """Build a stable unavailable/not-ready project-access status."""
+    return {
+        "ready": False,
+        "projectExists": project is not None,
+        "projectId": getattr(project, "project_id", None) if project is not None else None,
+        "projectDbId": _safe_model_id(project),
+        "ownerUserId": _safe_str(owner_user_id, "") or None,
+        "ownerReady": False,
+        "rolesReady": False,
+        "ownerAssignmentReady": False,
+        "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+        "activeRoleKeys": [],
+        "ownerRoleId": None,
+        "counts": {
+            "roles": 0,
+            "groups": 0,
+            "memberships": 0,
+            "assignments": 0,
+            "activeOwnerAssignments": 0,
+        },
+        "summary": {},
+        "error": error,
+        "errorType": exception_type,
+        "errors": [error] if error else [],
+    }
+
+
+def _project_owner_ready(project: Any, owner_user_id: Any) -> bool:
+    """Return whether Project itself stores the expected external user owner."""
+    if project is None:
+        return False
+
+    expected = _safe_str(owner_user_id, "")
+    if not expected:
+        return False
+
+    actual_type = _safe_str(getattr(project, "owner_type", None), "").lower()
+    actual_id = _safe_str(getattr(project, "owner_id", None), "")
+    return actual_type == "user" and actual_id == expected
+
+
+def build_default_project_access_status(
+    project: Any,
+    owner_user_id: Any,
+    *,
+    db_extension: Any = None,
+) -> dict[str, Any]:
+    """Build a read-only status for default roles and the owner assignment."""
+    owner = _safe_str(owner_user_id, DEFAULT_PROJECT_OWNER_USER_ID)
+    if project is None:
+        return _empty_project_access_status(
+            project=None,
+            owner_user_id=owner,
+            error="Default project does not exist.",
+            exception_type="ProjectMissing",
+        )
+
+    db_obj = _get_db_extension(db_extension)
+    if db_obj is None:
+        return _empty_project_access_status(
+            project=project,
+            owner_user_id=owner,
+            error="SQLAlchemy db extension is unavailable.",
+            exception_type="DatabaseUnavailable",
+        )
+
+    try:
+        api = load_project_access_seed_api()
+        summary_factory = api["build_project_access_summary"]
+        summary = summary_factory(
+            project=project,
+            session=db_obj.session,
+            include_deleted=False,
+            include_internal=True,
+            include_metadata=False,
+        )
+        summary_data = _safe_dict(summary)
+
+        roles = summary_data.get("roles") or []
+        assignments = summary_data.get("assignments") or []
+        if not isinstance(roles, Sequence) or isinstance(roles, (str, bytes, bytearray)):
+            roles = []
+        if not isinstance(assignments, Sequence) or isinstance(
+            assignments,
+            (str, bytes, bytearray),
+        ):
+            assignments = []
+
+        active_role_keys: set[str] = set()
+        owner_role_ids: set[str] = set()
+        for raw_role in roles:
+            role = _safe_dict(raw_role)
+            status = _safe_str(role.get("status"), "active").lower()
+            if status != "active":
+                continue
+            role_key = _safe_str(role.get("roleKey"), "").lower()
+            role_id = _safe_str(role.get("roleId"), "")
+            if role_key:
+                active_role_keys.add(role_key)
+            if role_key == "owner" and role_id:
+                owner_role_ids.add(role_id)
+
+        matching_owner_assignments = 0
+        for raw_assignment in assignments:
+            assignment = _safe_dict(raw_assignment)
+            if _safe_str(assignment.get("status"), "").lower() != "active":
+                continue
+            if _safe_str(assignment.get("subjectType"), "").lower() != "user":
+                continue
+            if _safe_str(assignment.get("userId"), "") != owner:
+                continue
+            if _safe_str(assignment.get("roleId"), "") not in owner_role_ids:
+                continue
+            if assignment.get("effective") is False:
+                continue
+            matching_owner_assignments += 1
+
+        roles_ready = set(DEFAULT_PROJECT_ROLE_KEYS).issubset(active_role_keys)
+        owner_ready = _project_owner_ready(project, owner)
+        owner_assignment_ready = matching_owner_assignments == 1
+        counts = _safe_dict(summary_data.get("counts"))
+
+        return {
+            "ready": bool(roles_ready and owner_ready and owner_assignment_ready),
+            "projectExists": True,
+            "projectId": getattr(project, "project_id", None),
+            "projectDbId": _safe_model_id(project),
+            "ownerUserId": owner,
+            "ownerReady": owner_ready,
+            "rolesReady": roles_ready,
+            "ownerAssignmentReady": owner_assignment_ready,
+            "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "activeRoleKeys": sorted(active_role_keys),
+            "ownerRoleId": sorted(owner_role_ids)[0] if len(owner_role_ids) == 1 else None,
+            "matchingOwnerAssignmentCount": matching_owner_assignments,
+            "counts": {
+                "roles": _safe_int(counts.get("roles"), len(roles), minimum=0),
+                "groups": _safe_int(counts.get("groups"), 0, minimum=0),
+                "memberships": _safe_int(counts.get("memberships"), 0, minimum=0),
+                "assignments": _safe_int(
+                    counts.get("assignments"),
+                    len(assignments),
+                    minimum=0,
+                ),
+                "activeOwnerAssignments": _safe_int(
+                    counts.get("activeOwnerAssignments"),
+                    matching_owner_assignments,
+                    minimum=0,
+                ),
+            },
+            "summary": summary_data,
+            "error": None,
+            "errorType": None,
+            "errors": [],
+        }
+    except Exception as exc:
+        return _empty_project_access_status(
+            project=project,
+            owner_user_id=owner,
+            error=_safe_exception_message(exc),
+            exception_type=exc.__class__.__name__,
+        )
+
+
+def default_project_access_exists(
+    project: Any,
+    owner_user_id: Any,
+    *,
+    db_extension: Any = None,
+) -> bool:
+    """Return whether owner fields, four roles and owner assignment are ready."""
+    status = build_default_project_access_status(
+        project,
+        owner_user_id,
+        db_extension=db_extension,
+    )
+    return _safe_bool(status.get("ready"), False)
+
+
+def seed_default_project_access(
+    app: Flask,
+    project: Any,
+    owner_user_id: Any,
+    *,
+    db_extension: Any = None,
+) -> list[dict[str, Any]]:
+    """
+    Seed/repair default roles and the owner assignment without committing.
+
+    The surrounding default-seed transaction owns commit and rollback.
+    """
+    started_at = _utc_now_iso()
+    db_obj = _get_db_extension(db_extension)
+    if db_obj is None:
+        raise RuntimeError("SQLAlchemy db extension is unavailable.")
+    if project is None:
+        raise RuntimeError("Default project is required before access seeding.")
+
+    owner = _safe_str(owner_user_id, DEFAULT_PROJECT_OWNER_USER_ID)
+    try:
+        api = load_project_access_seed_api()
+        initialize = api["ensure_project_access_initialized"]
+        initialization = initialize(
+            project=project,
+            owner_user_id=owner,
+            actor_user_id=DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
+            session=db_obj.session,
+            synchronize_default_roles=True,
+            restore_deleted_roles=True,
+            replace_existing_owner=True,
+            allow_missing_owner=False,
+            lock_project=True,
+            flush=True,
+        )
+
+        to_dict = getattr(initialization, "to_dict", None)
+        if not callable(to_dict):
+            raise RuntimeError(
+                "Project-access initialization result has no to_dict() contract."
+            )
+        data = _safe_dict(
+            to_dict(include_internal=True, include_metadata=False)
+        )
+        if not _safe_bool(data.get("accessInitialized"), False):
+            raise RuntimeError(
+                "Project-access initialization returned accessInitialized=false."
+            )
+
+        role_stats = _safe_dict(data.get("roleStats"))
+        assignment_stats = _safe_dict(data.get("assignmentStats"))
+        created_count = _safe_int(role_stats.get("created"), 0, minimum=0) + _safe_int(
+            assignment_stats.get("created"),
+            0,
+            minimum=0,
+        )
+        updated_count = (
+            _safe_int(role_stats.get("updated"), 0, minimum=0)
+            + _safe_int(role_stats.get("reactivated"), 0, minimum=0)
+            + _safe_int(assignment_stats.get("updated"), 0, minimum=0)
+            + _safe_int(assignment_stats.get("reactivated"), 0, minimum=0)
+            + _safe_int(assignment_stats.get("revoked"), 0, minimum=0)
+        )
+        changed = _safe_bool(data.get("changed"), created_count > 0 or updated_count > 0)
+
+        status = build_default_project_access_status(
+            project,
+            owner,
+            db_extension=db_extension,
+        )
+        if not _safe_bool(status.get("ready"), False):
+            raise RuntimeError(
+                "Default project access is not ready after initialization."
+            )
+
+        data["status"] = status
+        data["createdCount"] = created_count
+        data["updatedCount"] = updated_count
+        return [
+            _make_operation(
+                name="project_access",
+                ok=True,
+                status=OP_STATUS_OK if changed else OP_STATUS_SKIPPED,
+                created=created_count > 0,
+                updated=updated_count > 0,
+                skipped=not changed,
+                changed=changed,
+                message=(
+                    "Default project roles and owner assignment initialized."
+                    if changed
+                    else "Default project access is already ready."
+                ),
+                started_at=started_at,
+                data=data,
+            )
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            f"Default project-access bootstrap failed: {_safe_exception_message(exc)}"
+        ) from exc
 
 
 # -----------------------------------------------------------------------------
@@ -1591,6 +2004,24 @@ def _resolve_project_name(world_defaults: Any) -> str:
     )
 
 
+def _resolve_project_owner_user_id(world_defaults: Any) -> str:
+    """Resolve the temporary external owner user id for the default project."""
+    return _safe_str(
+        _first_attr(
+            world_defaults,
+            (
+                "project_owner_user_id",
+                "default_project_owner_user_id",
+                "owner_user_id",
+                "projectOwnerUserId",
+                "ownerUserId",
+            ),
+            DEFAULT_PROJECT_OWNER_USER_ID,
+        ),
+        DEFAULT_PROJECT_OWNER_USER_ID,
+    )
+
+
 def _resolve_universe_id(world_defaults: Any) -> str:
     return _safe_str(
         _first_attr(world_defaults, ("universe_id", "default_universe_id", "universeId"), DEFAULT_UNIVERSE_ID),
@@ -1655,6 +2086,14 @@ def _fallback_world_defaults(app: Any = None) -> Any:
         project_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
         project_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG", project_id), project_id)
         project_name = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_NAME", DEFAULT_PROJECT_NAME), DEFAULT_PROJECT_NAME)
+        project_owner_user_id = _safe_str(
+            _config_get(
+                app,
+                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+                DEFAULT_PROJECT_OWNER_USER_ID,
+            ),
+            DEFAULT_PROJECT_OWNER_USER_ID,
+        )
 
         universe_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_ID", DEFAULT_UNIVERSE_ID), DEFAULT_UNIVERSE_ID)
         universe_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_UNIVERSE_SLUG", universe_id), universe_id)
@@ -1731,6 +2170,14 @@ def _fallback_seed_settings(app: Any = None) -> Any:
         seed_defaults = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS", False), False)
         seed_debug_blocks = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", seed_defaults), seed_defaults)
         seed_dev_project = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_DEV_PROJECT", seed_defaults), seed_defaults)
+        seed_project_access = _safe_bool(
+            _config_get(
+                app,
+                "VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS",
+                seed_dev_project,
+            ),
+            seed_dev_project,
+        )
         seed_on_empty_only = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY", True), True)
         advisory_lock_enabled = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_BOOTSTRAP_USE_ADVISORY_LOCK", True), True)
         fail_on_error = _safe_bool(_config_get(app, "VECTOPLAN_CHUNK_DB_BOOTSTRAP_FAIL_ON_ERROR", True), True)
@@ -1947,69 +2394,55 @@ def is_default_seed_complete(
     require_blocks: bool = True,
     require_system_blocks: bool = True,
     require_project: bool = True,
+    require_project_access: bool | None = None,
+    db_extension: Any = None,
 ) -> bool:
-    """
-    Return whether the target default seed graph is complete.
-
-    Built-in system blocks are checked independently from optional debug block
-    seeding. A complete runtime registry must satisfy the Air invariant and
-    contain every persistent built-in system mirror.
-    """
+    """Return whether every requested default seed slice is already ready."""
     try:
+        if require_project_access is None:
+            require_project_access = require_project
+
         registry = None
-
         if require_blocks or require_system_blocks:
-            registry = find_default_block_registry(
-                models,
-                block_defaults,
-            )
-
+            registry = find_default_block_registry(models, block_defaults)
             if registry is None:
                 return False
 
-        if require_blocks:
-            if not default_debug_blocks_exist(
-                models,
-                registry,
-                block_defaults,
-            ):
-                return False
+        if require_blocks and not default_debug_blocks_exist(
+            models,
+            registry,
+            block_defaults,
+        ):
+            return False
 
-        if require_system_blocks:
-            if not default_system_blocks_exist(
-                registry
-            ):
-                return False
+        if require_system_blocks and not default_system_blocks_exist(registry):
+            return False
 
-        if require_project:
-            project = find_default_project(
-                models,
-                world_defaults,
-            )
-
+        if require_project or require_project_access:
+            project = find_default_project(models, world_defaults)
             if project is None:
                 return False
 
-            universe = find_default_universe(
-                models,
-                project,
-                world_defaults,
-            )
-
-            if universe is None:
+            owner_user_id = _resolve_project_owner_user_id(world_defaults)
+            if not _project_owner_ready(project, owner_user_id):
                 return False
 
-            world = find_default_world(
-                models,
-                universe,
-                world_defaults,
-            )
+            if require_project:
+                universe = find_default_universe(models, project, world_defaults)
+                if universe is None:
+                    return False
+                world = find_default_world(models, universe, world_defaults)
+                if world is None:
+                    return False
 
-            if world is None:
+            if require_project_access and not default_project_access_exists(
+                project,
+                owner_user_id,
+                db_extension=db_extension,
+            ):
                 return False
 
         return True
-
     except Exception:
         return False
 
@@ -2019,26 +2452,40 @@ def is_default_seed_complete(
 # -----------------------------------------------------------------------------
 
 def create_project_object(model_class: Any, world_defaults: Any) -> Any:
-    """Create Project instance using model factory if available."""
+    """Create the default Project with the external placeholder owner user id."""
     project_id = _resolve_project_id(world_defaults)
     project_slug = _resolve_project_slug(world_defaults)
     project_name = _resolve_project_name(world_defaults)
+    owner_user_id = _resolve_project_owner_user_id(world_defaults)
     universe_id = _resolve_universe_id(world_defaults)
     world_id = _resolve_world_id(world_defaults)
 
     metadata_json = {
         "seededBy": "vectoplan-chunk.default_seed",
         "seededAt": _utc_now_iso(),
+        "ownerUserId": owner_user_id,
         "defaultUniverseId": universe_id,
         "defaultWorldId": world_id,
         "spawnWorldId": world_id,
     }
 
-    for method_name in ("create_dev_project", "create"):
-        create_method = getattr(model_class, method_name, None)
-        if not callable(create_method):
-            continue
+    create_dev_project = getattr(model_class, "create_dev_project", None)
+    if callable(create_dev_project):
+        try:
+            obj = create_dev_project(
+                project_id=project_id,
+                default_universe_id=universe_id,
+                default_world_id=world_id,
+                owner_user_id=owner_user_id,
+                created_by_user_id=DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
+            )
+            apply_project_defaults_to_object(obj, world_defaults)
+            return obj
+        except TypeError:
+            pass
 
+    create_method = getattr(model_class, "create", None)
+    if callable(create_method):
         attempts = (
             {
                 "project_id": project_id,
@@ -2047,29 +2494,21 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
                 "default_universe_id": universe_id,
                 "default_world_id": world_id,
                 "spawn_world_id": world_id,
-                "created_by_user_id": "bootstrap",
+                "owner_user_id": owner_user_id,
+                "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
                 "metadata_json": metadata_json,
             },
             {
                 "project_id": project_id,
-                "slug": project_slug,
                 "name": project_name,
                 "default_universe_id": universe_id,
+                "default_world_id": world_id,
+                "owner_type": "user",
+                "owner_id": owner_user_id,
+                "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
                 "metadata_json": metadata_json,
             },
-            {
-                "project_id": project_id,
-                "default_universe_id": universe_id,
-                "default_world_id": world_id,
-                "created_by_user_id": "bootstrap",
-            },
-            {
-                "project_id": project_id,
-                "default_universe_id": universe_id,
-                "created_by_user_id": "bootstrap",
-            },
         )
-
         for kwargs in attempts:
             try:
                 obj = create_method(**kwargs)
@@ -2091,10 +2530,10 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
         "default_universe_id": universe_id,
         "default_world_id": world_id,
         "spawn_world_id": world_id,
-        "owner_type": "system",
-        "owner_id": "vectoplan-chunk",
-        "created_by_user_id": "bootstrap",
-        "updated_by_user_id": "bootstrap",
+        "owner_type": "user",
+        "owner_id": owner_user_id,
+        "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
+        "updated_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
         "metadata_json": metadata_json,
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
@@ -2105,10 +2544,11 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
 
 
 def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
-    """Apply config-driven project defaults to Project object."""
+    """Repair default world references and the temporary user owner."""
     changed = False
     universe_id = _resolve_universe_id(world_defaults)
     world_id = _resolve_world_id(world_defaults)
+    owner_user_id = _resolve_project_owner_user_id(world_defaults)
 
     if _call_if_available(
         project,
@@ -2116,26 +2556,70 @@ def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
         default_universe_id=universe_id,
         default_world_id=world_id,
         spawn_world_id=world_id,
-        updated_by_user_id="bootstrap",
+        updated_by_user_id=DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
     ):
         changed = True
     else:
-        changed = _set_attr_if_supported(project, "default_universe_id", universe_id, overwrite=True) or changed
-        changed = _set_attr_if_supported(project, "default_world_id", world_id, overwrite=True) or changed
-        changed = _set_attr_if_supported(project, "spawn_world_id", world_id, overwrite=True) or changed
+        changed = _set_attr_if_supported(
+            project,
+            "default_universe_id",
+            universe_id,
+            overwrite=True,
+        ) or changed
+        changed = _set_attr_if_supported(
+            project,
+            "default_world_id",
+            world_id,
+            overwrite=True,
+        ) or changed
+        changed = _set_attr_if_supported(
+            project,
+            "spawn_world_id",
+            world_id,
+            overwrite=True,
+        ) or changed
+
+    current_owner_type = _safe_str(getattr(project, "owner_type", None), "").lower()
+    current_owner_id = _safe_str(getattr(project, "owner_id", None), "")
+    if current_owner_type != "user" or current_owner_id != owner_user_id:
+        if _call_if_available(
+            project,
+            "set_owner_user",
+            owner_user_id,
+            updated_by_user_id=DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
+        ):
+            changed = True
+        else:
+            changed = _set_attr_if_supported(
+                project,
+                "owner_type",
+                "user",
+                overwrite=True,
+            ) or changed
+            changed = _set_attr_if_supported(
+                project,
+                "owner_id",
+                owner_user_id,
+                overwrite=True,
+            ) or changed
 
     changed = _set_attr_if_supported(project, "status", "active", overwrite=False) or changed
-    changed = _set_attr_if_supported(project, "updated_by_user_id", "bootstrap", overwrite=True) or changed
+    changed = _set_attr_if_supported(
+        project,
+        "updated_by_user_id",
+        DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
+        overwrite=True,
+    ) or changed
     changed = _merge_metadata_json(
         project,
         {
             "seededBy": "vectoplan-chunk.default_seed",
+            "ownerUserId": owner_user_id,
             "defaultUniverseId": universe_id,
             "defaultWorldId": world_id,
             "spawnWorldId": world_id,
         },
     ) or changed
-
     return changed
 
 
@@ -2855,6 +3339,7 @@ def seed_dev_project_universe_world(
                 data={
                     "projectId": project_id,
                     "projectDbId": _safe_model_id(project),
+                    "ownerUserId": _resolve_project_owner_user_id(world_defaults),
                     "defaultUniverseId": universe_id,
                     "defaultWorldId": world_id,
                 },
@@ -2877,6 +3362,7 @@ def seed_dev_project_universe_world(
                 data={
                     "projectId": project_id,
                     "projectDbId": _safe_model_id(project),
+                    "ownerUserId": _resolve_project_owner_user_id(world_defaults),
                     "defaultUniverseId": universe_id,
                     "defaultWorldId": world_id,
                 },
@@ -3024,6 +3510,7 @@ def run_default_seed(
     enabled: bool | None = None,
     seed_debug_blocks_enabled: bool | None = None,
     seed_dev_project_enabled: bool | None = None,
+    seed_project_access_enabled: bool | None = None,
     seed_on_empty_only: bool | None = None,
     fail_on_error: bool | None = None,
 ) -> DefaultSeedResult:
@@ -3086,6 +3573,18 @@ def run_default_seed(
                 resolved_enabled,
             )
         )
+        resolved_seed_project_access = bool(
+            seed_project_access_enabled
+            if seed_project_access_enabled is not None
+            else _safe_bool(
+                getattr(
+                    resolved_seed_settings,
+                    "seed_project_access",
+                    resolved_seed_project,
+                ),
+                resolved_seed_project,
+            )
+        )
         resolved_seed_on_empty_only = bool(
             seed_on_empty_only
             if seed_on_empty_only is not None
@@ -3108,9 +3607,11 @@ def run_default_seed(
         result.seed_debug_blocks_requested = resolved_seed_blocks
         result.seed_system_blocks_requested = resolved_seed_system_blocks
         result.seed_dev_project_requested = resolved_seed_project
+        result.seed_project_access_requested = resolved_seed_project_access
         result.seed_on_empty_only = resolved_seed_on_empty_only
 
         result.project_id = _resolve_project_id(resolved_world_defaults)
+        result.owner_user_id = _resolve_project_owner_user_id(resolved_world_defaults)
         result.universe_id = _resolve_universe_id(resolved_world_defaults)
         result.world_id = _resolve_world_id(resolved_world_defaults)
         result.template_id = _resolve_template_id(resolved_world_defaults)
@@ -3128,8 +3629,11 @@ def run_default_seed(
         result.metadata["advisoryLockEnabled"] = advisory_lock_enabled
         result.metadata["failOnError"] = resolved_fail_on_error
         result.metadata["seedSystemBlocks"] = resolved_seed_system_blocks
+        result.metadata["seedProjectAccess"] = resolved_seed_project_access
         result.metadata["defaults"] = {
             "projectId": result.project_id,
+            "ownerUserId": result.owner_user_id,
+            "projectRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
             "universeId": result.universe_id,
             "worldId": result.world_id,
             "templateId": result.template_id,
@@ -3163,6 +3667,7 @@ def run_default_seed(
             not resolved_seed_blocks
             and not resolved_seed_system_blocks
             and not resolved_seed_project
+            and not resolved_seed_project_access
         ):
             result.operations.append(
                 _make_operation(
@@ -3215,6 +3720,8 @@ def run_default_seed(
                 require_blocks=resolved_seed_blocks,
                 require_system_blocks=resolved_seed_system_blocks,
                 require_project=resolved_seed_project,
+                require_project_access=resolved_seed_project_access,
+                db_extension=db_extension,
             ):
                 result.seed_skipped_because_complete = True
                 result.operations.append(
@@ -3229,6 +3736,7 @@ def run_default_seed(
                             "seedDebugBlocks": resolved_seed_blocks,
                             "seedSystemBlocks": resolved_seed_system_blocks,
                             "seedDevProject": resolved_seed_project,
+                            "seedProjectAccess": resolved_seed_project_access,
                         },
                     )
                 )
@@ -3294,6 +3802,31 @@ def run_default_seed(
                     )
                 )
 
+
+            if resolved_seed_project_access:
+                project = find_default_project(
+                    models,
+                    resolved_world_defaults,
+                )
+                result.operations.extend(
+                    seed_default_project_access(
+                        app,
+                        project,
+                        result.owner_user_id or DEFAULT_PROJECT_OWNER_USER_ID,
+                        db_extension=db_extension,
+                    )
+                )
+            else:
+                result.operations.append(
+                    _make_operation(
+                        name="project_access",
+                        ok=True,
+                        status=OP_STATUS_SKIPPED,
+                        skipped=True,
+                        message="Default project-access seeding disabled.",
+                    )
+                )
+
         try:
             if seed_bootstrap_lock is None:
                 run_seed_body()
@@ -3332,6 +3865,18 @@ def run_default_seed(
 
             result.post_status = build_default_seed_status(app, db_extension=db_extension)
             _apply_status_to_result(result, result.post_status)
+
+            if resolved_seed_project_access and not result.default_project_access_ready:
+                result.errors.append(
+                    _make_message(
+                        code="default_project_access_not_ready_after_seed",
+                        message=(
+                            "Default project roles or owner assignment are not "
+                            "ready after seed."
+                        ),
+                        details=result.post_status,
+                    )
+                )
 
             if resolved_seed_project and not result.default_world_ready:
                 result.errors.append(
@@ -3435,6 +3980,63 @@ def _apply_status_to_result(
             (status.get("project") or {}).get("exists"),
             False,
         )
+        project_access_status = _safe_dict(status.get("projectAccess"))
+        result.default_project_owner_ready = _safe_bool(
+            project_access_status.get("ownerReady"),
+            False,
+        )
+        result.default_project_roles_ready = _safe_bool(
+            project_access_status.get("rolesReady"),
+            False,
+        )
+        result.default_project_owner_assignment_ready = _safe_bool(
+            project_access_status.get("ownerAssignmentReady"),
+            False,
+        )
+        result.default_project_access_ready = _safe_bool(
+            project_access_status.get("ready"),
+            False,
+        )
+        project_access_counts = _safe_dict(project_access_status.get("counts"))
+        result.project_access_role_count = _safe_int(
+            project_access_counts.get("roles"),
+            0,
+            minimum=0,
+        )
+        result.project_access_assignment_count = _safe_int(
+            project_access_counts.get("assignments"),
+            0,
+            minimum=0,
+        )
+
+        for raw_operation in result.operations:
+            operation = _safe_dict(raw_operation)
+            if _safe_str(operation.get("name"), "") != "project_access":
+                continue
+            operation_data = _safe_dict(operation.get("data"))
+            role_stats = _safe_dict(operation_data.get("roleStats"))
+            assignment_stats = _safe_dict(operation_data.get("assignmentStats"))
+            result.project_access_created = max(
+                result.project_access_created,
+                _safe_int(role_stats.get("created"), 0, minimum=0)
+                + _safe_int(assignment_stats.get("created"), 0, minimum=0),
+            )
+            result.project_access_updated = max(
+                result.project_access_updated,
+                _safe_int(role_stats.get("updated"), 0, minimum=0)
+                + _safe_int(assignment_stats.get("updated"), 0, minimum=0),
+            )
+            result.project_access_reactivated = max(
+                result.project_access_reactivated,
+                _safe_int(role_stats.get("reactivated"), 0, minimum=0)
+                + _safe_int(assignment_stats.get("reactivated"), 0, minimum=0),
+            )
+            result.project_access_reused = max(
+                result.project_access_reused,
+                _safe_int(role_stats.get("reused"), 0, minimum=0)
+                + _safe_int(assignment_stats.get("reused"), 0, minimum=0),
+            )
+
         result.default_universe_ready = _safe_bool(
             (status.get("universe") or {}).get("exists"),
             False,
@@ -3594,98 +4196,60 @@ def build_default_seed_status(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """
-    Build read-only default seed status.
-
-    This does not create or update anything. Built-in system-block status is
-    evaluated against the same default BlockRegistry used by the concrete world.
-    """
+    """Build the complete read-only default seed status."""
     started_at = _utc_now_iso()
 
     with _app_context(app):
         try:
             models = load_seed_model_classes()
-            world_defaults = resolve_world_defaults(
-                app,
-                None,
-            )
-            block_defaults = resolve_block_defaults(
-                app,
-                None,
-            )
+            world_defaults = resolve_world_defaults(app, None)
+            block_defaults = resolve_block_defaults(app, None)
 
-            registry = find_default_block_registry(
-                models,
-                block_defaults,
-            )
-            project = find_default_project(
-                models,
-                world_defaults,
-            )
+            registry = find_default_block_registry(models, block_defaults)
+            project = find_default_project(models, world_defaults)
             universe = (
-                find_default_universe(
-                    models,
-                    project,
-                    world_defaults,
-                )
+                find_default_universe(models, project, world_defaults)
                 if project is not None
                 else None
             )
             world = (
-                find_default_world(
-                    models,
-                    universe,
-                    world_defaults,
-                )
+                find_default_world(models, universe, world_defaults)
                 if universe is not None
                 else None
             )
 
-            debug_blocks_ok = (
-                default_debug_blocks_exist(
-                    models,
-                    registry,
-                    block_defaults,
-                )
+            debug_blocks_ok = default_debug_blocks_exist(
+                models,
+                registry,
+                block_defaults,
             )
-
-            system_blocks_status = (
-                build_default_system_blocks_status(
-                    registry
-                )
-            )
-
+            system_blocks_status = build_default_system_blocks_status(registry)
             system_blocks_ready = _safe_bool(
                 system_blocks_status.get("ready"),
                 False,
             )
-
             air_invariant_ready = _safe_bool(
-                (
-                    _safe_dict(
-                        system_blocks_status.get("air")
-                    )
-                ).get("ready"),
+                _safe_dict(system_blocks_status.get("air")).get("ready"),
                 False,
             )
+            system_railing_ready = _system_railing_ready(system_blocks_status)
+            system_counts = _system_block_status_counts(system_blocks_status)
 
-            system_railing_ready = (
-                _system_railing_ready(
-                    system_blocks_status
-                )
+            owner_user_id = _resolve_project_owner_user_id(world_defaults)
+            project_access_status = build_default_project_access_status(
+                project,
+                owner_user_id,
+                db_extension=db_extension,
             )
-
-            system_counts = (
-                _system_block_status_counts(
-                    system_blocks_status
-                )
+            project_access_ready = _safe_bool(
+                project_access_status.get("ready"),
+                False,
             )
 
             project_exists = project is not None
             universe_exists = universe is not None
             world_exists = world is not None
             registry_exists = registry is not None
-
             complete = bool(
                 registry_exists
                 and debug_blocks_ok
@@ -3693,38 +4257,20 @@ def build_default_seed_status(
                 and air_invariant_ready
                 and system_railing_ready
                 and project_exists
+                and project_access_ready
                 and universe_exists
                 and world_exists
             )
 
             completed_at = _utc_now_iso()
-
-            project_id = _resolve_project_id(
-                world_defaults
-            )
-            universe_id = _resolve_universe_id(
-                world_defaults
-            )
-            world_id = _resolve_world_id(
-                world_defaults
-            )
-            template_id = _resolve_template_id(
-                world_defaults
-            )
-            provider_id = _resolve_provider_id(
-                world_defaults
-            )
-            provider_world_id = (
-                _resolve_provider_world_id(
-                    world_defaults
-                )
-            )
+            project_id = _resolve_project_id(world_defaults)
+            universe_id = _resolve_universe_id(world_defaults)
+            world_id = _resolve_world_id(world_defaults)
+            template_id = _resolve_template_id(world_defaults)
+            provider_id = _resolve_provider_id(world_defaults)
+            provider_world_id = _resolve_provider_world_id(world_defaults)
             registry_id = _safe_str(
-                getattr(
-                    block_defaults,
-                    "registry_id",
-                    DEFAULT_BLOCK_REGISTRY_ID,
-                ),
+                getattr(block_defaults, "registry_id", DEFAULT_BLOCK_REGISTRY_ID),
                 DEFAULT_BLOCK_REGISTRY_ID,
             )
             registry_version = _safe_str(
@@ -3738,101 +4284,70 @@ def build_default_seed_status(
 
             return {
                 "ok": complete,
-                "status": (
-                    STATUS_READY
-                    if complete
-                    else STATUS_PARTIAL
-                ),
+                "status": STATUS_READY if complete else STATUS_PARTIAL,
                 "startedAt": started_at,
                 "completedAt": completed_at,
-                "durationMs": _duration_ms(
-                    started_at,
-                    completed_at,
-                ),
+                "durationMs": _duration_ms(started_at, completed_at),
                 "defaults": {
                     "projectId": project_id,
+                    "ownerUserId": owner_user_id,
+                    "projectRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
                     "universeId": universe_id,
                     "worldId": world_id,
                     "templateId": template_id,
                     "providerId": provider_id,
                     "providerWorldId": provider_world_id,
                     "blockRegistryId": registry_id,
-                    "blockRegistryVersion": (
-                        registry_version
-                    ),
-                    "systemRailingBlockTypeId": (
-                        DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
-                    ),
-                    "airSystemBlockId": (
-                        DEFAULT_SYSTEM_AIR_BLOCK_ID
-                    ),
+                    "blockRegistryVersion": registry_version,
+                    "systemRailingBlockTypeId": DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID,
+                    "airSystemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
                 },
                 "project": {
                     "exists": project_exists,
                     "projectId": project_id,
                     "dbId": _safe_model_id(project),
+                    "ownerType": (
+                        _safe_str(getattr(project, "owner_type", None), "") or None
+                        if project is not None
+                        else None
+                    ),
+                    "ownerUserId": (
+                        _safe_str(getattr(project, "owner_id", None), "") or None
+                        if project is not None
+                        else None
+                    ),
+                    "ownerReady": _safe_bool(
+                        project_access_status.get("ownerReady"),
+                        False,
+                    ),
                     "defaultUniverseId": (
-                        _safe_str(
-                            getattr(
-                                project,
-                                "default_universe_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(project, "default_universe_id", None), "") or None
                         if project is not None
                         else None
                     ),
                     "defaultWorldId": (
-                        _safe_str(
-                            getattr(
-                                project,
-                                "default_world_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(project, "default_world_id", None), "") or None
                         if project is not None
                         else None
                     ),
                     "spawnWorldId": (
-                        _safe_str(
-                            getattr(
-                                project,
-                                "spawn_world_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(project, "spawn_world_id", None), "") or None
                         if project is not None
                         else None
                     ),
                 },
+                "projectAccess": project_access_status,
                 "universe": {
                     "exists": universe_exists,
                     "universeId": universe_id,
                     "dbId": _safe_model_id(universe),
                     "defaultWorldId": (
-                        _safe_str(
-                            getattr(
-                                universe,
-                                "default_world_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(universe, "default_world_id", None), "") or None
                         if universe is not None
                         else None
                     ),
                     "spawnWorldId": (
-                        _safe_str(
-                            getattr(
-                                universe,
-                                "spawn_world_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(universe, "spawn_world_id", None), "") or None
                         if universe is not None
                         else None
                     ),
@@ -3842,62 +4357,30 @@ def build_default_seed_status(
                     "worldId": world_id,
                     "dbId": _safe_model_id(world),
                     "templateId": (
-                        _safe_str(
-                            getattr(
-                                world,
-                                "template_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(world, "template_id", None), "") or None
                         if world is not None
                         else None
                     ),
                     "providerId": (
-                        _safe_str(
-                            getattr(
-                                world,
-                                "provider_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(world, "provider_id", None), "") or None
                         if world is not None
                         else None
                     ),
                     "providerWorldId": (
-                        _safe_str(
-                            getattr(
-                                world,
-                                "provider_world_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(world, "provider_world_id", None), "") or None
                         if world is not None
                         else None
                     ),
                     "blockRegistryId": (
-                        _safe_str(
-                            getattr(
-                                world,
-                                "block_registry_id",
-                                "",
-                            ),
-                            "",
-                        )
+                        _safe_str(getattr(world, "block_registry_id", None), "") or None
                         if world is not None
                         else None
                     ),
                     "blockRegistryVersion": (
                         _safe_str(
-                            getattr(
-                                world,
-                                "block_registry_version",
-                                "",
-                            ),
+                            getattr(world, "block_registry_version", None),
                             "",
-                        )
+                        ) or None
                         if world is not None
                         else None
                     ),
@@ -3908,35 +4391,34 @@ def build_default_seed_status(
                     "registryVersion": registry_version,
                     "dbId": _safe_model_id(registry),
                 },
-                "debugBlocks": {
-                    "complete": debug_blocks_ok,
-                },
+                "debugBlocks": {"complete": debug_blocks_ok},
                 "systemBlocks": {
                     **system_blocks_status,
                     "summary": {
                         "ready": system_blocks_ready,
-                        "airInvariantReady": (
-                            air_invariant_ready
-                        ),
-                        "systemRailingReady": (
-                            system_railing_ready
-                        ),
-                        "mirrorCount": system_counts[
-                            "mirrors"
-                        ],
-                        "readyMirrorCount": system_counts[
-                            "readyMirrors"
-                        ],
-                        "missingCount": system_counts[
-                            "missing"
-                        ],
-                        "driftedCount": system_counts[
-                            "drifted"
-                        ],
+                        "airInvariantReady": air_invariant_ready,
+                        "systemRailingReady": system_railing_ready,
+                        "mirrorCount": system_counts["mirrors"],
+                        "readyMirrorCount": system_counts["readyMirrors"],
+                        "missingCount": system_counts["missing"],
+                        "driftedCount": system_counts["drifted"],
                     },
                 },
                 "ready": {
                     "project": project_exists,
+                    "projectOwner": _safe_bool(
+                        project_access_status.get("ownerReady"),
+                        False,
+                    ),
+                    "projectRoles": _safe_bool(
+                        project_access_status.get("rolesReady"),
+                        False,
+                    ),
+                    "projectOwnerAssignment": _safe_bool(
+                        project_access_status.get("ownerAssignmentReady"),
+                        False,
+                    ),
+                    "projectAccess": project_access_ready,
                     "universe": universe_exists,
                     "world": world_exists,
                     "blockRegistry": registry_exists,
@@ -3946,23 +4428,16 @@ def build_default_seed_status(
                     "systemRailing": system_railing_ready,
                 },
             }
-
         except Exception as exc:
             completed_at = _utc_now_iso()
-
             return {
                 "ok": False,
                 "status": STATUS_FAILED,
                 "startedAt": started_at,
                 "completedAt": completed_at,
-                "durationMs": _duration_ms(
-                    started_at,
-                    completed_at,
-                ),
+                "durationMs": _duration_ms(started_at, completed_at),
                 "error": _safe_exception_message(exc),
-                "exceptionType": (
-                    exc.__class__.__name__
-                ),
+                "exceptionType": exc.__class__.__name__,
             }
 
 
@@ -4008,10 +4483,12 @@ def build_default_seed_summary(
         "seedDebugBlocksRequested": bool(data.get("seed_debug_blocks_requested")),
         "seedSystemBlocksRequested": bool(data.get("seed_system_blocks_requested")),
         "seedDevProjectRequested": bool(data.get("seed_dev_project_requested")),
+        "seedProjectAccessRequested": bool(data.get("seed_project_access_requested")),
         "seedOnEmptyOnly": bool(data.get("seed_on_empty_only")),
         "seedSkippedBecauseComplete": bool(data.get("seed_skipped_because_complete")),
         "lockUsed": bool(data.get("lock_used")),
         "projectId": data.get("project_id"),
+        "ownerUserId": data.get("owner_user_id"),
         "universeId": data.get("universe_id"),
         "worldId": data.get("world_id"),
         "templateId": data.get("template_id"),
@@ -4020,6 +4497,20 @@ def build_default_seed_summary(
         "blockRegistryId": data.get("block_registry_id"),
         "blockRegistryVersion": data.get("block_registry_version"),
         "defaultProjectReady": data.get("default_project_ready"),
+        "defaultProjectOwnerReady": data.get("default_project_owner_ready"),
+        "defaultProjectRolesReady": data.get("default_project_roles_ready"),
+        "defaultProjectOwnerAssignmentReady": data.get(
+            "default_project_owner_assignment_ready"
+        ),
+        "defaultProjectAccessReady": data.get("default_project_access_ready"),
+        "projectAccessRoleCount": data.get("project_access_role_count"),
+        "projectAccessAssignmentCount": data.get(
+            "project_access_assignment_count"
+        ),
+        "projectAccessCreated": data.get("project_access_created"),
+        "projectAccessUpdated": data.get("project_access_updated"),
+        "projectAccessReactivated": data.get("project_access_reactivated"),
+        "projectAccessReused": data.get("project_access_reused"),
         "defaultUniverseReady": data.get("default_universe_ready"),
         "defaultWorldReady": data.get("default_world_ready"),
         "blockRegistryReady": data.get("block_registry_ready"),
@@ -4047,6 +4538,9 @@ def build_default_seed_summary(
 
 __all__ = [
     "DEFAULT_SEED_RESULT_VERSION",
+    "DEFAULT_PROJECT_OWNER_USER_ID",
+    "DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID",
+    "DEFAULT_PROJECT_ROLE_KEYS",
     "OP_STATUS_FAILED",
     "OP_STATUS_OK",
     "OP_STATUS_SKIPPED",
@@ -4065,6 +4559,7 @@ __all__ = [
     "apply_universe_defaults_to_object",
     "apply_world_defaults_to_object",
     "build_default_seed_status",
+    "build_default_project_access_status",
     "build_default_system_blocks_status",
     "build_default_seed_summary",
     "create_block_registry_object",
@@ -4073,6 +4568,7 @@ __all__ = [
     "create_universe_object",
     "create_world_object",
     "default_debug_blocks_exist",
+    "default_project_access_exists",
     "default_system_blocks_exist",
     "default_seed_result_to_dict",
     "find_default_block_registry",
@@ -4081,8 +4577,10 @@ __all__ = [
     "find_default_world",
     "is_default_seed_complete",
     "load_seed_model_classes",
+    "load_project_access_seed_api",
     "load_system_block_bootstrap_api",
     "clear_default_seed_system_block_caches",
+    "clear_default_seed_project_access_caches",
     "resolve_block_defaults",
     "resolve_seed_settings",
     "resolve_world_defaults",
@@ -4090,5 +4588,6 @@ __all__ = [
     "run_default_seed_if_enabled",
     "seed_debug_blocks",
     "seed_system_blocks",
+    "seed_default_project_access",
     "seed_dev_project_universe_world",
 ]

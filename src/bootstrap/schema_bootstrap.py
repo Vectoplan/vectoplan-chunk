@@ -7,7 +7,8 @@ This module owns the controlled schema bootstrap path.
 Responsibilities:
 - verify SQLAlchemy extension availability
 - verify model registry availability
-- inspect existing database tables
+- inspect existing database tables and critical columns
+- verify Project owner columns and project-access table shapes
 - optionally run db.create_all() for local/dev bootstrap
 - protect db.create_all() with a PostgreSQL advisory lock
 - never seed default data
@@ -22,6 +23,7 @@ Important boundaries:
 - no Event/Command/Object traversal here
 - no request handling here
 - no Alembic migration execution here
+- no silent ALTER TABLE repair here; missing columns are reported explicitly
 
 Design rule:
 
@@ -32,10 +34,10 @@ Typical flow:
 
     DB is reachable
     -> models are registered
-    -> existing table names are inspected
+    -> existing table names and critical columns are inspected
     -> advisory lock is acquired
     -> db.create_all() is called if enabled
-    -> resulting table names are inspected
+    -> resulting table names and critical columns are inspected
     -> session is removed
     -> result is returned
 
@@ -47,6 +49,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Any, Final, Mapping, Sequence
 
 try:
@@ -126,7 +130,14 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-SCHEMA_BOOTSTRAP_RESULT_VERSION: Final[str] = "schema-bootstrap-result.v1"
+SCHEMA_BOOTSTRAP_RESULT_VERSION: Final[str] = "schema-bootstrap-result.v2"
+
+PROJECT_ACCESS_REQUIRED_TABLES: Final[tuple[str, ...]] = (
+    "project_roles",
+    "project_groups",
+    "project_group_members",
+    "project_role_assignments",
+)
 
 DEFAULT_REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "projects",
@@ -139,6 +150,130 @@ DEFAULT_REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "chunk_events",
     "world_object_instances",
     "world_object_chunk_refs",
+    *PROJECT_ACCESS_REQUIRED_TABLES,
+)
+
+PROJECT_OWNER_REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "project_id",
+    "external_app_project_id",
+    "source_service",
+    "owner_type",
+    "owner_id",
+    "created_by_user_id",
+    "updated_by_user_id",
+    "metadata_json",
+    "created_at",
+    "updated_at",
+    "deleted_at",
+)
+
+PROJECT_ACCESS_REQUIRED_COLUMNS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "project_roles": (
+            "id",
+            "role_id",
+            "project_db_id",
+            "role_key",
+            "name",
+            "description",
+            "permissions_json",
+            "is_system",
+            "status",
+            "schema_version",
+            "revision",
+            "metadata_json",
+            "created_by_user_id",
+            "updated_by_user_id",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ),
+        "project_groups": (
+            "id",
+            "group_id",
+            "project_db_id",
+            "group_key",
+            "name",
+            "description",
+            "is_system",
+            "status",
+            "schema_version",
+            "revision",
+            "metadata_json",
+            "created_by_user_id",
+            "updated_by_user_id",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ),
+        "project_group_members": (
+            "id",
+            "membership_id",
+            "project_db_id",
+            "group_db_id",
+            "group_id",
+            "user_id",
+            "status",
+            "added_by_user_id",
+            "removed_by_user_id",
+            "starts_at",
+            "expires_at",
+            "removed_at",
+            "removal_reason",
+            "schema_version",
+            "revision",
+            "metadata_json",
+            "created_by_user_id",
+            "updated_by_user_id",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ),
+        "project_role_assignments": (
+            "id",
+            "assignment_id",
+            "project_db_id",
+            "role_db_id",
+            "role_id",
+            "subject_type",
+            "user_id",
+            "group_db_id",
+            "group_id",
+            "subject_key",
+            "permission_overrides_json",
+            "status",
+            "assigned_by_user_id",
+            "revoked_by_user_id",
+            "starts_at",
+            "expires_at",
+            "revoked_at",
+            "revocation_reason",
+            "schema_version",
+            "revision",
+            "metadata_json",
+            "created_by_user_id",
+            "updated_by_user_id",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ),
+    }
+)
+
+DEFAULT_REQUIRED_COLUMNS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "projects": PROJECT_OWNER_REQUIRED_COLUMNS,
+        **dict(PROJECT_ACCESS_REQUIRED_COLUMNS),
+    }
+)
+
+SCHEMA_CRITICAL_MODEL_CLASSES: Final[tuple[str, ...]] = (
+    "Project",
+    "ProjectRole",
+    "ProjectGroup",
+    "ProjectGroupMember",
+    "ProjectRoleAssignment",
 )
 
 STATUS_COMPLETED: Final[str] = "completed"
@@ -202,11 +337,23 @@ class SchemaBootstrapResult:
     model_registry_ready: bool | None = None
 
     required_tables: list[str] = field(default_factory=list)
+    required_columns: dict[str, list[str]] = field(default_factory=dict)
+
     tables_before: list[str] = field(default_factory=list)
     tables_after: list[str] = field(default_factory=list)
     missing_tables_before: list[str] = field(default_factory=list)
     missing_tables_after: list[str] = field(default_factory=list)
     created_tables: list[str] = field(default_factory=list)
+
+    columns_before: dict[str, list[str]] = field(default_factory=dict)
+    columns_after: dict[str, list[str]] = field(default_factory=dict)
+    missing_columns_before: dict[str, list[str]] = field(default_factory=dict)
+    missing_columns_after: dict[str, list[str]] = field(default_factory=dict)
+
+    project_owner_columns_ready: bool | None = None
+    project_access_tables_ready: bool | None = None
+    project_access_columns_ready: bool | None = None
+    project_access_schema_ready: bool | None = None
 
     operations: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
@@ -308,6 +455,76 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+@lru_cache(maxsize=128)
+def _normalize_name_tuple_cached(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize a tuple of schema identifiers without caching DB state."""
+    normalized = {
+        _safe_str(value, "")
+        for value in values
+        if _safe_str(value, "")
+    }
+    return tuple(sorted(normalized))
+
+
+def _normalize_name_sequence(values: Sequence[Any] | None) -> list[str]:
+    """Normalize a sequence of schema identifiers."""
+    if not values:
+        return []
+
+    raw_values: list[str] = []
+    for value in values:
+        normalized = _safe_str(value, "")
+        if normalized:
+            raw_values.append(normalized)
+
+    return list(_normalize_name_tuple_cached(tuple(raw_values)))
+
+
+def _normalize_required_column_map(
+    value: Mapping[str, Sequence[Any]] | None,
+    *,
+    allowed_tables: Sequence[str] | None = None,
+) -> dict[str, list[str]]:
+    """Normalize a table -> required column mapping."""
+    if not isinstance(value, Mapping):
+        return {}
+
+    allowed = set(_normalize_name_sequence(allowed_tables)) if allowed_tables else None
+    result: dict[str, list[str]] = {}
+
+    for table_name, column_names in value.items():
+        normalized_table = _safe_str(table_name, "")
+        if not normalized_table:
+            continue
+        if allowed is not None and normalized_table not in allowed:
+            continue
+        if isinstance(column_names, (str, bytes)):
+            normalized_columns = _normalize_name_sequence([column_names])
+        else:
+            try:
+                normalized_columns = _normalize_name_sequence(list(column_names or []))
+            except Exception:
+                normalized_columns = []
+        if normalized_columns:
+            result[normalized_table] = normalized_columns
+
+    return dict(sorted(result.items()))
+
+
+def _missing_column_count(value: Mapping[str, Sequence[Any]] | None) -> int:
+    """Count missing columns across all tables."""
+    if not isinstance(value, Mapping):
+        return 0
+
+    total = 0
+    for columns in value.values():
+        try:
+            total += len(list(columns or []))
+        except Exception:
+            continue
+    return total
+
+
 def _safe_log_info(app: Any, message: str, *args: Any) -> None:
     """Info-log defensively."""
     try:
@@ -385,13 +602,18 @@ def _make_operation(
 # -----------------------------------------------------------------------------
 
 def _is_flask_app(app: object) -> bool:
-    """Return whether object is Flask-like."""
-    if isinstance(app, Flask):
-        return True
+    """Return whether object is Flask-like, including partial test environments."""
+    try:
+        if Flask is not Any and isinstance(app, Flask):
+            return True
+    except Exception:
+        pass
 
     required_attrs = ("extensions", "config", "logger")
     try:
-        return all(hasattr(app, attr_name) for attr_name in required_attrs)
+        return app is not None and all(
+            hasattr(app, attr_name) for attr_name in required_attrs
+        )
     except Exception:
         return False
 
@@ -493,14 +715,19 @@ def require_schema_models_ready() -> dict[str, Any]:
     """
     Verify model registry readiness without querying product data.
 
-    Returns a compact model summary.
+    The check covers normal model registration plus the critical Project owner
+    and project-access model shapes required by this schema bootstrap.
     """
     try:
-        from models import get_model_debug_summary, require_models_ready
+        import models as model_package
     except Exception as exc:
         raise RuntimeError(
-            f"Could not import model registry helpers: {_safe_exception_message(exc)}"
+            f"Could not import model registry package: {_safe_exception_message(exc)}"
         ) from exc
+
+    require_models_ready = getattr(model_package, "require_models_ready", None)
+    if not callable(require_models_ready):
+        raise RuntimeError("models.require_models_ready() is unavailable.")
 
     try:
         require_models_ready()
@@ -509,12 +736,49 @@ def require_schema_models_ready() -> dict[str, Any]:
             f"Model registry is not ready: {_safe_exception_message(exc)}"
         ) from exc
 
+    require_expected_columns = getattr(
+        model_package,
+        "require_expected_model_columns",
+        None,
+    )
+    if callable(require_expected_columns):
+        try:
+            require_expected_columns(class_names=SCHEMA_CRITICAL_MODEL_CLASSES)
+        except Exception as exc:
+            raise RuntimeError(
+                "Critical Project/project-access model columns are incomplete: "
+                f"{_safe_exception_message(exc)}"
+            ) from exc
+
+    get_model_debug_summary = getattr(model_package, "get_model_debug_summary", None)
     try:
-        summary = get_model_debug_summary()
+        summary = get_model_debug_summary() if callable(get_model_debug_summary) else {}
     except Exception:
         summary = {}
 
-    return _safe_dict(summary)
+    normalized_summary = _safe_dict(summary)
+    available_classes = set(normalized_summary.get("availableClasses") or [])
+    missing_critical = [
+        class_name
+        for class_name in SCHEMA_CRITICAL_MODEL_CLASSES
+        if class_name not in available_classes
+    ]
+    if available_classes and missing_critical:
+        raise RuntimeError(
+            "Critical schema model classes are unavailable: "
+            f"{missing_critical}"
+        )
+
+    if normalized_summary.get("projectAccessShapeReady") is False:
+        raise RuntimeError("Project-access model shape is not ready.")
+    if normalized_summary.get("appIntegrationReady") is False:
+        raise RuntimeError("Project app-integration/owner model shape is not ready.")
+
+    normalized_summary.setdefault(
+        "schemaCriticalModelClasses",
+        list(SCHEMA_CRITICAL_MODEL_CLASSES),
+    )
+    return normalized_summary
 
 
 # -----------------------------------------------------------------------------
@@ -529,13 +793,75 @@ def get_required_table_names(
     """
     Return required table names.
 
-    Prefer SQLAlchemy metadata tables, fallback to known core table names.
+    Registered SQLAlchemy metadata is merged with the explicit fallback list.
+    The merge prevents a partially imported model package from silently hiding
+    required project-access tables from schema diagnostics.
     """
-    metadata_tables = _get_metadata_tables(db_extension)
-    if metadata_tables:
-        return metadata_tables
+    fallback_tables = _normalize_name_sequence(fallback or DEFAULT_REQUIRED_TABLES)
+    metadata_tables = _normalize_name_sequence(_get_metadata_tables(db_extension))
+    return _normalize_name_sequence([*fallback_tables, *metadata_tables])
 
-    return sorted(str(name) for name in (fallback or DEFAULT_REQUIRED_TABLES))
+
+@lru_cache(maxsize=1)
+def _registered_required_column_contract_cached() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return the code-level critical column contract; never cache DB state."""
+    merged: dict[str, set[str]] = {
+        table_name: set(column_names)
+        for table_name, column_names in DEFAULT_REQUIRED_COLUMNS.items()
+    }
+
+    try:
+        import models as model_package
+
+        expected_columns = getattr(model_package, "EXPECTED_MODEL_COLUMNS", {})
+        class_to_table = getattr(model_package, "MODEL_CLASS_TO_TABLE", {})
+        if isinstance(expected_columns, Mapping) and isinstance(class_to_table, Mapping):
+            for class_name in SCHEMA_CRITICAL_MODEL_CLASSES:
+                table_name = _safe_str(class_to_table.get(class_name), "")
+                if table_name not in merged:
+                    continue
+                columns = expected_columns.get(class_name) or ()
+                for column_name in columns:
+                    normalized_column = _safe_str(column_name, "")
+                    if normalized_column:
+                        merged[table_name].add(normalized_column)
+    except Exception:
+        pass
+
+    return tuple(
+        (table_name, tuple(sorted(column_names)))
+        for table_name, column_names in sorted(merged.items())
+    )
+
+
+def reset_schema_bootstrap_caches() -> None:
+    """Reset pure normalization/model-contract caches; no DB state is cached."""
+    _normalize_name_tuple_cached.cache_clear()
+    _registered_required_column_contract_cached.cache_clear()
+
+
+def get_required_column_names(
+    *,
+    required_tables: Sequence[str] | None = None,
+    fallback: Mapping[str, Sequence[Any]] | None = None,
+) -> dict[str, list[str]]:
+    """Return the critical table -> column contract used by readiness checks."""
+    allowed_tables = _normalize_name_sequence(required_tables) if required_tables else None
+
+    if fallback is not None:
+        return _normalize_required_column_map(
+            fallback,
+            allowed_tables=allowed_tables,
+        )
+
+    contract = {
+        table_name: list(column_names)
+        for table_name, column_names in _registered_required_column_contract_cached()
+    }
+    return _normalize_required_column_map(
+        contract,
+        allowed_tables=allowed_tables,
+    )
 
 
 def inspect_existing_tables(
@@ -563,6 +889,62 @@ def inspect_existing_tables(
         ) from exc
 
 
+def inspect_existing_columns(
+    app: Any = None,
+    *,
+    db_extension: Any = None,
+    table_names: Sequence[str] | None = None,
+    existing_tables: Sequence[str] | None = None,
+    schema: str | None = None,
+) -> dict[str, list[str]]:
+    """Inspect columns for existing target tables without ORM traversal."""
+    engine = _get_engine(app, db_extension)
+    if engine is None:
+        raise RuntimeError("SQLAlchemy engine is unavailable; cannot inspect table columns.")
+    if inspect is None:
+        raise RuntimeError("sqlalchemy.inspect is unavailable; cannot inspect table columns.")
+
+    normalized_targets = _normalize_name_sequence(table_names or [])
+    normalized_existing = set(
+        _normalize_name_sequence(
+            existing_tables
+            if existing_tables is not None
+            else inspect_existing_tables(
+                app,
+                db_extension=db_extension,
+                schema=schema,
+            )
+        )
+    )
+
+    result: dict[str, list[str]] = {}
+    try:
+        inspector = inspect(engine)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not create SQLAlchemy inspector: {_safe_exception_message(exc)}"
+        ) from exc
+
+    for table_name in normalized_targets:
+        if table_name not in normalized_existing:
+            continue
+        try:
+            column_entries = inspector.get_columns(table_name, schema=schema)
+            column_names = [
+                _safe_str(entry.get("name"), "")
+                for entry in column_entries
+                if isinstance(entry, Mapping)
+            ]
+            result[table_name] = _normalize_name_sequence(column_names)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not inspect columns for table '{table_name}': "
+                f"{_safe_exception_message(exc)}"
+            ) from exc
+
+    return dict(sorted(result.items()))
+
+
 def calculate_missing_tables(
     required_tables: Sequence[str],
     existing_tables: Sequence[str],
@@ -579,6 +961,130 @@ def calculate_created_tables(
     """Return tables present after but not before."""
     before_set = {str(name) for name in before_tables}
     return sorted(str(name) for name in after_tables if str(name) not in before_set)
+
+
+def calculate_missing_columns(
+    required_columns: Mapping[str, Sequence[Any]],
+    existing_columns: Mapping[str, Sequence[Any]],
+    *,
+    existing_tables: Sequence[str] | None = None,
+) -> dict[str, list[str]]:
+    """Return missing columns for required tables that physically exist."""
+    normalized_required = _normalize_required_column_map(required_columns)
+    normalized_existing = _normalize_required_column_map(existing_columns)
+    existing_table_set = (
+        set(_normalize_name_sequence(existing_tables))
+        if existing_tables is not None
+        else set(normalized_existing)
+    )
+
+    missing: dict[str, list[str]] = {}
+    for table_name, required_names in normalized_required.items():
+        if table_name not in existing_table_set:
+            # Missing tables are reported separately; avoid duplicating every
+            # column as an additional error.
+            continue
+        available = set(normalized_existing.get(table_name, []))
+        absent = [name for name in required_names if name not in available]
+        if absent:
+            missing[table_name] = absent
+
+    return dict(sorted(missing.items()))
+
+
+def build_schema_readiness_flags(
+    *,
+    existing_tables: Sequence[str],
+    missing_tables: Sequence[str],
+    missing_columns: Mapping[str, Sequence[Any]],
+) -> dict[str, bool]:
+    """Build ownership and project-access schema readiness flags."""
+    existing = set(_normalize_name_sequence(existing_tables))
+    missing_table_set = set(_normalize_name_sequence(missing_tables))
+    normalized_missing_columns = _normalize_required_column_map(missing_columns)
+
+    project_owner_columns_ready = (
+        "projects" in existing
+        and "projects" not in missing_table_set
+        and not normalized_missing_columns.get("projects")
+    )
+    project_access_tables_ready = all(
+        table_name in existing and table_name not in missing_table_set
+        for table_name in PROJECT_ACCESS_REQUIRED_TABLES
+    )
+    project_access_columns_ready = (
+        project_access_tables_ready
+        and all(
+            not normalized_missing_columns.get(table_name)
+            for table_name in PROJECT_ACCESS_REQUIRED_TABLES
+        )
+    )
+
+    return {
+        "projectOwnerColumnsReady": project_owner_columns_ready,
+        "projectAccessTablesReady": project_access_tables_ready,
+        "projectAccessColumnsReady": project_access_columns_ready,
+        "projectAccessSchemaReady": (
+            project_owner_columns_ready
+            and project_access_tables_ready
+            and project_access_columns_ready
+        ),
+    }
+
+
+def inspect_schema_contract(
+    app: Any = None,
+    *,
+    db_extension: Any = None,
+    required_tables: Sequence[str] | None = None,
+    required_columns: Mapping[str, Sequence[Any]] | None = None,
+    schema: str | None = None,
+) -> dict[str, Any]:
+    """Inspect required tables and critical columns as one read-only snapshot."""
+    resolved_tables = _normalize_name_sequence(
+        required_tables or get_required_table_names(db_extension=db_extension)
+    )
+    resolved_columns = get_required_column_names(
+        required_tables=resolved_tables,
+        fallback=required_columns,
+    )
+    existing_tables = inspect_existing_tables(
+        app,
+        db_extension=db_extension,
+        schema=schema,
+    )
+    missing_tables = calculate_missing_tables(resolved_tables, existing_tables)
+    existing_columns = inspect_existing_columns(
+        app,
+        db_extension=db_extension,
+        table_names=list(resolved_columns),
+        existing_tables=existing_tables,
+        schema=schema,
+    )
+    missing_columns = calculate_missing_columns(
+        resolved_columns,
+        existing_columns,
+        existing_tables=existing_tables,
+    )
+    readiness = build_schema_readiness_flags(
+        existing_tables=existing_tables,
+        missing_tables=missing_tables,
+        missing_columns=missing_columns,
+    )
+
+    return {
+        "ok": not missing_tables and not missing_columns,
+        "schema": schema,
+        "requiredTables": resolved_tables,
+        "requiredColumns": resolved_columns,
+        "existingTables": existing_tables,
+        "existingColumns": existing_columns,
+        "missingTables": missing_tables,
+        "missingColumns": missing_columns,
+        "missingTableCount": len(missing_tables),
+        "missingColumnCount": _missing_column_count(missing_columns),
+        **readiness,
+    }
 
 
 def verify_required_tables_exist(
@@ -600,6 +1106,53 @@ def verify_required_tables_exist(
         "missingTables": missing,
         "schema": schema,
     }
+
+
+def verify_required_columns_exist(
+    app: Any = None,
+    *,
+    db_extension: Any = None,
+    required_tables: Sequence[str] | None = None,
+    required_columns: Mapping[str, Sequence[Any]] | None = None,
+    schema: str | None = None,
+) -> dict[str, Any]:
+    """Verify critical columns for existing required tables."""
+    snapshot = inspect_schema_contract(
+        app,
+        db_extension=db_extension,
+        required_tables=required_tables,
+        required_columns=required_columns,
+        schema=schema,
+    )
+    return {
+        "ok": not snapshot["missingColumns"] and not snapshot["missingTables"],
+        "requiredColumns": snapshot["requiredColumns"],
+        "existingColumns": snapshot["existingColumns"],
+        "missingColumns": snapshot["missingColumns"],
+        "missingColumnCount": snapshot["missingColumnCount"],
+        "missingTables": snapshot["missingTables"],
+        "schema": schema,
+        "projectOwnerColumnsReady": snapshot["projectOwnerColumnsReady"],
+        "projectAccessColumnsReady": snapshot["projectAccessColumnsReady"],
+    }
+
+
+def verify_schema_contract(
+    app: Any = None,
+    *,
+    db_extension: Any = None,
+    required_tables: Sequence[str] | None = None,
+    required_columns: Mapping[str, Sequence[Any]] | None = None,
+    schema: str | None = None,
+) -> dict[str, Any]:
+    """Verify the full required table/critical-column schema contract."""
+    return inspect_schema_contract(
+        app,
+        db_extension=db_extension,
+        required_tables=required_tables,
+        required_columns=required_columns,
+        schema=schema,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -782,6 +1335,7 @@ def run_schema_bootstrap(
     settings: SchemaBootstrapSettings | None = None,
     db_extension: Any = None,
     required_tables: Sequence[str] | None = None,
+    required_columns: Mapping[str, Sequence[Any]] | None = None,
     create_all: bool | None = None,
     enabled: bool | None = None,
     fail_on_error: bool | None = None,
@@ -801,7 +1355,11 @@ def run_schema_bootstrap(
         started_at=started_at,
         enabled=False,
         create_all_requested=False,
-        required_tables=list(required_tables or DEFAULT_REQUIRED_TABLES),
+        required_tables=_normalize_name_sequence(required_tables or DEFAULT_REQUIRED_TABLES),
+        required_columns=get_required_column_names(
+            required_tables=required_tables or DEFAULT_REQUIRED_TABLES,
+            fallback=required_columns,
+        ),
     )
 
     if not _is_flask_app(app):
@@ -922,32 +1480,48 @@ def run_schema_bootstrap(
         )
         return _finish_or_raise(app, result, resolved_fail_on_error)
 
-    # Required tables should be based on actual registered metadata if possible.
-    result.required_tables = list(
+    # Required tables use registered metadata plus the explicit access fallback.
+    result.required_tables = _normalize_name_sequence(
         required_tables or get_required_table_names(db_extension=db_extension)
     )
+    result.required_columns = get_required_column_names(
+        required_tables=result.required_tables,
+        fallback=required_columns,
+    )
 
-    # Step 3: Inspect before.
+    # Step 3: Inspect required tables and critical columns before.
     try:
-        result.tables_before = inspect_existing_tables(
+        before_snapshot = inspect_schema_contract(
             app,
             db_extension=db_extension,
+            required_tables=result.required_tables,
+            required_columns=result.required_columns,
             schema=schema,
         )
-        result.missing_tables_before = calculate_missing_tables(
-            result.required_tables,
-            result.tables_before,
-        )
+        result.tables_before = list(before_snapshot["existingTables"])
+        result.missing_tables_before = list(before_snapshot["missingTables"])
+        result.columns_before = dict(before_snapshot["existingColumns"])
+        result.missing_columns_before = dict(before_snapshot["missingColumns"])
         result.operations.append(
             _make_operation(
-                name="inspect_tables_before",
+                name="inspect_schema_before",
                 ok=True,
                 status=OP_STATUS_OK,
-                message="Existing tables inspected before schema bootstrap.",
+                message="Tables and critical columns inspected before schema bootstrap.",
                 data={
                     "tableCount": len(result.tables_before),
-                    "missingRequiredCount": len(result.missing_tables_before),
+                    "missingRequiredTableCount": len(result.missing_tables_before),
                     "missingRequiredTables": result.missing_tables_before,
+                    "missingRequiredColumnCount": _missing_column_count(
+                        result.missing_columns_before
+                    ),
+                    "missingRequiredColumns": result.missing_columns_before,
+                    "projectOwnerColumnsReady": before_snapshot[
+                        "projectOwnerColumnsReady"
+                    ],
+                    "projectAccessSchemaReady": before_snapshot[
+                        "projectAccessSchemaReady"
+                    ],
                 },
             )
         )
@@ -955,22 +1529,18 @@ def run_schema_bootstrap(
         message = _safe_exception_message(exc)
         result.errors.append(
             _make_message(
-                code="inspect_tables_before_failed",
+                code="inspect_schema_before_failed",
                 message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                details={"exceptionType": exc.__class__.__name__},
             )
         )
         result.operations.append(
             _make_operation(
-                name="inspect_tables_before",
+                name="inspect_schema_before",
                 ok=False,
                 status=OP_STATUS_FAILED,
                 message=message,
-                data={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                data={"exceptionType": exc.__class__.__name__},
             )
         )
         return _finish_or_raise(app, result, resolved_fail_on_error)
@@ -1063,33 +1633,55 @@ def run_schema_bootstrap(
         if result.errors:
             return _finish_or_raise(app, result, resolved_fail_on_error)
 
-    # Step 5: Inspect after.
+    # Step 5: Inspect tables and critical columns after.
     try:
-        result.tables_after = inspect_existing_tables(
+        after_snapshot = inspect_schema_contract(
             app,
             db_extension=db_extension,
+            required_tables=result.required_tables,
+            required_columns=result.required_columns,
             schema=schema,
         )
-        result.missing_tables_after = calculate_missing_tables(
-            result.required_tables,
-            result.tables_after,
-        )
+        result.tables_after = list(after_snapshot["existingTables"])
+        result.missing_tables_after = list(after_snapshot["missingTables"])
+        result.columns_after = dict(after_snapshot["existingColumns"])
+        result.missing_columns_after = dict(after_snapshot["missingColumns"])
         result.created_tables = calculate_created_tables(
             result.tables_before,
             result.tables_after,
         )
+        result.project_owner_columns_ready = bool(
+            after_snapshot["projectOwnerColumnsReady"]
+        )
+        result.project_access_tables_ready = bool(
+            after_snapshot["projectAccessTablesReady"]
+        )
+        result.project_access_columns_ready = bool(
+            after_snapshot["projectAccessColumnsReady"]
+        )
+        result.project_access_schema_ready = bool(
+            after_snapshot["projectAccessSchemaReady"]
+        )
         result.operations.append(
             _make_operation(
-                name="inspect_tables_after",
+                name="inspect_schema_after",
                 ok=True,
                 status=OP_STATUS_OK,
-                message="Existing tables inspected after schema bootstrap.",
+                message="Tables and critical columns inspected after schema bootstrap.",
                 data={
                     "tableCount": len(result.tables_after),
                     "createdTableCount": len(result.created_tables),
                     "createdTables": result.created_tables,
-                    "missingRequiredCount": len(result.missing_tables_after),
+                    "missingRequiredTableCount": len(result.missing_tables_after),
                     "missingRequiredTables": result.missing_tables_after,
+                    "missingRequiredColumnCount": _missing_column_count(
+                        result.missing_columns_after
+                    ),
+                    "missingRequiredColumns": result.missing_columns_after,
+                    "projectOwnerColumnsReady": result.project_owner_columns_ready,
+                    "projectAccessTablesReady": result.project_access_tables_ready,
+                    "projectAccessColumnsReady": result.project_access_columns_ready,
+                    "projectAccessSchemaReady": result.project_access_schema_ready,
                 },
             )
         )
@@ -1097,22 +1689,18 @@ def run_schema_bootstrap(
         message = _safe_exception_message(exc)
         result.errors.append(
             _make_message(
-                code="inspect_tables_after_failed",
+                code="inspect_schema_after_failed",
                 message=message,
-                details={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                details={"exceptionType": exc.__class__.__name__},
             )
         )
         result.operations.append(
             _make_operation(
-                name="inspect_tables_after",
+                name="inspect_schema_after",
                 ok=False,
                 status=OP_STATUS_FAILED,
                 message=message,
-                data={
-                    "exceptionType": exc.__class__.__name__,
-                },
+                data={"exceptionType": exc.__class__.__name__},
             )
         )
         return _finish_or_raise(app, result, resolved_fail_on_error)
@@ -1124,8 +1712,28 @@ def run_schema_bootstrap(
             _make_message(
                 code="required_tables_missing",
                 message=message,
+                details={"missingTables": result.missing_tables_after},
+            )
+        )
+        return _finish_or_raise(app, result, resolved_fail_on_error)
+
+    if result.missing_columns_after:
+        message = (
+            "Required columns are missing after schema bootstrap. "
+            "db.create_all() creates missing tables but does not alter existing "
+            "tables; run the explicit missing-column repair or a migration."
+        )
+        result.errors.append(
+            _make_message(
+                code="required_columns_missing",
+                message=message,
                 details={
-                    "missingTables": result.missing_tables_after,
+                    "missingColumns": result.missing_columns_after,
+                    "missingColumnCount": _missing_column_count(
+                        result.missing_columns_after
+                    ),
+                    "createAllExecuted": result.create_all_executed,
+                    "requiresMigrationOrRepair": True,
                 },
             )
         )
@@ -1204,67 +1812,112 @@ def build_schema_status(
     *,
     db_extension: Any = None,
     required_tables: Sequence[str] | None = None,
+    required_columns: Mapping[str, Sequence[Any]] | None = None,
     schema: str | None = None,
 ) -> dict[str, Any]:
     """
-    Build read-only schema status.
+    Build read-only table/column schema status.
 
-    This does not create tables.
+    This function never creates or repairs schema objects.
     """
     started_at = _utc_now_iso()
 
     try:
         ping = ping_database(app, db_extension=db_extension)
     except Exception as exc:
-        ping = {
-            "ok": False,
+        ping = {"ok": False, "error": _safe_exception_message(exc)}
+
+    model_summary: dict[str, Any] = {}
+    model_registry_ready = False
+    try:
+        model_summary = require_schema_models_ready()
+        model_registry_ready = True
+    except Exception as exc:
+        model_summary = {
+            "ready": False,
             "error": _safe_exception_message(exc),
+            "exceptionType": exc.__class__.__name__,
         }
 
-    try:
-        required = list(required_tables or get_required_table_names(db_extension=db_extension))
-    except Exception:
-        required = list(required_tables or DEFAULT_REQUIRED_TABLES)
+    resolved_tables = _normalize_name_sequence(
+        required_tables or get_required_table_names(db_extension=db_extension)
+    )
+    resolved_columns = get_required_column_names(
+        required_tables=resolved_tables,
+        fallback=required_columns,
+    )
 
-    existing: list[str] = []
-    missing: list[str] = []
+    snapshot: dict[str, Any] = {
+        "existingTables": [],
+        "existingColumns": {},
+        "missingTables": resolved_tables,
+        "missingColumns": {},
+        "missingTableCount": len(resolved_tables),
+        "missingColumnCount": 0,
+        "projectOwnerColumnsReady": False,
+        "projectAccessTablesReady": False,
+        "projectAccessColumnsReady": False,
+        "projectAccessSchemaReady": False,
+    }
+    inspection_error: str | None = None
 
     if ping.get("ok"):
         try:
-            existing = inspect_existing_tables(
+            snapshot = inspect_schema_contract(
                 app,
                 db_extension=db_extension,
+                required_tables=resolved_tables,
+                required_columns=resolved_columns,
                 schema=schema,
             )
-            missing = calculate_missing_tables(required, existing)
         except Exception as exc:
-            return {
-                "ok": False,
-                "status": STATUS_FAILED,
-                "startedAt": started_at,
-                "completedAt": _utc_now_iso(),
-                "database": ping,
-                "requiredTables": required,
-                "existingTables": existing,
-                "missingTables": missing,
-                "error": _safe_exception_message(exc),
-            }
+            inspection_error = _safe_exception_message(exc)
 
     completed_at = _utc_now_iso()
+    ok = (
+        bool(ping.get("ok"))
+        and model_registry_ready
+        and inspection_error is None
+        and not snapshot.get("missingTables")
+        and not snapshot.get("missingColumns")
+    )
 
     return {
-        "ok": bool(ping.get("ok")) and not missing,
-        "status": STATUS_COMPLETED if bool(ping.get("ok")) and not missing else STATUS_FAILED,
+        "ok": ok,
+        "status": STATUS_COMPLETED if ok else STATUS_FAILED,
+        "resultVersion": SCHEMA_BOOTSTRAP_RESULT_VERSION,
         "startedAt": started_at,
         "completedAt": completed_at,
         "durationMs": _duration_ms(started_at, completed_at),
         "database": ping,
-        "requiredTables": required,
-        "existingTables": existing,
-        "missingTables": missing,
-        "tableCount": len(existing),
-        "missingTableCount": len(missing),
+        "modelRegistryReady": model_registry_ready,
+        "modelSummary": model_summary,
+        "requiredTables": resolved_tables,
+        "requiredColumns": resolved_columns,
+        "existingTables": snapshot.get("existingTables", []),
+        "existingColumns": snapshot.get("existingColumns", {}),
+        "missingTables": snapshot.get("missingTables", []),
+        "missingColumns": snapshot.get("missingColumns", {}),
+        "tableCount": len(snapshot.get("existingTables") or []),
+        "missingTableCount": len(snapshot.get("missingTables") or []),
+        "missingColumnCount": _missing_column_count(
+            snapshot.get("missingColumns") or {}
+        ),
+        "projectOwnerColumnsReady": bool(
+            snapshot.get("projectOwnerColumnsReady")
+        ),
+        "projectAccessTablesReady": bool(
+            snapshot.get("projectAccessTablesReady")
+        ),
+        "projectAccessColumnsReady": bool(
+            snapshot.get("projectAccessColumnsReady")
+        ),
+        "projectAccessSchemaReady": bool(
+            snapshot.get("projectAccessSchemaReady")
+        ),
         "schema": schema,
+        "error": inspection_error,
+        "mutated": False,
     }
 
 
@@ -1299,11 +1952,22 @@ def build_schema_bootstrap_summary(
         "databaseAvailable": data.get("database_available"),
         "modelRegistryReady": data.get("model_registry_ready"),
         "requiredTableCount": len(data.get("required_tables") or []),
+        "requiredColumnTableCount": len(data.get("required_columns") or {}),
         "tableCountBefore": len(data.get("tables_before") or []),
         "tableCountAfter": len(data.get("tables_after") or []),
         "missingTableCountBefore": len(data.get("missing_tables_before") or []),
         "missingTableCountAfter": len(data.get("missing_tables_after") or []),
+        "missingColumnCountBefore": _missing_column_count(
+            data.get("missing_columns_before") or {}
+        ),
+        "missingColumnCountAfter": _missing_column_count(
+            data.get("missing_columns_after") or {}
+        ),
         "createdTableCount": len(data.get("created_tables") or []),
+        "projectOwnerColumnsReady": data.get("project_owner_columns_ready"),
+        "projectAccessTablesReady": data.get("project_access_tables_ready"),
+        "projectAccessColumnsReady": data.get("project_access_columns_ready"),
+        "projectAccessSchemaReady": data.get("project_access_schema_ready"),
         "operationCount": len(data.get("operations") or []),
         "warningCount": len(data.get("warnings") or []),
         "errorCount": len(data.get("errors") or []),
@@ -1316,7 +1980,12 @@ def build_schema_bootstrap_summary(
 # -----------------------------------------------------------------------------
 
 __all__ = [
+    "DEFAULT_REQUIRED_COLUMNS",
     "DEFAULT_REQUIRED_TABLES",
+    "PROJECT_ACCESS_REQUIRED_COLUMNS",
+    "PROJECT_ACCESS_REQUIRED_TABLES",
+    "PROJECT_OWNER_REQUIRED_COLUMNS",
+    "SCHEMA_CRITICAL_MODEL_CLASSES",
     "OP_STATUS_FAILED",
     "OP_STATUS_OK",
     "OP_STATUS_SKIPPED",
@@ -1332,14 +2001,22 @@ __all__ = [
     "build_schema_bootstrap_summary",
     "build_schema_status",
     "calculate_created_tables",
+    "calculate_missing_columns",
     "calculate_missing_tables",
+    "build_schema_readiness_flags",
+    "get_required_column_names",
     "get_required_table_names",
+    "inspect_existing_columns",
     "inspect_existing_tables",
+    "inspect_schema_contract",
     "ping_database",
     "require_schema_models_ready",
+    "reset_schema_bootstrap_caches",
     "run_create_all",
     "run_schema_bootstrap",
     "run_schema_bootstrap_if_enabled",
     "schema_bootstrap_result_to_dict",
+    "verify_required_columns_exist",
     "verify_required_tables_exist",
+    "verify_schema_contract",
 ]
