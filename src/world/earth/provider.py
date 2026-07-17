@@ -43,14 +43,33 @@ WorldInstance, Referenzfingerprint, Manifest, Transformationspolicy und
 Transformationsoptionen gecacht. Ein Cache-Reset verändert keine persistierte
 Wahrheit. Generator-, Transformer- und Earth-Grid-Caches besitzen eigene
 Lebenszyklen und werden durch die übergeordnete Paketfassade geordnet geleert.
+
+Neutrale World-Adapteroberfläche
+--------------------------------
+Der allgemeine ``src.world``-Loader kennt Provider über eine kleine, stabile
+Moduloberfläche. Dieses Modul stellt deshalb zusätzlich die Funktionen
+``get_provider_info``, ``load_world_config``, ``validate_world_config``,
+``create_world_definition`` und ``generate_chunk`` bereit.
+
+Diese Adapteroberfläche ändert die konkrete Earth-Identitätsregel nicht:
+``earth`` bleibt die Provider-/Template-ID für Discovery und World-Test,
+während intern weiterhin eine konkrete, von ``earth`` verschiedene
+WorldInstance-ID verwendet wird. Periodische Aliase werden für neutrale
+``GeneratedChunk``-Antworten auf der angefragten Adresse ausgegeben; die
+kanonische Speicheradresse bleibt vollständig in den Metadaten erhalten.
 """
+
+from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 from hashlib import sha256
+from importlib import import_module
 import json
+from pathlib import Path
+from types import ModuleType
 import re
 from threading import RLock
 from typing import Any, ClassVar, Final, Self
@@ -107,10 +126,42 @@ from .validator import (
     WORLD_TYPE,
     EarthWorldDefinition,
     load_earth_world_definition,
+    validate_earth_world_definition,
 )
 
 
 DEFAULT_INSTANCE_WORLD_ID: Final[str] = "world_spawn"
+
+# Neutral src.world discovery identity. ``WORLD_ID`` deliberately names the
+# provider/template world, not a persisted WorldInstance.
+WORLD_ID: Final[str] = PROVIDER_WORLD_ID
+PROVIDER_LABEL: Final[str] = "Earth"
+PROVIDER_VERSION: Final[str] = "1.1.1"
+PROVIDER_MODULE: Final[str] = "src.world.earth.provider"
+CONFIG_FILENAME: Final[str] = "world.json"
+NEUTRAL_ADAPTER_SCHEMA_VERSION: Final[str] = "earth-neutral-world-adapter.v1"
+NEUTRAL_ADAPTER_CONCRETE_WORLD_ID: Final[str] = DEFAULT_INSTANCE_WORLD_ID
+NEUTRAL_ADAPTER_BLOCK_REGISTRY_ID: Final[str] = "debug-blocks"
+NEUTRAL_ADAPTER_BLOCK_REGISTRY_VERSION: Final[str] = "1"
+NEUTRAL_ADAPTER_UNUSED_BLOCK_TYPE_ID: Final[str] = "system_terrain"
+_MAX_CONFIG_FILE_BYTES: Final[int] = 1_048_576
+_NEUTRAL_API_MODULES: Final[tuple[str, str]] = (
+    "src.world.errors",
+    "src.world.models",
+)
+
+SUPPORTED_PROVIDER_FUNCTIONS: Final[tuple[str, ...]] = (
+    "get_provider_info",
+    "get_default_config_path",
+    "load_world_config",
+    "validate_world_config",
+    "create_world_definition",
+    "generate_chunk",
+    "get_provider_status",
+    "require_provider_ready",
+    "get_provider_contract",
+)
+
 PROVIDER_SCHEMA_VERSION: Final[str] = "earth-world-provider.v1"
 CAPABILITIES_SCHEMA_VERSION: Final[str] = (
     "earth-provider-capabilities.v1"
@@ -134,6 +185,805 @@ _SPAWN_RESOLUTION_CALLS = 0
 _REFERENCE_REBUILDS = 0
 _OPERATION_FAILURES = 0
 
+
+
+@lru_cache(maxsize=1)
+def _load_neutral_world_api() -> tuple[ModuleType, ModuleType]:
+    """Load the neutral world contract only when an adapter function is used.
+
+    Importing ``src.world.earth.provider`` must remain safe while the Flask app,
+    route registry, model registry or ``src.world`` package itself is still
+    being initialized.  The previous eager imports could turn an unrelated
+    later import into a failure when Python observed a partially initialized
+    module graph.
+    """
+
+    modules: list[ModuleType] = []
+    failures: list[dict[str, str]] = []
+
+    for module_name in _NEUTRAL_API_MODULES:
+        try:
+            module = import_module(module_name)
+        except Exception as exc:
+            failures.append(
+                {
+                    "module": module_name,
+                    "exceptionType": type(exc).__name__,
+                    "message": str(exc).strip() or type(exc).__name__,
+                }
+            )
+            continue
+
+        if not isinstance(module, ModuleType):
+            failures.append(
+                {
+                    "module": module_name,
+                    "exceptionType": "InvalidModuleType",
+                    "message": f"Expected ModuleType, got {type(module).__name__}.",
+                }
+            )
+            continue
+
+        modules.append(module)
+
+    if failures or len(modules) != len(_NEUTRAL_API_MODULES):
+        raise RuntimeError(
+            "Earth neutral adapter dependencies are not ready: "
+            + json.dumps(failures, ensure_ascii=True, sort_keys=True)
+        )
+
+    return modules[0], modules[1]
+
+
+def _neutral_symbol(name: str) -> Any:
+    errors_module, models_module = _load_neutral_world_api()
+
+    for module in (errors_module, models_module):
+        value = getattr(module, name, None)
+        if value is not None:
+            return value
+
+    raise RuntimeError(
+        f"Earth neutral adapter dependency symbol '{name}' is unavailable."
+    )
+
+
+def _neutral_type(name: str) -> type[Any]:
+    value = _neutral_symbol(name)
+    if not isinstance(value, type):
+        raise RuntimeError(
+            f"Earth neutral adapter symbol '{name}' must be a type, "
+            f"got {type(value).__name__}."
+        )
+    return value
+
+
+def _neutral_callable(name: str) -> Any:
+    value = _neutral_symbol(name)
+    if not callable(value):
+        raise RuntimeError(
+            f"Earth neutral adapter symbol '{name}' must be callable."
+        )
+    return value
+
+
+def _neutral_exception(name: str, *args: Any, **kwargs: Any) -> BaseException:
+    value = _neutral_type(name)(*args, **kwargs)
+    if not isinstance(value, BaseException):
+        raise RuntimeError(
+            f"Earth neutral adapter symbol '{name}' did not create an exception."
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class EarthProviderStatus:
+    """Read-only status of the neutral Earth provider adapter."""
+
+    ready: bool
+    config_path: str
+    config_exists: bool
+    config_valid: bool
+    earth_definition_ready: bool
+    neutral_definition_ready: bool
+    chunk_generation_ready: bool | None
+    errors: tuple[dict[str, Any], ...] = ()
+    warnings: tuple[dict[str, Any], ...] = ()
+    metadata: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "providerId": PROVIDER_ID,
+            "worldId": WORLD_ID,
+            "worldType": WORLD_TYPE,
+            "providerVersion": PROVIDER_VERSION,
+            "configPath": self.config_path,
+            "configExists": self.config_exists,
+            "configValid": self.config_valid,
+            "earthDefinitionReady": self.earth_definition_ready,
+            "neutralDefinitionReady": self.neutral_definition_ready,
+            "chunkGenerationReady": self.chunk_generation_ready,
+            "errors": [dict(item) for item in self.errors],
+            "warnings": [dict(item) for item in self.warnings],
+            "metadata": dict(self.metadata or {}),
+        }
+
+
+def _provider_package_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path(__file__).parent
+
+
+def get_default_config_path() -> Path:
+    """Return the canonical ``src/world/earth/world.json`` path."""
+
+    return _provider_package_dir() / CONFIG_FILENAME
+
+
+def _coerce_config_path(value: str | Path | None) -> Path:
+    if value is None:
+        return get_default_config_path()
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str) and value.strip():
+        return Path(value.strip())
+    raise _neutral_exception("InvalidWorldConfigFileError",
+        "Earth world config path must be a non-empty string or Path.",
+        details={"actualType": type(value).__name__},
+    )
+
+
+def _read_world_config_file(path: Path) -> dict[str, Any]:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except Exception:
+        resolved = path
+
+    if not resolved.exists():
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file does not exist.",
+            details={"configPath": str(resolved)},
+        )
+    if not resolved.is_file():
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config path is not a file.",
+            details={"configPath": str(resolved)},
+        )
+
+    try:
+        size_bytes = int(resolved.stat().st_size)
+    except Exception as exc:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file could not be inspected.",
+            details={"configPath": str(resolved)},
+            cause=exc,
+        ) from exc
+
+    if size_bytes > _MAX_CONFIG_FILE_BYTES:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file is too large.",
+            details={
+                "configPath": str(resolved),
+                "sizeBytes": size_bytes,
+                "maximumBytes": _MAX_CONFIG_FILE_BYTES,
+            },
+        )
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file must be UTF-8 encoded.",
+            details={"configPath": str(resolved)},
+            cause=exc,
+        ) from exc
+    except Exception as exc:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file could not be read.",
+            details={"configPath": str(resolved)},
+            cause=exc,
+        ) from exc
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file contains invalid JSON.",
+            details={
+                "configPath": str(resolved),
+                "line": exc.lineno,
+                "column": exc.colno,
+                "parserMessage": exc.msg,
+            },
+            cause=exc,
+        ) from exc
+    except Exception as exc:
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config file could not be parsed.",
+            details={"configPath": str(resolved)},
+            cause=exc,
+        ) from exc
+
+    if not isinstance(parsed, Mapping):
+        raise _neutral_exception("InvalidWorldConfigFileError",
+            "Earth world config JSON root must be an object.",
+            details={
+                "configPath": str(resolved),
+                "rootType": type(parsed).__name__,
+            },
+        )
+    return dict(parsed)
+
+
+def load_world_config(
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Load Earth ``world.json`` without creating providers or transformers."""
+
+    try:
+        return _read_world_config_file(_coerce_config_path(config_path))
+    except Exception as exc:
+        world_error = _neutral_callable("coerce_world_error")(
+            exc,
+            fallback_message="Earth provider could not load world config.",
+            fallback_code="earth_world_config_load_failed",
+            fallback_status_code=500,
+            details={
+                "providerId": PROVIDER_ID,
+                "configPath": str(config_path or get_default_config_path()),
+            },
+        )
+        raise world_error from exc
+
+
+def _validate_manifest_mapping(
+    raw_config: Mapping[str, Any],
+    *,
+    source_path: str | Path | None = None,
+) -> EarthWorldDefinition:
+    if not isinstance(raw_config, Mapping):
+        raise _neutral_exception("InvalidWorldDefinitionError",
+            "Earth world config must be an object.",
+            details={"configType": type(raw_config).__name__},
+        )
+
+    result = validate_earth_world_definition(
+        dict(raw_config),
+        allow_unknown_fields=False,
+        source_path=source_path,
+    )
+    result.raise_for_errors()
+    definition = result.definition
+    if not isinstance(definition, EarthWorldDefinition):
+        raise _neutral_exception("InvalidWorldDefinitionError",
+            "Earth validation did not produce EarthWorldDefinition.",
+            details={"providerId": PROVIDER_ID},
+        )
+    _validate_provider_definition(definition)
+    return definition
+
+
+def validate_world_config(
+    raw_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the Earth manifest and return an isolated normalized mapping."""
+
+    try:
+        if not isinstance(raw_config, Mapping):
+            raise _neutral_exception("InvalidWorldDefinitionError",
+                "Earth world config must be an object.",
+                details={"configType": type(raw_config).__name__},
+            )
+        normalized = dict(raw_config)
+        _validate_manifest_mapping(normalized)
+        return normalized
+    except Exception as exc:
+        world_error = _neutral_callable("coerce_world_error")(
+            exc,
+            fallback_message="Earth provider config validation failed.",
+            fallback_code="earth_world_config_validation_failed",
+            fallback_status_code=400,
+            details={"providerId": PROVIDER_ID},
+        )
+        raise world_error from exc
+
+
+def _neutral_adapter_palette() -> tuple[PaletteEntry, ...]:
+    """Provide the one unused positive entry required by legacy WorldDefinition.
+
+    Earth fallback chunks remain air-only and therefore contain exclusively
+    cell value ``0``. ``system_air`` is intentionally not represented as a
+    positive palette entry.
+    """
+
+    return (
+        _neutral_type("PaletteEntry")(
+            block_type_id=NEUTRAL_ADAPTER_UNUSED_BLOCK_TYPE_ID,
+            label="Terrain",
+            solid=True,
+            placeable=True,
+            breakable=True,
+            registry_id=NEUTRAL_ADAPTER_BLOCK_REGISTRY_ID,
+            registry_version=NEUTRAL_ADAPTER_BLOCK_REGISTRY_VERSION,
+            metadata={
+                "source": "system",
+                "adapterCompatibilityOnly": True,
+                "usedByEarthAirOnlyFallback": False,
+                "airCellValue": 0,
+                "cellValueRule": "paletteIndex + 1",
+            },
+        ),
+    )
+
+
+def _neutral_definition_from_earth(
+    definition: EarthWorldDefinition,
+    raw_config: Mapping[str, Any],
+) -> WorldDefinition:
+    if not isinstance(definition, EarthWorldDefinition):
+        raise _neutral_exception("InvalidWorldDefinitionError",
+            "Earth neutral adapter requires EarthWorldDefinition.",
+            details={"actualType": type(definition).__name__},
+        )
+
+    min_y = int(raw_config.get("minY", -1024))
+    max_y = int(raw_config.get("maxY", 8192))
+    surface_y = int(raw_config.get("surfaceY", 0))
+    if min_y > max_y:
+        raise _neutral_exception("InvalidWorldDefinitionError",
+            "Earth neutral minY must not exceed maxY.",
+            details={"minY": min_y, "maxY": max_y},
+        )
+
+    neutral = _neutral_type("WorldDefinition")(
+        world_id=WORLD_ID,
+        world_type=WORLD_TYPE,
+        label=definition.display_name,
+        generator_type=definition.generator_type,
+        generator_version=definition.generator_version,
+        chunk_size=definition.chunk.size,
+        cell_size=float(definition.grid.vertical_meters_per_cell),
+        coordinate_system=definition.coordinate_system_id,
+        projection_type=definition.grid.projection_id,
+        topology_type=definition.topology_type,
+        surface_y=surface_y,
+        min_y=min_y,
+        max_y=max_y,
+        seed=f"earth:{definition.semantic_fingerprint[:24]}",
+        palette=_neutral_adapter_palette(),
+        block_registry_id=NEUTRAL_ADAPTER_BLOCK_REGISTRY_ID,
+        block_registry_version=NEUTRAL_ADAPTER_BLOCK_REGISTRY_VERSION,
+        metadata={
+            "adapterSchemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
+            "providerId": definition.provider_id,
+            "templateId": definition.template_id,
+            "providerWorldId": definition.provider_world_id,
+            "providerContractVersion": definition.provider_contract_version,
+            "definitionVersion": definition.definition_version,
+            "definitionSemanticFingerprint": definition.semantic_fingerprint,
+            "manifestFingerprint": definition.manifest_fingerprint,
+            "concreteWorldIdRequired": True,
+            "adapterConcreteWorldId": NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
+            "globalReferenceRequiredForConcreteWorld": bool(
+                definition.global_reference.required
+            ),
+            "generationMode": definition.generator.generation_mode,
+            "airOnlyFallback": True,
+            "airCellValue": 0,
+            "periodicX": True,
+            "periodicZ": False,
+            "worldWidthCells": definition.grid.world_width_cells,
+            "worldHeightCells": definition.grid.world_height_cells,
+            "worldWidthChunks": definition.grid.world_width_chunks,
+            "worldHeightChunks": definition.grid.world_height_chunks,
+            "canonicalStorageAddresses": True,
+            "requestedAddressPreservedByNeutralAdapter": True,
+        },
+        raw_config=dict(raw_config),
+    )
+    neutral.validate()
+    return neutral
+
+
+def create_world_definition(
+    raw_config: Mapping[str, Any],
+) -> WorldDefinition:
+    """Create the generic discovery definition for provider id ``earth``."""
+
+    try:
+        normalized = validate_world_config(raw_config)
+        earth_definition = _validate_manifest_mapping(normalized)
+        return _neutral_definition_from_earth(earth_definition, normalized)
+    except Exception as exc:
+        world_error = _neutral_callable("coerce_world_error")(
+            exc,
+            fallback_message="Earth provider could not create WorldDefinition.",
+            fallback_code="earth_world_definition_create_failed",
+            fallback_status_code=400,
+            details={"providerId": PROVIDER_ID},
+        )
+        raise world_error from exc
+
+
+def get_provider_info() -> WorldProviderInfo:
+    """Return neutral-loader metadata for the Earth provider."""
+
+    return _neutral_type("WorldProviderInfo")(
+        provider_id=PROVIDER_ID,
+        world_type=WORLD_TYPE,
+        label=PROVIDER_LABEL,
+        provider_module=PROVIDER_MODULE,
+        config_path=str(get_default_config_path()),
+        supports_chunk_generation=True,
+        supports_world_metadata=True,
+        metadata={
+            "providerVersion": PROVIDER_VERSION,
+            "providerContractVersion": "earth-provider.v1",
+            "neutralAdapterSchemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
+            "generatorType": "earth-flat-periodic",
+            "generatorVersion": "1",
+            "projectionType": "vectoplan-periodic-equirectangular",
+            "topologyType": "periodic-x-v1",
+            "coordinateSystem": "vectoplan-earth-grid-v1",
+            "concreteWorldId": NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
+            "concreteWorldRequiresGlobalReference": True,
+            "airOnlyFallback": True,
+            "databaseUsed": False,
+        },
+    )
+
+
+def _ensure_neutral_world_definition(value: Any) -> WorldDefinition:
+    if not isinstance(value, _neutral_type("WorldDefinition")):
+        raise _neutral_exception("WorldProviderContractError",
+            "Earth provider expected WorldDefinition.",
+            details={"actualType": type(value).__name__},
+        )
+    value.validate()
+    mismatches: dict[str, Any] = {}
+    if value.world_id != WORLD_ID:
+        mismatches["worldId"] = {"expected": WORLD_ID, "actual": value.world_id}
+    if value.world_type != WORLD_TYPE:
+        mismatches["worldType"] = {
+            "expected": WORLD_TYPE,
+            "actual": value.world_type,
+        }
+    if value.generator_type != "earth-flat-periodic":
+        mismatches["generatorType"] = {
+            "expected": "earth-flat-periodic",
+            "actual": value.generator_type,
+        }
+    if value.topology_type != "periodic-x-v1":
+        mismatches["topologyType"] = {
+            "expected": "periodic-x-v1",
+            "actual": value.topology_type,
+        }
+    if mismatches:
+        raise _neutral_exception("WorldProviderContractError",
+            "Earth WorldDefinition does not match provider contract.",
+            details={"mismatches": mismatches},
+        )
+    return value
+
+
+def _ensure_neutral_chunk_request(value: Any) -> ChunkRequest:
+    if not isinstance(value, _neutral_type("ChunkRequest")):
+        raise _neutral_exception("WorldProviderContractError",
+            "Earth provider expected ChunkRequest.",
+            details={"actualType": type(value).__name__},
+        )
+    if value.world_id != WORLD_ID:
+        raise _neutral_exception("WorldProviderContractError",
+            "Earth ChunkRequest uses the wrong world id.",
+            details={"expectedWorldId": WORLD_ID, "actualWorldId": value.world_id},
+        )
+    return value
+
+
+@lru_cache(maxsize=1)
+def _get_neutral_adapter_earth_definition_cached() -> EarthWorldDefinition:
+    return _validate_manifest_mapping(
+        load_world_config(),
+        source_path=get_default_config_path(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_cached_default_world_definition() -> WorldDefinition:
+    """Return the validated generic Earth definition used by WorldLoader."""
+
+    raw = load_world_config()
+    earth_definition = _validate_manifest_mapping(
+        raw,
+        source_path=get_default_config_path(),
+    )
+    return _neutral_definition_from_earth(earth_definition, raw)
+
+
+@lru_cache(maxsize=1)
+def _get_neutral_adapter_provider_cached() -> "EarthWorldProvider":
+    """Create a deterministic non-persistent provider for WorldService tests.
+
+    The reference at 0°/0°/0 m is an adapter-local construction input. It is
+    never persisted and never substitutes the required reference of a concrete
+    project WorldInstance.
+    """
+
+    try:
+        from ...georeferencing.crs import canonical_geographic_crs
+
+        definition = _get_neutral_adapter_earth_definition_cached()
+        grid_definition = definition.to_earth_grid_definition()
+        reference = GlobalReferencePoint(
+            coordinate=GlobalCoordinate.from_values("0", "0", "0"),
+            crs=canonical_geographic_crs(),
+            grid=grid_definition.grid,
+            reference_version=1,
+            source="earth-neutral-world-adapter",
+        )
+        return get_earth_world_provider(
+            NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
+            reference,
+            definition=definition,
+        )
+    except Exception as exc:
+        world_error = _neutral_callable("coerce_world_error")(
+            exc,
+            fallback_message="Earth neutral adapter provider could not be created.",
+            fallback_code="earth_neutral_adapter_provider_failed",
+            fallback_status_code=500,
+            details={
+                "providerId": PROVIDER_ID,
+                "concreteWorldId": NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
+            },
+        )
+        raise world_error from exc
+
+
+def generate_chunk(
+    world: WorldDefinition,
+    request: ChunkRequest,
+) -> GeneratedChunk:
+    """Generate a generic ``GeneratedChunk`` through the real Earth generator.
+
+    The neutral ``src.world`` contract requires returned coordinates to equal
+    the requested coordinates. Canonical periodic coordinates are therefore
+    retained in metadata, while the authoritative project-scoped storage path
+    continues to use ``EarthWorldProvider`` and canonical addresses directly.
+    """
+
+    try:
+        neutral_world = _ensure_neutral_world_definition(world)
+        normalized_request = _ensure_neutral_chunk_request(request)
+        provider = _get_neutral_adapter_provider_cached()
+        generated = provider.generate_chunk(
+            (
+                normalized_request.chunk_x,
+                normalized_request.chunk_y,
+                normalized_request.chunk_z,
+            )
+        )
+        runtime_payload = generated.to_dict(include_cells=False)
+        canonical = generated.address
+        requested = generated.requested_address
+        return _neutral_type("GeneratedChunk").create(
+            world=neutral_world,
+            chunk_x=normalized_request.chunk_x,
+            chunk_y=normalized_request.chunk_y,
+            chunk_z=normalized_request.chunk_z,
+            cells=generated.cells,
+            source="earth-generated-fallback",
+            chunk_version=generated.config.generated_chunk_version,
+            content_hash=generated.content_fingerprint,
+            metadata={
+                "adapterSchemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
+                "providerId": PROVIDER_ID,
+                "templateId": TEMPLATE_ID,
+                "providerWorldId": PROVIDER_WORLD_ID,
+                "concreteAdapterWorldId": provider.world_id,
+                "requestedChunk": requested.to_dict(),
+                "canonicalChunk": canonical.to_dict(),
+                "requestedChunkKey": requested.key,
+                "canonicalChunkKey": canonical.key,
+                "canonicalized": generated.canonicalized,
+                "normalization": runtime_payload.get("normalization", {}),
+                "contentFingerprint": generated.content_fingerprint,
+                "generationFingerprint": runtime_payload.get(
+                    "generationFingerprint"
+                ),
+                "configFingerprint": generated.config.config_fingerprint,
+                "airOnly": generated.non_air_cell_count == 0,
+                "canonicalAddressRequiredForPersistence": True,
+                "neutralResponseUsesRequestedAddress": True,
+                "requestId": normalized_request.request_id,
+            },
+        )
+    except Exception as exc:
+        world_error = _neutral_callable("coerce_world_error")(
+            exc,
+            fallback_message="Earth provider could not generate neutral chunk.",
+            fallback_code="earth_chunk_generation_failed",
+            fallback_status_code=500,
+            details={
+                "providerId": PROVIDER_ID,
+                "worldId": getattr(request, "world_id", None),
+                "chunkX": getattr(request, "chunk_x", None),
+                "chunkY": getattr(request, "chunk_y", None),
+                "chunkZ": getattr(request, "chunk_z", None),
+            },
+        )
+        raise world_error from exc
+
+
+def get_provider_status(
+    *,
+    include_config_validation: bool = True,
+    include_component_readiness: bool = False,
+) -> EarthProviderStatus:
+    """Return a bounded provider status without DB or persistence access."""
+
+    path = get_default_config_path()
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    config_exists = path.is_file()
+    config_valid = False
+    earth_definition_ready = False
+    neutral_definition_ready = False
+    chunk_generation_ready: bool | None = None
+
+    if not config_exists:
+        errors.append(
+            {
+                "code": "earth_world_config_missing",
+                "message": "Earth world.json does not exist.",
+                "configPath": str(path),
+            }
+        )
+    elif include_config_validation:
+        try:
+            raw = load_world_config(path)
+            definition = _validate_manifest_mapping(raw, source_path=path)
+            config_valid = True
+            earth_definition_ready = True
+            neutral = _neutral_definition_from_earth(definition, raw)
+            neutral_definition_ready = bool(
+                neutral.world_id == WORLD_ID
+                and neutral.world_type == WORLD_TYPE
+                and neutral.generator_type == definition.generator_type
+            )
+        except Exception as exc:
+            errors.append(_safe_error(exc))
+    else:
+        config_valid = True
+        earth_definition_ready = True
+        neutral_definition_ready = True
+
+    if include_component_readiness and not errors:
+        try:
+            probe = generate_chunk(
+                get_cached_default_world_definition(),
+                _neutral_type("ChunkRequest").create(
+                    world_id=WORLD_ID,
+                    chunk_x=0,
+                    chunk_y=0,
+                    chunk_z=0,
+                    metadata={"source": "earth-provider-status"},
+                ),
+            )
+            chunk_generation_ready = bool(
+                probe.chunk_key == "0:0:0"
+                and probe.is_empty_air_chunk
+                and len(probe.cells) == probe.expected_cell_count
+            )
+        except Exception as exc:
+            chunk_generation_ready = False
+            errors.append(_safe_error(exc))
+
+    ready = bool(
+        config_exists
+        and config_valid
+        and earth_definition_ready
+        and neutral_definition_ready
+        and (chunk_generation_ready is not False)
+        and not errors
+    )
+    return EarthProviderStatus(
+        ready=ready,
+        config_path=str(path),
+        config_exists=config_exists,
+        config_valid=config_valid,
+        earth_definition_ready=earth_definition_ready,
+        neutral_definition_ready=neutral_definition_ready,
+        chunk_generation_ready=chunk_generation_ready,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        metadata={
+            "providerModule": PROVIDER_MODULE,
+            "neutralAdapterSchemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
+            "componentReadinessChecked": include_component_readiness,
+            "databaseQueried": False,
+            "persistentStateChanged": False,
+            "neutralDependenciesLoaded": bool(
+                _load_neutral_world_api.cache_info().currsize
+            ),
+        },
+    )
+
+
+def require_provider_ready() -> None:
+    """Raise when explicit full Earth provider readiness is not satisfied."""
+
+    status = get_provider_status(
+        include_config_validation=True,
+        include_component_readiness=True,
+    )
+    if status.ready:
+        return
+    raise _neutral_exception("WorldProviderError",
+        "Earth provider is not ready.",
+        details=status.to_dict(),
+    )
+
+
+def get_provider_contract() -> dict[str, Any]:
+    """Return the neutral and concrete Earth provider contracts."""
+
+    return {
+        "providerId": PROVIDER_ID,
+        "worldId": WORLD_ID,
+        "worldType": WORLD_TYPE,
+        "templateId": TEMPLATE_ID,
+        "providerWorldId": PROVIDER_WORLD_ID,
+        "providerModule": PROVIDER_MODULE,
+        "providerVersion": PROVIDER_VERSION,
+        "configFilename": CONFIG_FILENAME,
+        "requiredFunctions": list(SUPPORTED_PROVIDER_FUNCTIONS[:6]),
+        "optionalFunctions": list(SUPPORTED_PROVIDER_FUNCTIONS[6:]),
+        "neutralAdapter": {
+            "schemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
+            "worldId": WORLD_ID,
+            "returnedChunkCoordinates": "requested",
+            "canonicalChunkCoordinatesInMetadata": True,
+            "positivePaletteCompatibilityEntry": (
+                NEUTRAL_ADAPTER_UNUSED_BLOCK_TYPE_ID
+            ),
+            "generatedCellValues": [0],
+            "airStoredInPositivePalette": False,
+        },
+        "concreteWorld": {
+            "defaultWorldId": NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
+            "providerIdentityMayNotBeConcreteWorldId": True,
+            "globalReferenceRequired": True,
+            "globalReferencePersistedPerWorld": 1,
+            "canonicalizeBeforePersistence": True,
+            "normalReanchorAllowed": False,
+        },
+        "generator": {
+            "type": "earth-flat-periodic",
+            "version": "1",
+            "airOnlyFallback": True,
+            "periodicX": True,
+            "periodicZ": False,
+        },
+        "boundaries": {
+            "usesDatabase": False,
+            "createsSchema": False,
+            "writesSnapshots": False,
+            "writesEvents": False,
+            "persistsReferences": False,
+            "neutralDependenciesImportedLazily": True,
+            "importSafeDuringAppBootstrap": True,
+        },
+    }
+
+
+def reset_provider_caches() -> dict[str, Any]:
+    """Clear only Earth provider and neutral-adapter process caches."""
+
+    return clear_earth_provider_component_caches()
 
 @dataclass(frozen=True, slots=True)
 class EarthProviderCapabilities:
@@ -1266,6 +2116,18 @@ def earth_provider_component_cache_info() -> dict[str, JsonValue]:
         "providers": _cache_info_to_dict(
             _get_earth_world_provider_cached.cache_info()
         ),
+        "neutralDependencies": _cache_info_to_dict(
+            _load_neutral_world_api.cache_info()
+        ),
+        "neutralAdapterProvider": _cache_info_to_dict(
+            _get_neutral_adapter_provider_cached.cache_info()
+        ),
+        "neutralEarthDefinition": _cache_info_to_dict(
+            _get_neutral_adapter_earth_definition_cached.cache_info()
+        ),
+        "neutralWorldDefinition": _cache_info_to_dict(
+            get_cached_default_world_definition.cache_info()
+        ),
         "metrics": metrics,
     }
 
@@ -1285,6 +2147,12 @@ def clear_earth_provider_component_caches() -> dict[str, JsonValue]:
     global _OPERATION_FAILURES
 
     _get_earth_world_provider_cached.cache_clear()
+    _get_neutral_adapter_provider_cached.cache_clear()
+    get_cached_default_world_definition.cache_clear()
+    _load_neutral_world_api.cache_clear()
+    _get_neutral_adapter_provider_cached.cache_clear()
+    _get_neutral_adapter_earth_definition_cached.cache_clear()
+    get_cached_default_world_definition.cache_clear()
 
     with _METRICS_LOCK:
         _FACTORY_CALLS = 0
@@ -1302,6 +2170,9 @@ def clear_earth_provider_component_caches() -> dict[str, JsonValue]:
         "ok": True,
         "cleared": [
             "providers",
+            "neutralAdapterProvider",
+            "neutralAdapterDefinition",
+            "neutralWorldDefinition",
             "metrics",
         ],
         "remaining": earth_provider_component_cache_info(),
@@ -1897,11 +2768,33 @@ def _safe_error(error: BaseException) -> dict[str, JsonValue]:
 
 
 __all__ = [
+    "CAPABILITIES_SCHEMA_VERSION",
+    "CONFIG_FILENAME",
     "DEFAULT_INSTANCE_WORLD_ID",
     "EarthProviderCapabilities",
+    "EarthProviderStatus",
     "EarthWorldProvider",
+    "NEUTRAL_ADAPTER_CONCRETE_WORLD_ID",
+    "NEUTRAL_ADAPTER_SCHEMA_VERSION",
+    "PROVIDER_LABEL",
+    "PROVIDER_MODULE",
+    "PROVIDER_SCHEMA_VERSION",
+    "PROVIDER_VERSION",
+    "SUPPORTED_PROVIDER_FUNCTIONS",
+    "WORLD_ID",
     "clear_earth_provider_component_caches",
+    "create_world_definition",
     "earth_provider_component_cache_info",
     "earth_provider_component_status",
+    "generate_chunk",
+    "get_cached_default_world_definition",
+    "get_default_config_path",
     "get_earth_world_provider",
+    "get_provider_contract",
+    "get_provider_info",
+    "get_provider_status",
+    "load_world_config",
+    "require_provider_ready",
+    "reset_provider_caches",
+    "validate_world_config",
 ]

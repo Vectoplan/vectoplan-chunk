@@ -19,6 +19,7 @@ Important boundaries:
 
 Productive project-scoped API:
 - routes.projects:projects_bp
+- routes.project_access:project_access_bp
 - routes.worlds:worlds_bp
 - routes.blocks:blocks_bp
 - routes.chunks:chunks_bp
@@ -33,6 +34,11 @@ Legacy compatibility:
 
 Core route examples:
 - GET  /projects/dev-project/bootstrap
+- GET  /projects/dev-project/access
+- PUT  /projects/dev-project/access/initialize
+- GET  /projects/dev-project/roles
+- GET  /projects/dev-project/groups
+- GET  /projects/dev-project/assignments
 - GET  /projects/dev-project/worlds
 - POST /projects/dev-project/worlds
 - GET  /projects/dev-project/worlds/world_spawn
@@ -43,6 +49,9 @@ Core route examples:
 
 Architecture semantics:
 - Project contains Universes.
+- Project owns project-scoped roles, groups, memberships and assignments.
+- Project-access rows store external user ids without cross-service user foreign keys.
+- Project-access routes prepare storage contracts but do not enforce authorization.
 - Universe contains concrete WorldInstances.
 - world_spawn is the concrete editable project world.
 - flat is the provider/template world.
@@ -56,7 +65,7 @@ import importlib
 import traceback
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any
 
 from flask import Blueprint, Flask
 
@@ -65,7 +74,7 @@ from flask import Blueprint, Flask
 # Constants
 # -----------------------------------------------------------------------------
 
-ROUTES_REGISTRY_VERSION = "0.5.0"
+ROUTES_REGISTRY_VERSION = "0.6.0"
 
 DEFAULT_EXTENSION_NAMESPACE = "vectoplan_chunk"
 DEFAULT_ROUTING_STATE_KEY = "routing"
@@ -80,8 +89,32 @@ CONFIG_EXTENSION_NAMESPACE_KEYS = (
     "ROUTES_EXTENSION_NAMESPACE",
 )
 
+PROJECT_ACCESS_BLUEPRINT_MODULE = "routes.project_access"
+PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE = "project_access_bp"
+PROJECT_ACCESS_BLUEPRINT_NAME = "project_access"
+
+CONFIG_ENABLE_PROJECT_ACCESS_ROUTES = (
+    "VECTOPLAN_CHUNK_ENABLE_PROJECT_ACCESS_ROUTES",
+    "VECTOPLAN_CHUNK_PROJECT_ACCESS_ROUTES_ENABLED",
+)
+
+CONFIG_REQUIRE_PROJECT_ACCESS_ROUTES = (
+    "VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_ROUTES",
+    "VECTOPLAN_CHUNK_PROJECT_ACCESS_ROUTES_REQUIRED",
+)
+
+PROJECT_ACCESS_CORE_ROUTE_RULES = (
+    "/project-access/_status",
+    "/projects/<project_id>/access",
+    "/projects/<project_id>/access/initialize",
+    "/projects/<project_id>/roles",
+    "/projects/<project_id>/groups",
+    "/projects/<project_id>/assignments",
+)
+
 PRODUCTIVE_BLUEPRINT_MODULES = (
     "routes.projects",
+    PROJECT_ACCESS_BLUEPRINT_MODULE,
     "routes.worlds",
     "routes.blocks",
     "routes.chunks",
@@ -362,6 +395,13 @@ def _ensure_routing_state(app: Flask) -> dict[str, Any]:
     routing.setdefault("routesRegistryVersion", ROUTES_REGISTRY_VERSION)
     routing.setdefault("routingInitialized", False)
     routing.setdefault("projectScopedApiEnabled", True)
+    routing.setdefault("projectAccessApiEnabled", True)
+    routing.setdefault("projectAccessRoutesRequired", True)
+    routing.setdefault("projectAccessBlueprintRegistered", False)
+    routing.setdefault("projectAccessRouteSurfaceReady", False)
+    routing.setdefault("projectAccessAuthzEnforced", False)
+    routing.setdefault("projectAccessCoreRouteRules", list(PROJECT_ACCESS_CORE_ROUTE_RULES))
+    routing.setdefault("projectAccessMissingRouteRules", [])
     routing.setdefault("worldStateApiEnabled", True)
     routing.setdefault("snapshotBackedChunksEnabled", True)
     routing.setdefault("commandWriteApiEnabled", True)
@@ -470,10 +510,63 @@ def _should_register_legacy_routes(app: Flask) -> bool:
     )
 
 
+def _first_config_bool(
+    app: Flask,
+    keys: tuple[str, ...],
+    *,
+    default: bool,
+) -> bool:
+    """Return the first explicitly configured boolean from ``keys``."""
+    for key in keys:
+        value = _safe_get_config_value(app, key, None)
+        if value is not None:
+            return _safe_bool(value, default=default)
+    return default
+
+
+def _should_register_project_access_routes(app: Flask) -> bool:
+    """Return whether the prepared project-access route surface is enabled."""
+    return _first_config_bool(
+        app,
+        CONFIG_ENABLE_PROJECT_ACCESS_ROUTES,
+        default=True,
+    )
+
+
+def _should_require_project_access_routes(app: Flask) -> bool:
+    """Return whether missing project-access routes must fail app startup."""
+    if not _should_register_project_access_routes(app):
+        return False
+
+    return _first_config_bool(
+        app,
+        CONFIG_REQUIRE_PROJECT_ACCESS_ROUTES,
+        default=True,
+    )
+
+
+def _is_project_access_spec(spec: BlueprintSpec) -> bool:
+    """Return whether a specification describes the project-access Blueprint."""
+    return bool(
+        spec.module_name == PROJECT_ACCESS_BLUEPRINT_MODULE
+        and spec.attribute_name == PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE
+    )
+
+
+def _effective_spec_required(app: Flask, spec: BlueprintSpec) -> bool:
+    """Resolve the effective required flag for a Blueprint specification."""
+    if _is_project_access_spec(spec):
+        return _should_require_project_access_routes(app)
+    return bool(spec.required)
+
+
 def _should_skip_spec(app: Flask, spec: BlueprintSpec) -> tuple[bool, str | None]:
     """
     Check whether a blueprint spec should be skipped due to config.
     """
+    if _is_project_access_spec(spec) and not _should_register_project_access_routes(app):
+        return True, "project_access_routes_disabled"
+
     if spec.category == "debug" and not _should_register_dev_routes(app):
         return True, "dev_routes_disabled"
 
@@ -494,7 +587,8 @@ def get_blueprint_specs() -> tuple[BlueprintSpec, ...]:
 
     Productive route order is intentional:
     - projects first
-    - worlds second
+    - project access immediately after projects
+    - worlds next
     - blocks/chunks read APIs
     - commands write API
     - debug/legacy last
@@ -507,6 +601,17 @@ def get_blueprint_specs() -> tuple[BlueprintSpec, ...]:
             required=True,
             description="Project creation, listing, patching, deletion and bootstrap routes.",
             category="productive",
+        ),
+        BlueprintSpec(
+            module_name=PROJECT_ACCESS_BLUEPRINT_MODULE,
+            attribute_name=PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE,
+            url_prefix=None,
+            required=True,
+            description=(
+                "Prepared project-scoped roles, groups, memberships and role "
+                "assignment routes without authorization enforcement."
+            ),
+            category="productive-access",
         ),
         BlueprintSpec(
             module_name="routes.worlds",
@@ -568,6 +673,51 @@ def get_blueprint_specs() -> tuple[BlueprintSpec, ...]:
             category="legacy",
         ),
     )
+
+
+def _validate_blueprint_specs(
+    specs: tuple[BlueprintSpec, ...],
+) -> dict[str, Any]:
+    """Validate the immutable Blueprint registry contract without importing routes."""
+    errors: list[str] = []
+    identities: set[tuple[str, str]] = set()
+    project_access_count = 0
+
+    for index, spec in enumerate(specs):
+        module_name = _safe_str(spec.module_name)
+        attribute_name = _safe_str(spec.attribute_name)
+
+        if not module_name:
+            errors.append(f"spec[{index}] has no module_name")
+        if not attribute_name:
+            errors.append(f"spec[{index}] has no attribute_name")
+
+        identity = (module_name, attribute_name)
+        if identity in identities:
+            errors.append(
+                "duplicate Blueprint specification: "
+                f"{module_name}:{attribute_name}"
+            )
+        identities.add(identity)
+
+        if _is_project_access_spec(spec):
+            project_access_count += 1
+
+    if project_access_count != 1:
+        errors.append(
+            "expected exactly one project-access Blueprint specification; "
+            f"found {project_access_count}"
+        )
+
+    if errors:
+        raise RuntimeError("Invalid Blueprint registry: " + " | ".join(errors))
+
+    return {
+        "ok": True,
+        "specCount": len(specs),
+        "uniqueIdentityCount": len(identities),
+        "projectAccessSpecCount": project_access_count,
+    }
 
 
 @lru_cache(maxsize=64)
@@ -664,6 +814,7 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
     Required Blueprints fail app startup.
     Optional Blueprints are logged and skipped on failure.
     """
+    effective_required = _effective_spec_required(app, spec)
     skip, skip_reason = _should_skip_spec(app, spec)
 
     if skip:
@@ -678,7 +829,7 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
                 attribute_name=spec.attribute_name,
                 blueprint_name=None,
                 url_prefix=spec.url_prefix,
-                required=spec.required,
+                required=effective_required,
                 category=spec.category,
                 status="skipped",
                 skipped=True,
@@ -704,7 +855,7 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
                 attribute_name=spec.attribute_name,
                 blueprint_name=getattr(blueprint, "name", None),
                 url_prefix=spec.url_prefix,
-                required=spec.required,
+                required=effective_required,
                 category=spec.category,
                 status=status,
                 skipped=reason != "registered",
@@ -722,7 +873,7 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
                 attribute_name=spec.attribute_name,
                 blueprint_name=None,
                 url_prefix=spec.url_prefix,
-                required=spec.required,
+                required=effective_required,
                 category=spec.category,
                 status="error",
                 skipped=False,
@@ -733,7 +884,7 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
             ),
         )
 
-        if spec.required:
+        if effective_required:
             _safe_log_error(
                 app,
                 f"Required Blueprint '{spec.module_name}:{spec.attribute_name}' "
@@ -748,9 +899,53 @@ def _register_spec(app: Flask, spec: BlueprintSpec) -> None:
         )
 
 
+def _collect_route_rules(app: Flask) -> set[str]:
+    """Collect registered Flask route rules without invoking any view functions."""
+    try:
+        return {str(rule.rule) for rule in app.url_map.iter_rules()}
+    except Exception:
+        return set()
+
+
+def _build_project_access_route_surface_status(app: Flask) -> dict[str, Any]:
+    """Build a read-only contract status for the project-access route surface."""
+    enabled = _should_register_project_access_routes(app)
+    required = _should_require_project_access_routes(app)
+
+    try:
+        blueprint_registered = PROJECT_ACCESS_BLUEPRINT_NAME in app.blueprints
+    except Exception:
+        blueprint_registered = False
+
+    rules = _collect_route_rules(app)
+    present = [rule for rule in PROJECT_ACCESS_CORE_ROUTE_RULES if rule in rules]
+    missing = [rule for rule in PROJECT_ACCESS_CORE_ROUTE_RULES if rule not in rules]
+
+    ready = bool(enabled and blueprint_registered and not missing)
+
+    return {
+        "enabled": enabled,
+        "required": required,
+        "authzEnforced": False,
+        "blueprintName": PROJECT_ACCESS_BLUEPRINT_NAME,
+        "blueprintRegistered": blueprint_registered,
+        "coreRouteRules": list(PROJECT_ACCESS_CORE_ROUTE_RULES),
+        "presentRouteRules": present,
+        "missingRouteRules": missing,
+        "routeSurfaceReady": ready,
+        "status": (
+            "disabled"
+            if not enabled
+            else "ready"
+            if ready
+            else "missing"
+        ),
+    }
+
+
 def _store_registration_metadata(app: Flask) -> None:
     """
-    Store final routing metadata.
+    Store final routing metadata and verify the project-access route contract.
     """
     routing = _ensure_routing_state(app)
 
@@ -766,11 +961,22 @@ def _store_registration_metadata(app: Flask) -> None:
         routing["blueprintRegistrationErrorCount"] = len(routing.get("errors", []) or [])
         routing["blueprintRegistrationSuccessCount"] = len(routing.get("successes", []) or [])
         routing["blueprintRegistrationSkippedCount"] = len(routing.get("skipped", []) or [])
+        project_access_status = _build_project_access_route_surface_status(app)
+
         routing["productiveBlueprintModules"] = list(PRODUCTIVE_BLUEPRINT_MODULES)
         routing["debugBlueprintModules"] = list(DEBUG_BLUEPRINT_MODULES)
         routing["optionalLegacyBlueprintModules"] = list(OPTIONAL_LEGACY_BLUEPRINT_MODULES)
-        routing["routingInitialized"] = True
+        routing["routingInitialized"] = False
+        routing["routingError"] = None
         routing["projectScopedApiEnabled"] = True
+        routing["projectAccessApiEnabled"] = project_access_status["enabled"]
+        routing["projectAccessRoutesRequired"] = project_access_status["required"]
+        routing["projectAccessBlueprintRegistered"] = project_access_status["blueprintRegistered"]
+        routing["projectAccessRouteSurfaceReady"] = project_access_status["routeSurfaceReady"]
+        routing["projectAccessAuthzEnforced"] = False
+        routing["projectAccessCoreRouteRules"] = project_access_status["coreRouteRules"]
+        routing["projectAccessMissingRouteRules"] = project_access_status["missingRouteRules"]
+        routing["projectAccess"] = project_access_status
         routing["worldStateApiEnabled"] = True
         routing["snapshotBackedChunksEnabled"] = True
         routing["commandWriteApiEnabled"] = "commands" in tracked_names
@@ -782,17 +988,46 @@ def _store_registration_metadata(app: Flask) -> None:
         # startup/status code that reads app.extensions[namespace] directly.
         namespace = _ensure_extension_namespace(app)
         namespace["routes_registry_version"] = ROUTES_REGISTRY_VERSION
-        namespace["routing_initialized"] = True
+        namespace["routing_initialized"] = False
         namespace["registered_blueprint_names"] = set(tracked_names)
         namespace["registered_blueprint_names_list"] = tracked_names
         namespace["registered_blueprint_count"] = len(tracked_names)
         namespace["project_scoped_api_enabled"] = True
+        namespace["project_access_api_enabled"] = project_access_status["enabled"]
+        namespace["project_access_routes_required"] = project_access_status["required"]
+        namespace["project_access_blueprint_registered"] = project_access_status["blueprintRegistered"]
+        namespace["project_access_route_surface_ready"] = project_access_status["routeSurfaceReady"]
+        namespace["project_access_authz_enforced"] = False
+        namespace["project_access_route_status"] = dict(project_access_status)
         namespace["world_state_api_enabled"] = True
         namespace["snapshot_backed_chunks_enabled"] = True
         namespace["command_write_api_enabled"] = routing["commandWriteApiEnabled"]
         namespace["earth_debug_route_enabled"] = routing["earthDebugRouteEnabled"]
 
+        if (
+            project_access_status["enabled"]
+            and project_access_status["required"]
+            and not project_access_status["routeSurfaceReady"]
+        ):
+            missing = ", ".join(project_access_status["missingRouteRules"]) or "<blueprint>"
+            raise RuntimeError(
+                "Required project-access Blueprint route surface is incomplete: "
+                f"{missing}."
+            )
+
+        routing["routingInitialized"] = True
+        routing["routingError"] = None
+        namespace["routing_initialized"] = True
+
     except Exception as exc:
+        try:
+            routing["routingInitialized"] = False
+            routing["routingError"] = {
+                "type": type(exc).__name__,
+                "message": _safe_exception_message(exc),
+            }
+        except Exception:
+            pass
         raise RuntimeError("Routing metadata could not be stored.") from exc
 
 
@@ -821,6 +1056,13 @@ def register_blueprints(app: Flask) -> Flask:
     _ensure_routing_state(app)
 
     specs = get_blueprint_specs()
+    spec_validation = _validate_blueprint_specs(specs)
+
+    try:
+        routing = _ensure_routing_state(app)
+        routing["specValidation"] = spec_validation
+    except Exception:
+        pass
 
     if not specs:
         _safe_log_warning(app, "No Blueprint specs found; no routes registered.")
@@ -926,7 +1168,16 @@ def get_routing_metadata(app: Flask) -> dict[str, Any]:
             "routesRegistryVersion": routing.get("routesRegistryVersion"),
             "routeModule": routing.get("routeModule"),
             "routingInitialized": routing.get("routingInitialized"),
+            "routingError": routing.get("routingError"),
             "projectScopedApiEnabled": routing.get("projectScopedApiEnabled"),
+            "projectAccessApiEnabled": routing.get("projectAccessApiEnabled"),
+            "projectAccessRoutesRequired": routing.get("projectAccessRoutesRequired"),
+            "projectAccessBlueprintRegistered": routing.get("projectAccessBlueprintRegistered"),
+            "projectAccessRouteSurfaceReady": routing.get("projectAccessRouteSurfaceReady"),
+            "projectAccessAuthzEnforced": routing.get("projectAccessAuthzEnforced"),
+            "projectAccessCoreRouteRules": routing.get("projectAccessCoreRouteRules", []),
+            "projectAccessMissingRouteRules": routing.get("projectAccessMissingRouteRules", []),
+            "projectAccess": routing.get("projectAccess", {}),
             "worldStateApiEnabled": routing.get("worldStateApiEnabled"),
             "snapshotBackedChunksEnabled": routing.get("snapshotBackedChunksEnabled"),
             "commandWriteApiEnabled": routing.get("commandWriteApiEnabled"),
@@ -936,6 +1187,7 @@ def get_routing_metadata(app: Flask) -> dict[str, Any]:
             "registeredBlueprintNames": get_registered_blueprint_names(app),
             "registeredBlueprintCount": routing.get("registeredBlueprintCount"),
             "blueprintSpecs": routing.get("blueprintSpecs", []),
+            "specValidation": routing.get("specValidation", {}),
             "records": get_blueprint_registration_records(app),
             "errors": get_blueprint_registration_errors(app),
             "successes": get_blueprint_registration_successes(app),
@@ -974,6 +1226,12 @@ __all__ = [
     "BlueprintSpec",
     "BlueprintRegistrationRecord",
     "ROUTES_REGISTRY_VERSION",
+    "PROJECT_ACCESS_BLUEPRINT_MODULE",
+    "PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE",
+    "PROJECT_ACCESS_BLUEPRINT_NAME",
+    "PROJECT_ACCESS_CORE_ROUTE_RULES",
+    "CONFIG_ENABLE_PROJECT_ACCESS_ROUTES",
+    "CONFIG_REQUIRE_PROJECT_ACCESS_ROUTES",
     "PRODUCTIVE_BLUEPRINT_MODULES",
     "DEBUG_BLUEPRINT_MODULES",
     "OPTIONAL_LEGACY_BLUEPRINT_MODULES",

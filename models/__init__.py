@@ -10,6 +10,7 @@ the full schema.
 Current persistent model groups:
 
     Project / Universe / WorldInstance
+    ProjectRole / ProjectGroup / ProjectGroupMember / ProjectRoleAssignment
     BlockRegistry / BlockType
     ChunkSnapshot
     WorldCommandLog / ChunkEvent
@@ -35,6 +36,8 @@ Important design rules:
 - public/API ids are not internal database ids,
 - Project.project_id is the chunk-service public project id,
 - Project.external_app_project_id links to vectoplan-app without DB FK,
+- project access user ids are external strings without cross-service DB FK,
+- access models store future roles/groups but do not authorize requests,
 - Universe.universe_id is unique inside one project,
 - WorldInstance.world_id is unique inside one universe,
 - ChunkSnapshot uniqueness uses internal world_db_id + chunk_x/y/z,
@@ -63,6 +66,7 @@ PACKAGE_NAME = "models"
 
 MODEL_IMPORT_ORDER: Tuple[str, ...] = (
     "project",
+    "project_access",
     "universe",
     "world",
     "block",
@@ -73,6 +77,10 @@ MODEL_IMPORT_ORDER: Tuple[str, ...] = (
 
 EXPECTED_MODEL_CLASSES: Tuple[str, ...] = (
     "Project",
+    "ProjectRole",
+    "ProjectGroup",
+    "ProjectGroupMember",
+    "ProjectRoleAssignment",
     "Universe",
     "WorldInstance",
     "BlockRegistry",
@@ -86,6 +94,10 @@ EXPECTED_MODEL_CLASSES: Tuple[str, ...] = (
 
 MODEL_CLASS_TO_MODULE: Dict[str, str] = {
     "Project": "project",
+    "ProjectRole": "project_access",
+    "ProjectGroup": "project_access",
+    "ProjectGroupMember": "project_access",
+    "ProjectRoleAssignment": "project_access",
     "Universe": "universe",
     "WorldInstance": "world",
     "BlockRegistry": "block",
@@ -99,6 +111,10 @@ MODEL_CLASS_TO_MODULE: Dict[str, str] = {
 
 MODEL_CLASS_TO_TABLE: Dict[str, str] = {
     "Project": "projects",
+    "ProjectRole": "project_roles",
+    "ProjectGroup": "project_groups",
+    "ProjectGroupMember": "project_group_members",
+    "ProjectRoleAssignment": "project_role_assignments",
     "Universe": "universes",
     "WorldInstance": "world_instances",
     "BlockRegistry": "block_registries",
@@ -127,7 +143,99 @@ EXPECTED_MODEL_COLUMNS: Dict[str, Tuple[str, ...]] = {
         "spawn_world_id",
         "external_app_project_id",
         "source_service",
+        "owner_type",
+        "owner_id",
+        "created_by_user_id",
+        "updated_by_user_id",
         "metadata_json",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    ),
+    "ProjectRole": (
+        "id",
+        "role_id",
+        "project_db_id",
+        "role_key",
+        "name",
+        "description",
+        "permissions_json",
+        "is_system",
+        "status",
+        "schema_version",
+        "revision",
+        "metadata_json",
+        "created_by_user_id",
+        "updated_by_user_id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    ),
+    "ProjectGroup": (
+        "id",
+        "group_id",
+        "project_db_id",
+        "group_key",
+        "name",
+        "description",
+        "is_system",
+        "status",
+        "schema_version",
+        "revision",
+        "metadata_json",
+        "created_by_user_id",
+        "updated_by_user_id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    ),
+    "ProjectGroupMember": (
+        "id",
+        "membership_id",
+        "project_db_id",
+        "group_db_id",
+        "group_id",
+        "user_id",
+        "status",
+        "added_by_user_id",
+        "removed_by_user_id",
+        "starts_at",
+        "expires_at",
+        "removed_at",
+        "removal_reason",
+        "schema_version",
+        "revision",
+        "metadata_json",
+        "created_by_user_id",
+        "updated_by_user_id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+    ),
+    "ProjectRoleAssignment": (
+        "id",
+        "assignment_id",
+        "project_db_id",
+        "role_db_id",
+        "role_id",
+        "subject_type",
+        "user_id",
+        "group_db_id",
+        "group_id",
+        "subject_key",
+        "permission_overrides_json",
+        "status",
+        "assigned_by_user_id",
+        "revoked_by_user_id",
+        "starts_at",
+        "expires_at",
+        "revoked_at",
+        "revocation_reason",
+        "schema_version",
+        "revision",
+        "metadata_json",
+        "created_by_user_id",
+        "updated_by_user_id",
         "created_at",
         "updated_at",
         "deleted_at",
@@ -479,6 +587,7 @@ def reset_model_import_cache() -> None:
     get_model_table_map.cache_clear()
     get_model_column_map.cache_clear()
     get_model_relationship_map.cache_clear()
+    get_project_access_model_contract.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -730,6 +839,7 @@ def get_model_debug_summary() -> Dict[str, Any]:
             for class_name, columns in status.missing_expected_columns.items()
         },
         "appIntegrationReady": is_app_integration_model_shape_ready(),
+        "projectAccessShapeReady": is_project_access_model_shape_ready(),
         "coreWorldShapeReady": is_core_world_model_shape_ready(),
     }
 
@@ -751,6 +861,9 @@ def is_app_integration_model_shape_ready() -> bool:
         "Project": (
             "project_id",
             "external_app_project_id",
+            "owner_type",
+            "owner_id",
+            "created_by_user_id",
             "default_universe_id",
             "default_world_id",
             "spawn_world_id",
@@ -781,6 +894,90 @@ def is_app_integration_model_shape_ready() -> bool:
         for column in required_columns:
             if column not in available:
                 return False
+
+    return True
+
+
+@lru_cache(maxsize=1)
+def get_project_access_model_contract() -> Dict[str, Any]:
+    """Return the DB-free contract exported by ``models.project_access``.
+
+    Import and contract failures are converted into diagnostic data so status
+    and bootstrap callers can report the cause without duplicating defensive
+    import logic. Only immutable/schema-derived information is cached; ORM
+    instances and database state are never cached.
+    """
+    module = _MODEL_MODULES.get("project_access")
+    if module is None:
+        module = _safe_import_model_module("project_access")
+
+    if module is None:
+        record = _MODEL_IMPORT_RECORDS.get("project_access")
+        return {
+            "ok": False,
+            "moduleName": "project_access",
+            "error": record.error if record is not None else "module unavailable",
+            "models": [],
+            "tables": [],
+            "expectedColumns": {},
+        }
+
+    builder = getattr(module, "get_project_access_model_contract", None)
+    if not callable(builder):
+        return {
+            "ok": False,
+            "moduleName": "project_access",
+            "error": "get_project_access_model_contract() is missing",
+            "models": [],
+            "tables": [],
+            "expectedColumns": {},
+        }
+
+    try:
+        result = builder()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "moduleName": "project_access",
+            "error": f"{type(exc).__name__}: {exc}",
+            "models": [],
+            "tables": [],
+            "expectedColumns": {},
+        }
+
+    if not isinstance(result, Mapping):
+        return {
+            "ok": False,
+            "moduleName": "project_access",
+            "error": "project access contract is not a mapping",
+            "models": [],
+            "tables": [],
+            "expectedColumns": {},
+        }
+
+    normalized = dict(result)
+    normalized.setdefault("ok", True)
+    normalized.setdefault("moduleName", "project_access")
+    return normalized
+
+
+def is_project_access_model_shape_ready() -> bool:
+    """Return whether all access models expose their critical columns."""
+    required_class_names = (
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+    column_map = get_model_column_map()
+
+    for class_name in required_class_names:
+        required_columns = EXPECTED_MODEL_COLUMNS.get(class_name, tuple())
+        available_columns = set(column_map.get(class_name, tuple()))
+        if not required_columns:
+            return False
+        if any(column not in available_columns for column in required_columns):
+            return False
 
     return True
 
@@ -858,6 +1055,14 @@ def validate_model_instances(instances: Iterable[Any]) -> Dict[str, Dict[str, st
             key = getattr(instance, "universe_id", None)
         if key is None:
             key = getattr(instance, "world_id", None)
+        if key is None:
+            key = getattr(instance, "role_id", None)
+        if key is None:
+            key = getattr(instance, "group_id", None)
+        if key is None:
+            key = getattr(instance, "membership_id", None)
+        if key is None:
+            key = getattr(instance, "assignment_id", None)
         if key is None:
             key = getattr(instance, "object_instance_id", None)
         if key is None:
@@ -950,6 +1155,12 @@ def build_model_identity(instance: Any) -> Dict[str, Any]:
         "externalAppProjectId": getattr(instance, "external_app_project_id", None),
         "universeId": getattr(instance, "universe_id", None),
         "worldId": getattr(instance, "world_id", None),
+        "roleId": getattr(instance, "role_id", None),
+        "groupId": getattr(instance, "group_id", None),
+        "membershipId": getattr(instance, "membership_id", None),
+        "assignmentId": getattr(instance, "assignment_id", None),
+        "userId": getattr(instance, "user_id", None),
+        "subjectType": getattr(instance, "subject_type", None),
         "chunkSnapshotId": getattr(instance, "snapshot_id", None),
         "commandId": getattr(instance, "command_id", None),
         "eventId": getattr(instance, "event_id", None),
@@ -965,6 +1176,8 @@ def build_model_schema_report() -> Dict[str, Any]:
         "package": status.to_dict(include_tracebacks=False),
         "ready": status.ready,
         "appIntegrationReady": is_app_integration_model_shape_ready(),
+        "projectAccessShapeReady": is_project_access_model_shape_ready(),
+        "projectAccessContract": get_project_access_model_contract(),
         "coreWorldShapeReady": is_core_world_model_shape_ready(),
         "tableNames": get_model_table_names(),
         "tableMap": get_model_table_map(),
@@ -987,6 +1200,10 @@ _collect_model_classes()
 
 # Public class aliases.
 Project = _MODEL_CLASSES.get("Project")
+ProjectRole = _MODEL_CLASSES.get("ProjectRole")
+ProjectGroup = _MODEL_CLASSES.get("ProjectGroup")
+ProjectGroupMember = _MODEL_CLASSES.get("ProjectGroupMember")
+ProjectRoleAssignment = _MODEL_CLASSES.get("ProjectRoleAssignment")
 Universe = _MODEL_CLASSES.get("Universe")
 WorldInstance = _MODEL_CLASSES.get("WorldInstance")
 BlockRegistry = _MODEL_CLASSES.get("BlockRegistry")
@@ -1009,6 +1226,10 @@ __all__ = [
     "ModelClassRecord",
     "ModelPackageStatus",
     "Project",
+    "ProjectRole",
+    "ProjectGroup",
+    "ProjectGroupMember",
+    "ProjectRoleAssignment",
     "Universe",
     "WorldInstance",
     "BlockRegistry",
@@ -1035,6 +1256,8 @@ __all__ = [
     "get_model_debug_summary",
     "is_model_column_available",
     "is_app_integration_model_shape_ready",
+    "get_project_access_model_contract",
+    "is_project_access_model_shape_ready",
     "is_core_world_model_shape_ready",
     "validate_model_instances",
     "serialize_model_instance",
