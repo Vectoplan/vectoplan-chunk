@@ -3,8 +3,8 @@
 
 ## Status dieser aktualisierten Fassung
 
-Stand: 2026-07-13  
-Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Default-Welt, App-Provisioning, bestätigter Editor-Chunk-Anbindung, betriebsfähiger eingebauter Systemblock-Schicht sowie zusätzlich implementiertem und über `/debug/earth` erfolgreich geprüftem Earth-v1-Kern für globale Referenzpunkte, CRS-Transformation, periodische X-Topologie, lokales Speicherraster, Spawnauflösung und Air-only-Chunkgenerierung.
+Stand: 2026-07-19  
+Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit strikt getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Welt, bestätigter App↔Chunk↔Editor-Grundintegration, betriebsfähiger Systemblock-Schicht, ausführbarem Earth-v1-Kern sowie neuem serviceauthentifiziertem App-Provisionierungs- und Projektzugriffsvertrag mit kanonischen `auth_user_id`-Identitäten, Rollenprojektion, Earth-Standard für App-Projekte, kontrolliertem Flat-Fallback und erfolgreich repariertem Init-/Startup-Pfad.
 
 Diese Aktualisierung **kürzt die bisherige IST-Dokumentation nicht**. Die vollständige bisherige Bestandsaufnahme bleibt weiter unten als historische Basis enthalten. Ergänzt wurden der inzwischen bestätigte Systemblock-Katalog, Air- und Railing-Invarianten, die persistente Registry-Spiegelung, die neuen Blockrouten und die verifizierte Editor-/Admin-Sichtbarkeit.
 
@@ -15,6 +15,24 @@ hinzugekommen sind die neutralen Koordinatenmodule, die Georeferenzierungs-
 und CRS-Schicht, der konkrete Earth-Provider, der persistierbare globale
 Referenzvertrag im World-Modell sowie eine temporäre Debug-Route für den
 vollständigen In-Memory-Smoke-Test.
+
+Die Fortschreibung vom 2026-07-19 ergänzt zusätzlich den neuen App→Chunk-Vertrag:
+
+```text
+App-Projekte
+→ Earth als angefordertes Standard-Template
+→ kontrollierter Flat-Fallback nur für bekannte Earth-Fach-/Vorbedingungsfehler
+→ kanonische auth_user_id als einzige serviceübergreifende Benutzeridentität
+→ Rollen owner/admin/editor/viewer
+→ Viewer strikt read-only
+→ vectoplan-app bleibt Source of Truth für Mitgliedschaften
+→ vectoplan-chunk persistiert und erzwingt die synchronisierte Access-Projektion
+```
+
+Ebenfalls dokumentiert wird die am 2026-07-19 bestätigte Wiederherstellung des
+Chunk-Starts. PostgreSQL und das Schema waren dabei bereits funktionsfähig; der
+eigentliche Fehler lag in der Bootstrap-Orchestrierung und ihrer Readiness-Prüfung
+innerhalb einer noch nicht abgeschlossenen Seed-Transaktion.
 
 Wichtig für die Einordnung:
 
@@ -7714,3 +7732,2454 @@ Providerkonstruktion, Spawnauflösung und Chunkgenerierung.
 
 Er bestätigt noch nicht automatisch eine persistierte produktive Earth-Welt.
 ```
+
+---
+
+## 28. Aktualisierung 2026-07-19 – Serviceauthentifiziertes App-Provisioning und Projektzugriffsprojektion
+
+Dieser Abschnitt erweitert die bisherige Dokumentation, ohne frühere Abschnitte zu
+entfernen, zu verkürzen oder umzudeuten.
+
+Die historische Flat-/PostgreSQL-/Snapshot-/Command-/Systemblock-/Earth-Dokumentation
+bleibt als Entwicklungsverlauf erhalten. Für den aktuellen App-Projektpfad gelten
+zusätzlich die nachfolgenden Verträge.
+
+### 28.1 Aktuell bestätigter Gesamtstand
+
+Bestätigt ist:
+
+```text
+PostgreSQL startet.
+Das vorhandene PostgreSQL-Volume kann wiederverwendet werden.
+Das Chunk-Schema wird erkannt.
+Der explizite Init-/Bootstrap-Pfad läuft wieder durch.
+vectoplan-chunk startet nach der Bootstrap-Reparatur wieder.
+```
+
+Der letzte bestätigte Betriebsbefund stammt aus dem realen Neustart am
+2026-07-19.
+
+Wichtig für die Einordnung:
+
+```text
+Die PostgreSQL-Ausgabe
+"Database directory appears to contain a database; Skipping initialization"
+ist kein Fehler.
+
+Sie bedeutet:
+→ ein bestehendes Datenverzeichnis wurde gefunden
+→ initdb wird nicht erneut ausgeführt
+→ PostgreSQL startet mit dem vorhandenen Datenbestand
+```
+
+Der tatsächliche frühere Startblocker lag oberhalb von PostgreSQL im Chunk-Init-
+und Seed-Pfad.
+
+### 28.2 Neue übergreifende Architekturregel
+
+Der aktuelle Projektvertrag lautet:
+
+```text
+vectoplan-auth
+→ kanonische Benutzeridentität
+
+vectoplan-app
+→ Projekt-Wahrheit
+→ Mitgliedschafts-Wahrheit
+→ Rollen-Wahrheit für App-Projekte
+→ startet Provisionierung
+→ synchronisiert Access-Projektion
+
+vectoplan-chunk
+→ persistiert Chunk-Projektgraph
+→ persistiert synchronisierte Access-Projektion
+→ erzwingt Zugriffsentscheidungen
+→ erzeugt keine eigene konkurrierende Mitgliedschaftswahrheit
+```
+
+Serviceübergreifend darf als Benutzeridentität nur verwendet werden:
+
+```text
+auth_user_id
+```
+
+Nicht erlaubt als serviceübergreifende Identität:
+
+```text
+lokale AppUser.id
+lokale Project.id
+lokale Chunk-DB-Primärschlüssel
+E-Mail-Adresse
+Account-ID
+Client-ID
+user_id ohne klaren kanonischen Auth-Vertrag
+verschachteltes user.id aus lokalem Payload
+numerische Platzhalter wie "1"
+```
+
+### 28.3 Rollenvertrag
+
+Die verbindlichen Projektrollen sind:
+
+```text
+owner
+admin
+editor
+viewer
+```
+
+Rollenbedeutung im Chunk-Service:
+
+```text
+owner
+→ alle Projektaktionen
+→ Access-Verwaltung
+→ Projektverwaltung
+→ dedizierter Owner-Transfer
+
+admin
+→ Projekt- und Access-Verwaltung
+→ kein generischer Owner-Transfer
+
+editor
+→ lesen
+→ Commands
+→ Materialisierung
+→ World-/Chunk-Mutationen
+→ keine Access-Verwaltung
+→ kein Owner-Transfer
+
+viewer
+→ lesen
+→ Projekt/World/Blocks/Chunks/Batch
+→ keine Commands
+→ keine Materialisierung
+→ keine Team-/Access-Verwaltung
+→ keine Projektmutation
+```
+
+Die Viewer-Regel ist strikt:
+
+```text
+viewer = read-only
+```
+
+Es gibt keinen stillen Viewer→Editor-Fallback.
+
+### 28.4 Public-Zugriff
+
+Public-/Unlisted-Zugriff darf nur serverseitig verifiziertes Lesen ermöglichen.
+
+```text
+public verified read
+→ möglich, wenn Route und Projektpolicy dies erlauben
+
+public mutation
+→ immer verboten
+
+client-supplied identity override
+→ immer verboten
+```
+
+Admin-, Owner-, Access- und Projektverwaltungsaktionen werden nie über einen
+öffentlichen Browserkontext freigegeben.
+
+### 28.5 Earth- und Flat-Standard sauber getrennt
+
+Die früher dokumentierte Flat-Default-Welt bleibt für den globalen Dev-/Bootstrap-
+Graphen gültig:
+
+```text
+dev-project
+dev-universe
+world_spawn
+templateId = flat
+providerId = flat
+providerWorldId = flat
+```
+
+Für neue von `vectoplan-app` angeforderte Projekte gilt dagegen:
+
+```text
+angefordertes App-Projekt-Template = earth
+```
+
+Damit existieren zwei bewusst getrennte Defaults:
+
+```text
+Globaler/technischer Bootstrap-Default
+→ Flat
+
+App-Projekt-Provisionierungsdefault
+→ Earth
+```
+
+Diese Trennung verhindert, dass der technische Dev-Seed unbeabsichtigt auf Earth
+umgestellt wird, während App-Projekte bereits georeferenziert provisioniert werden
+können.
+
+### 28.6 Kontrollierter Earth→Flat-Fallback
+
+Ein App-Projekt darf nur auf Flat zurückfallen, wenn alle folgenden Bedingungen
+erfüllt sind:
+
+```text
+1. Earth wurde angefordert.
+2. Fallback ist konfiguriert.
+3. Der Fehlercode gehört zur explizit erlaubten Earth-Fach-/Vorbedingungsliste.
+4. Es existiert noch keine unveränderliche widersprechende World-Instanz.
+```
+
+Typische kontrollierte Fallback-Gründe:
+
+```text
+Earth-Referenz fehlt
+Earth-Referenz unvollständig
+Earth-Referenz ungültig
+Earth-Referenz wird vom aktuellen Providervertrag nicht unterstützt
+```
+
+Kein Flat-Fallback bei:
+
+```text
+Authentifizierungsfehler
+fehlender Service-Principal
+Forbidden
+Timeout
+DNS-Fehler
+Connection refused
+Transportfehler
+Provider-Initialisierungsfehler
+Datenbankfehler
+Service unavailable
+HTTP 5xx
+Programmierfehler
+unerwartete Exception
+```
+
+Diese Regel verhindert, dass Infrastrukturprobleme still als fachlicher Flat-
+Erfolg maskiert werden.
+
+### 28.7 Template-Unveränderlichkeit
+
+Für bestehende World-Instanzen gilt:
+
+```text
+requested template bleibt stabil
+effective template bleibt stabil
+Fallback-Zustand bleibt nachvollziehbar
+```
+
+Ein Retry darf eine bestehende Earth- oder Flat-Welt nicht still umschreiben.
+
+Template-Wechsel benötigen später eine eigene dedizierte World-Migration.
+
+Auch eine Konfiguration wie:
+
+```text
+allow_template_change = true
+```
+
+berechtigt den normalen Provisionierungs-Retry nicht zu einem stillen Wechsel.
+
+### 28.8 Owner-Unveränderlichkeit
+
+Ein bestehender Projekt-Owner darf nicht über normale Provisionierungs- oder
+Assignment-Updates ersetzt werden.
+
+```text
+normal provisioning retry
+→ Owner bleibt unverändert
+
+normal assignment sync
+→ Ownerwechsel abgelehnt
+
+dedizierte transfer-owner Operation
+→ einzig zulässiger Owner-Wechselpfad
+```
+
+Damit wird verhindert, dass ein wiederholter App-Request versehentlich den Owner
+überschreibt.
+
+---
+
+## 29. Neue Service-Authentifizierung
+
+### 29.1 Datei
+
+```text
+services/vectoplan-chunk/src/services/service_auth_service.py
+```
+
+### 29.2 Zweck
+
+Der Service authentifiziert interne Aufrufer, bevor Provisionierungs- oder
+Access-Mutationen ausgeführt werden.
+
+Zugelassene technische Service-Identitäten:
+
+```text
+vectoplan-app
+vectoplan-editor
+vectoplan-chunk-init
+```
+
+Die konkrete Berechtigung hängt zusätzlich von der Operation ab.
+
+### 29.3 Unterstützte Credential-Formen
+
+Unterstützt werden kontrollierte interne Credentials über:
+
+```text
+API-Key
+Authorization: Bearer ...
+X-Vectoplan-Internal-Token
+```
+
+Der Service verwendet konstante Zeitvergleiche:
+
+```text
+hmac.compare_digest
+```
+
+### 29.4 Exemptions
+
+Auth-Ausnahmen gelten nur für exakt konfigurierte Health-/Statuspfade.
+
+Nicht erlaubt:
+
+```text
+Prefix-Bypass
+ähnlich klingender Unterpfad
+Path-Traversal-Variante
+ungeprüfte Wildcard-Ausnahme
+```
+
+### 29.5 Principal-Vertrag
+
+Der authentifizierte Service-Principal ist unveränderlich und enthält unter anderem:
+
+```text
+service_id
+authentication_method
+request_id
+correlation_id
+idempotency_key
+```
+
+Secrets werden nicht im Principalstatus ausgegeben.
+
+### 29.6 Redaction
+
+Diagnostik entfernt rekursiv:
+
+```text
+Authorization
+Bearer-Tokens
+API-Keys
+interne Tokens
+Passwörter
+Credentials
+Cookies
+Sessions
+kanonische User-IDs, wenn private Ausgabe nicht ausdrücklich aktiviert ist
+```
+
+### 29.7 Frameworkintegration
+
+Vorbereitet sind:
+
+```text
+Flask-Decorator
+Before-request-Hook
+idempotente globale Hook-Registrierung
+request-lokaler Principal-Kontext
+```
+
+Der Service führt selbst keine Datenbank- oder Netzwerkoperation aus.
+
+---
+
+## 30. Neuer Projekt-Provisionierungsservice
+
+### 30.1 Datei
+
+```text
+services/vectoplan-chunk/src/services/project_provisioning_service.py
+```
+
+### 30.2 Rolle
+
+Der Service bildet eine App-Projekt-ID idempotent auf einen vollständigen
+Chunk-Projektgraphen ab:
+
+```text
+App Project Public ID
+→ Chunk Project
+→ Universe
+→ konkrete WorldInstance
+→ BlockRegistry-Referenz
+→ optionale Access-Initialisierung
+```
+
+### 30.3 Deterministische Ressourcenidentitäten
+
+Verwendete Präfixe:
+
+```text
+Chunk Project = chk_prj_
+Universe      = chk_uni_
+World         = chk_wld_
+```
+
+Die konkrete Ressourcen-ID wird deterministisch aus dem App-Projektbezug und dem
+Provisionierungsvertrag abgeleitet.
+
+Dadurch gilt:
+
+```text
+gleicher fachlicher Request
+→ gleiche Ressourcenidentitäten
+→ idempotentes Ergebnis
+```
+
+### 30.4 Request-Fingerprint
+
+Der deterministische Fingerprint umfasst unter anderem:
+
+```text
+App-Projekt-ID
+Projektname
+Owner-Fingerprint
+angefordertes Template
+Earth-Referenz-Fingerprint oder normalisierten Referenzfehler
+sanitisierte Metadaten
+```
+
+Nicht in den Fingerprint gelangen rohe Secrets oder ungebundene lokale IDs.
+
+### 30.5 Provisionierungsstatus
+
+Mögliche Zustände umfassen:
+
+```text
+pending
+provisioning
+ready
+failed
+repair_required
+```
+
+Access besitzt einen getrennten Status:
+
+```text
+pending
+ready
+failed
+repair_required
+```
+
+Damit kann der Projektgraph bereits vorhanden sein, obwohl die Access-Projektion
+noch repariert werden muss.
+
+### 30.6 Atomarer lokaler Ressourcenpfad
+
+Innerhalb der Chunk-Datenbank werden gemeinsam behandelt:
+
+```text
+Project
+Universe
+WorldInstance
+BlockRegistry-Referenz
+Provisionierungsstatus
+```
+
+Bei einem lokalen Fehler wird die Transaktion zurückgerollt.
+
+Es gibt keine verteilte Transaktion mit `vectoplan-app`.
+
+### 30.7 Commit-Regel
+
+```text
+commit = true
+→ Repository darf äußeren Commit ausführen
+
+commit = false
+→ nur Flush/Savepoint
+→ äußerer Aufrufer besitzt Commit-/Rollback-Verantwortung
+```
+
+### 30.8 Teilzustandsreparatur
+
+Ein vorhandenes teilweise provisioniertes Projekt kann repariert werden:
+
+```text
+Project vorhanden, Universe fehlt
+→ Universe ergänzen
+
+Project + Universe vorhanden, World fehlt
+→ World ergänzen
+
+Ressourcen vorhanden, Access pending
+→ Access später initialisieren
+```
+
+### 30.9 Access-Integration
+
+Der Provisionierungsservice kann den Projektzugriffsservice aufrufen.
+
+```text
+Access-Initializer vorhanden und erfolgreich
+→ access ready
+
+kein Access-Initializer
+→ access pending
+
+Access-Initializer schlägt fehl
+→ Projektressourcen bleiben erhalten
+→ Access wird repair_required
+```
+
+Die Ressourcen werden nicht wegen eines nachgelagerten Access-Fehlers gelöscht.
+
+### 30.10 Preview
+
+Der Preview-Pfad ist rein lesend beziehungsweise berechnend:
+
+```text
+keine DB-Mutation
+keine Netzwerkoperation
+keine Schemaänderung
+```
+
+Er liefert deterministische Ziel-IDs und die geplante Earth-/Flat-Entscheidung.
+
+### 30.11 Persistence Adapter
+
+Vorhanden sind:
+
+```text
+ProjectProvisioningRepository
+InMemoryProjectProvisioningRepository
+SQLAlchemyProjectProvisioningRepository
+```
+
+Der SQLAlchemy-Adapter importiert SQLAlchemy nicht hart, sondern arbeitet adaptiv
+mit übergebenen Modellen und Sessions.
+
+### 30.12 Concurrency
+
+Verwendet werden:
+
+```text
+per-App-Projekt Locks
+TTL/LRU-Success-Cache
+idempotente Datenbankprüfung
+```
+
+Mehrere parallele identische Aufrufe erzeugen dadurch genau einen lokalen
+Ressourcengraphen.
+
+---
+
+## 31. Neuer Projektzugriffsservice
+
+### 31.1 Datei
+
+```text
+services/vectoplan-chunk/src/services/project_access_service.py
+```
+
+### 31.2 Rolle
+
+Der Service verwaltet nicht die fachliche Mitgliedschaftswahrheit, sondern die von
+`vectoplan-app` gelieferte, durchsetzbare Projektion.
+
+```text
+vectoplan-app membership state
+→ normalisierte AccessProjection
+→ diff
+→ lokale Chunk-Assignments
+→ verifizierter Access-Status
+```
+
+### 31.3 Identitätsregel
+
+Direkte Assignments verwenden ausschließlich:
+
+```text
+auth_user_id
+```
+
+Explizit abgelehnt werden:
+
+```text
+numerische IDs
+E-Mail-Adressen
+user_id
+app_user_id
+account_id
+client_id
+owner_id als lokale Zahl
+nested user.id
+mehrdeutige lokale Identity-Payloads
+```
+
+### 31.4 Assignment-Typen
+
+Unterstützt werden:
+
+```text
+direct
+→ kanonischer Auth-User
+
+group
+→ bestehende Gruppenidentität
+```
+
+Genau ein Subject muss gesetzt sein:
+
+```text
+direct → auth_user_id gesetzt, group_id leer
+group  → group_id gesetzt, auth_user_id leer
+```
+
+### 31.5 Owner-Invariante
+
+Eine gültige Projektion benötigt:
+
+```text
+genau einen Owner
+Owner muss direct sein
+Owner muss aktiv sein
+Owner muss kanonische auth_user_id besitzen
+```
+
+Gruppen können keine Owner sein.
+
+### 31.6 Synchronisierungsverhalten
+
+Bei einer App-Reconciliation gilt:
+
+```text
+stale direkte managed Assignments
+→ entfernen/deaktivieren
+
+aktuelle direkte Assignments
+→ erstellen/aktualisieren/reaktivieren
+
+bestehende Gruppenassignments
+→ bewahren
+```
+
+Damit überschreibt die App-Synchronisierung keine unabhängig gepflegten Gruppen.
+
+### 31.7 Fingerprints
+
+Projektionsfingerprints sind deterministisch.
+
+Sie dienen für:
+
+```text
+Idempotenz
+Drifterkennung
+Statusvergleich
+Reconciliation
+Repair
+```
+
+### 31.8 Service-Principal-Matrix
+
+Mutationen dürfen nur durch:
+
+```text
+vectoplan-app
+vectoplan-chunk-init
+```
+
+ausgeführt werden.
+
+Zugriffsentscheidungen dürfen zusätzlich durch:
+
+```text
+vectoplan-editor
+```
+
+angefragt werden.
+
+Ein Browserclient kann sich nicht selbst als interner Service ausgeben.
+
+### 31.9 Access-Operationen
+
+Der Service unterscheidet unter anderem:
+
+```text
+read_project
+read_world
+read_blocks
+read_chunks
+read_batch
+command
+materialize
+mutate_world
+mutate_chunk
+manage_access
+manage_project
+transfer_owner
+```
+
+Viewer erhält nur die Leseoperationen.
+
+### 31.10 Public-Entscheidungen
+
+```text
+server_verified_public_read = erlaubt, wenn Policy erfüllt
+public_mutation = immer denied
+```
+
+### 31.11 Repository-Schicht
+
+Vorhanden sind:
+
+```text
+ProjectAccessRepository
+InMemoryProjectAccessRepository
+SQLAlchemyProjectAccessRepository
+```
+
+Der adaptive SQLAlchemy-Adapter unterstützt mehrere Feldalias-Namen, damit die neue
+Modellschicht und bestehende Kompatibilitätsmodelle gemeinsam genutzt werden können.
+
+### 31.12 Transaktionsschutz
+
+Ein injizierter Fehler während einer Synchronisierung führt zu:
+
+```text
+Rollback aller Assignment-Mutationen
+kein teilweiser Ownerwechsel
+kein halbfertiger Projection-Fingerprint
+Repair-/Failure-Status wird bestmöglich dokumentiert
+```
+
+### 31.13 Idempotenz und Parallelität
+
+Verwendet werden:
+
+```text
+per-project Locks
+TTL/LRU-Success-Cache
+Projection-Fingerprint
+Repositorystatus
+```
+
+Parallel identische Synchronisierungen bleiben konsistent.
+
+---
+
+## 32. Erweitertes Projektmodell
+
+### 32.1 Datei
+
+```text
+services/vectoplan-chunk/models/project.py
+```
+
+### 32.2 Schema
+
+Aktueller Modellvertrag:
+
+```text
+project.schema.v3
+```
+
+### 32.3 Kanonische Identitätsfelder
+
+Neu beziehungsweise zentral:
+
+```text
+owner_auth_user_id
+created_by_auth_user_id
+updated_by_auth_user_id
+```
+
+Legacy-Kompatibilitätsfelder bleiben vorhanden, führen aber denselben kanonischen
+Auth-Wert:
+
+```text
+owner_id
+created_by_user_id
+updated_by_user_id
+```
+
+Sie dürfen nicht wieder mit lokalen numerischen IDs befüllt werden.
+
+### 32.4 Entfernung des alten Default-Owners
+
+Nicht mehr zulässig:
+
+```text
+owner = "1"
+```
+
+Expliziter Dev-Bootstrap-Owner:
+
+```text
+auth_dev_owner
+```
+
+### 32.5 Identitätsvalidierung
+
+Abgelehnt werden unter anderem:
+
+```text
+leere Identität
+rein numerische Identität
+E-Mail-Adresse
+anonymous
+guest
+URL
+Whitespace-/Control-Character-Identität
+```
+
+### 32.6 World-Template-Felder
+
+Neu beziehungsweise gehärtet:
+
+```text
+world_template_requested
+world_template_effective
+world_fallback_used
+world_fallback_code
+earth_reference_fingerprint
+world_metadata_json
+```
+
+### 32.7 Provisionierungsfelder
+
+```text
+provisioning_status
+provisioning_fingerprint
+provisioning_request_id
+provisioning_correlation_id
+provisioning_error_code
+provisioning_error_message
+provisioning_retry_required
+provisioning_repair_required
+provisioning_attempt_count
+provisioning_started_at
+provisioning_completed_at
+provisioning_updated_at
+```
+
+### 32.8 Access-Sync-Felder
+
+```text
+access_sync_status
+access_projection_version
+access_projection_fingerprint
+access_request_id
+access_correlation_id
+access_error_code
+access_error_message
+access_retry_required
+access_repair_required
+access_attempt_count
+access_started_at
+access_completed_at
+access_updated_at
+```
+
+### 32.9 Retry-Verhalten
+
+Ein erfolgreicher späterer Lauf entfernt alte Fehlerzustände automatisch:
+
+```text
+error_code → leer
+error_message → leer
+retry_required → false
+repair_required → false
+```
+
+### 32.10 Template- und Owner-Schutz im Patch
+
+Normale generische Projekt-Patches dürfen nicht verändern:
+
+```text
+Owner
+App-Projektlink
+World-Referenzen
+Provisionierungsstatus
+Access-Sync-Status
+interne Fingerprints
+interne Request-/Correlation-IDs
+```
+
+Solche Felder benötigen ausdrücklich interne Servicepfade.
+
+### 32.11 Öffentliche Serialisierung
+
+Public-Ausgabe enthält keine rohen Auth-IDs.
+
+Stattdessen werden verwendet:
+
+```text
+gekürzte Fingerprints
+nicht-sensitive Statuswerte
+öffentliche Ressourcenidentitäten
+```
+
+Private Service-Serialisierung muss ausdrücklich aktiviert werden.
+
+### 32.12 Metadaten-Sanitizer
+
+Entfernt oder begrenzt werden:
+
+```text
+Credentials
+Tokens
+E-Mail-Adressen
+interne URLs
+lokale User-/Account-IDs
+Bulk-Geometrien
+Chunk-Rohdaten
+Block-Rohdaten
+World-State-Rohpayloads
+Snapshots
+```
+
+### 32.13 Model-Grenzen
+
+Das Modell führt nicht aus:
+
+```text
+keine Queries
+keine Commits
+keine Remote Calls
+keine Service-Authentifizierung
+```
+
+Die Model-Listener normalisieren und validieren nur vor Insert/Update.
+
+---
+
+## 33. Neues Modell `ProjectAccessAssignment`
+
+### 33.1 Datei
+
+```text
+services/vectoplan-chunk/models/project_access_assignment.py
+```
+
+### 33.2 Tabelle
+
+```text
+project_access_assignments
+```
+
+### 33.3 Zentrale Felder
+
+```text
+id
+assignment_id
+chunk_project_id
+auth_user_id
+group_id
+role
+assignment_type
+active
+managed
+source_service
+projection_version
+revision
+metadata_json
+created_at
+updated_at
+deactivated_at
+```
+
+### 33.4 Subject-Invariante
+
+```text
+direct
+→ auth_user_id vorhanden
+→ group_id leer
+
+group
+→ group_id vorhanden
+→ auth_user_id leer
+```
+
+### 33.5 Rollenvalidierung
+
+Nur erlaubt:
+
+```text
+owner
+admin
+editor
+viewer
+```
+
+Owner ist nur für direkte Assignments zulässig.
+
+### 33.6 Eindeutigkeit
+
+Datenbankseitig beziehungsweise modellseitig abgesichert:
+
+```text
+ein direct Assignment pro Projekt + auth_user_id
+ein group Assignment pro Projekt + group_id
+gültiger Assignment-Typ
+gültige Rolle
+positive Revision
+Subject-XOR
+```
+
+### 33.7 Keine partielle Owner-Unique-Constraint
+
+Bewusst nicht verwendet wurde eine partielle Unique-Constraint auf den aktiven
+Owner.
+
+Grund:
+
+```text
+SQLAlchemy-Autoflush kann beim Owner-Transfer den neuen Owner schreiben,
+bevor der alte Owner herabgestuft wurde.
+```
+
+Eine solche Constraint könnte damit eine fachlich gültige atomare Transaktion
+blockieren.
+
+Die Invariante „genau ein Owner“ bleibt transaktional im
+`project_access_service.py` erzwungen.
+
+### 33.8 Querybare SQLAlchemy-Aliase
+
+Der adaptive Repository-Adapter kann unter anderem verwenden:
+
+```text
+public_id
+project_id
+project_public_id
+subject_auth_user_id
+principal_id
+subject_id
+project_role
+access_role
+subject_type
+principal_type
+is_active
+enabled
+is_managed
+direct_managed
+managed_by
+source
+subject_group_id
+details
+payload
+```
+
+### 33.9 Öffentliche Serialisierung
+
+Public-Ausgabe enthält:
+
+```text
+Subject-Fingerprint
+Rolle
+Typ
+Status
+nicht-sensitive Projektionsmetadaten
+```
+
+Rohe `auth_user_id` oder `group_id` werden nur in expliziter interner Ausgabe
+verwendet.
+
+### 33.10 Modellhelfer
+
+Vorbereitet beziehungsweise vorhanden:
+
+```text
+create_direct
+create_group
+from_projection_assignment
+apply_role
+deactivate
+reactivate
+to_dict / public-private serialization
+```
+
+Ein Ownerwechsel benötigt ein ausdrückliches internes Flag beziehungsweise den
+dedizierten Servicepfad.
+
+---
+
+## 34. Aktualisierte Modellregistrierung
+
+### 34.1 Datei
+
+```text
+services/vectoplan-chunk/models/__init__.py
+```
+
+### 34.2 Neue Registrierung
+
+Registriert werden zusätzlich:
+
+```text
+ProjectAccessAssignment
+project_access_assignments
+```
+
+### 34.3 Aktueller erkannter Modellgraph
+
+Der geprüfte Modellgraph umfasst 15 Modelltabellen:
+
+```text
+projects
+project_access_assignments
+project_roles
+project_groups
+project_group_members
+project_role_assignments
+universes
+world_instances
+block_registries
+block_types
+chunk_snapshots
+world_command_logs
+chunk_events
+world_object_instances
+world_object_chunk_refs
+```
+
+### 34.4 Getrennte Readiness
+
+Neu unterschieden werden:
+
+```text
+kanonische Access-Projektionsmodelle
+Legacy-Rollen-/Gruppenmodelle
+gemeinsamer vollständiger Access-Modellvertrag
+```
+
+Öffentliche Helfer umfassen sinngemäß:
+
+```text
+get_project_access_projection_contract
+get_legacy_project_access_model_contract
+get_project_access_model_contract
+is_project_access_projection_model_shape_ready
+is_legacy_project_access_model_shape_ready
+is_project_access_model_shape_ready
+```
+
+### 34.5 Diagnostik
+
+Modellidentitäten werden standardmäßig nur als Fingerprints ausgegeben.
+
+Lokale DB-Primärschlüssel oder rohe User-/Gruppen-IDs erscheinen nur in explizit
+interner Diagnostik.
+
+---
+
+## 35. Aktualisierte Chunk-Konfiguration
+
+### 35.1 Datei
+
+```text
+services/vectoplan-chunk/config.py
+```
+
+### 35.2 Trennung der Mutationsarten
+
+Die Konfiguration unterscheidet jetzt ausdrücklich:
+
+```text
+Schema-Mutationen
+→ create table
+→ add/repair columns
+→ Migration/Bootstrap
+
+Business-Mutationen
+→ Projekte provisionieren
+→ Access-Projektion synchronisieren
+→ Commands ausführen
+→ Chunks materialisieren
+```
+
+Produktionsruntime darf:
+
+```text
+Schema read-only
+Business-Mutationen nur authentifiziert und autorisiert
+```
+
+Die frühere Gleichsetzung
+
+```text
+schema read-only = vollständig schreibgeschützt
+```
+
+ist damit aufgehoben.
+
+### 35.3 Service-Auth-Konfiguration
+
+Konfiguriert werden:
+
+```text
+zugelassene Service-IDs
+API-Key-/Tokenquelle
+Header-/Bearer-Unterstützung
+exakte Auth-Ausnahmepfade
+sichere Statusfingerprints
+```
+
+### 35.4 Projekt-Provisionierung
+
+Konfiguriert werden:
+
+```text
+App-Projekt-Default = earth
+globaler Bootstrap-Default = flat
+kontrollierte Earth-Fallback-Codes
+Ressourcen-ID-Präfixe
+Idempotenz
+```
+
+### 35.5 Access Control
+
+Konfiguriert werden:
+
+```text
+enabled
+default deny
+canonical identities
+owner/admin/editor/viewer
+viewer read-only
+preserve group assignments
+prune stale direct assignments
+verify after sync
+public mutations disabled
+client identity override disabled
+```
+
+### 35.6 Produktionsvalidierung
+
+Unsichere Konfigurationen werden abgelehnt, zum Beispiel:
+
+```text
+Service-Auth deaktiviert
+Access-Control default allow
+Viewer nicht read-only
+unbekannte Rollen
+unsichere Public-Mutationen
+Client-Identity-Override
+stiller bestehender Templatewechsel
+```
+
+---
+
+## 36. Compose- und Servicevertrag
+
+### 36.1 Datei
+
+```text
+services/vectoplan-server/docker-compose.all.yml
+```
+
+### 36.2 Init versus Runtime
+
+Der Vertrag ist jetzt ausdrücklich:
+
+```text
+vectoplan-chunk-init
+→ Schema
+→ Bootstrap
+→ Repair
+→ Seed
+→ Access-Initialisierung
+
+vectoplan-chunk Runtime
+→ keine Schemaänderung
+→ authentifizierte Business-Reads/-Mutationen
+→ read-only Startup-/Readiness-Prüfung
+```
+
+### 36.3 App-Verfügbarkeit
+
+`vectoplan-app` hängt nicht mehr von einem als healthy markierten Chunk-Service ab,
+sondern kann bereits bei gestartetem Chunk-Container verfügbar bleiben.
+
+Grund:
+
+```text
+Chunk-Ausfall darf die gesamte Portal-App nicht unnötig am Containerstart hindern.
+Die App muss Chunk-Provisionierungsfehler kontrolliert als Pending/Failed führen.
+```
+
+### 36.4 Interne Servicekommunikation
+
+Vorbereitet beziehungsweise konfiguriert:
+
+```text
+vectoplan-app → vectoplan-chunk
+vectoplan-editor → vectoplan-chunk
+vectoplan-chunk-init → vectoplan-chunk-interne Services
+```
+
+### 36.5 Host-Gateway
+
+Für lokale getrennte Stacks wurde ergänzt:
+
+```text
+host.docker.internal:host-gateway
+```
+
+unter anderem für:
+
+```text
+app
+chunk
+chunk-init
+editor
+reconcile
+```
+
+### 36.6 Reconciliation-Service
+
+Ein Maintenance-Profil stellt einen App-seitigen Chunk-Reconciliation-Lauf bereit.
+
+Sicherer Default:
+
+```text
+--dry-run
+--json-lines
+```
+
+Er startet nicht automatisch als normaler Runtime-Service.
+
+---
+
+## 37. Bootstrap- und Startup-Reparatur vom 2026-07-19
+
+### 37.1 Sichtbares Fehlerbild
+
+Der Chunk-Service startete nach einer Neuinstallation beziehungsweise einem
+Bootstrap-Lauf zunächst nicht mehr.
+
+Die sichtbaren PostgreSQL-Zeilen lauteten sinngemäß:
+
+```text
+PostgreSQL Database directory appears to contain a database;
+Skipping initialization
+
+database system is ready to accept connections
+```
+
+Diese Zeilen waren korrekt und nicht die Ursache.
+
+### 37.2 Bestätigter Schema-Zustand
+
+Der Diagnosezustand zeigte:
+
+```text
+schemaReady = true
+15 erforderliche Tabellen erkannt
+Schema-Bootstrap erfolgreich
+PostgreSQL erreichbar
+```
+
+Damit waren ausgeschlossen:
+
+```text
+PostgreSQL-Portfehler
+fehlendes Datenverzeichnis
+vollständig fehlendes Schema
+allgemeiner SQLAlchemy-Importfehler
+```
+
+### 37.3 Tatsächlicher Fehler
+
+Der Init-Pfad meldete:
+
+```text
+run_default_seed is unavailable
+```
+
+und wechselte in den direkten Fallback.
+
+Dieser Fallback erzeugte bereits innerhalb der Transaktion:
+
+```text
+BlockRegistry
+debug/system blocks
+Project dev-project
+Owner auth_dev_owner
+```
+
+Danach brach er ab mit:
+
+```text
+Project access is not ready after canonical and legacy initialization.
+```
+
+Die Transaktion wurde zurückgerollt.
+
+Folge:
+
+```text
+Project nach dem Lauf wieder nicht vorhanden
+Universe nicht vorhanden
+World nicht vorhanden
+Access leer
+Seed nicht ready
+Runtime-Preflight blockiert Gunicorn
+```
+
+### 37.4 Ursache 1 – alter Owner-Vertrag
+
+Frühere Bootstrapteile erwarteten noch:
+
+```text
+owner = "1"
+```
+
+Das neue Projektmodell verwendete korrekt:
+
+```text
+owner = auth_dev_owner
+```
+
+Dieser geteilte Vertrag führte zu:
+
+```text
+Ownervergleich false
+Legacy-Owner-Zuweisung fehlt
+Access-Readiness false
+```
+
+### 37.5 Ursache 2 – Default-Seed-Import als Alles-oder-nichts
+
+Der bevorzugte Bootstrap importierte mehrere `default_seed.py`-Exporte gemeinsam.
+
+Fehlte ein optionaler oder umbenannter Export, wurden auch vorhandene Funktionen
+als nicht verfügbar behandelt.
+
+Beispiel:
+
+```text
+build_default_seed_status fehlt oder Importpfad weicht ab
+→ run_default_seed wird ebenfalls als unavailable behandelt
+```
+
+### 37.6 Ursache 3 – Readiness innerhalb einer uncommitted Transaktion
+
+Die Access-Zeilen wurden in derselben SQLAlchemy-Session erzeugt und geflusht.
+
+Die anschließende Readiness verwendete jedoch einen getrennten oder optionalen
+Statusadapter.
+
+Dieser sah die gerade erzeugten, noch nicht committed Datensätze nicht zuverlässig
+beziehungsweise meldete bei fehlendem Adapter pauschal `not ready`.
+
+Resultat:
+
+```text
+Daten vorhanden in laufender Session
+Statusadapter meldet leer/not ready
+Bootstrap wirft RuntimeError
+äußerer Rollback entfernt alle Seed-Daten
+```
+
+### 37.7 Ursache 4 – Legacy-Adapter nur teilweise verfügbar
+
+Der vorhandene Kompatibilitätspfad unter `src.project_access` konnte fehlen oder nur
+einen Teil der Rollen-/Assignment-Struktur initialisieren.
+
+Der bevorzugte Bootstrap verließ sich zunächst zu stark auf diesen Adapter.
+
+---
+
+## 38. Reparatur in `src/bootstrap/settings.py`
+
+### 38.1 Kanonischer Default-Owner
+
+```text
+DEFAULT_PROJECT_OWNER_AUTH_USER_ID = auth_dev_owner
+```
+
+Der Kompatibilitätsname `DEFAULT_PROJECT_OWNER_USER_ID` verweist auf denselben
+kanonischen Wert.
+
+### 38.2 Alias-Normalisierung
+
+Mehrere alte Owner-ENV-/Config-Namen werden weiter gelesen.
+
+Numerische Werte werden normalisiert:
+
+```text
+"1" → auth_dev_owner
+"42" → auth_dev_owner
+```
+
+Ein individueller kanonischer Auth-Owner bleibt erhalten.
+
+### 38.3 Seed-Setting
+
+Neu beziehungsweise ausdrücklich modelliert:
+
+```text
+seed_project_access
+```
+
+Regel:
+
+```text
+seed_dev_project = true
+→ seed_project_access muss effektiv true sein
+```
+
+Ein Dev-Projekt ohne Owner-/Rollenprojektion gilt nicht als vollständiger Seed.
+
+### 38.4 Runtime-Grenze
+
+Trotz neuer Access-Settings bleibt:
+
+```text
+Runtime DB mutations = false
+Runtime create_all = false
+Runtime seed = false
+```
+
+---
+
+## 39. Reparatur in `src/bootstrap/default_seed.py`
+
+### 39.1 Zielgraph
+
+Der Seed beschreibt jetzt explizit:
+
+```text
+Project(dev-project, owner=auth_dev_owner)
+→ Rollen owner/admin/editor/viewer
+→ Owner-Zuweisung
+→ Universe(dev-universe)
+→ WorldInstance(world_spawn)
+```
+
+### 39.2 Owner-Reparatur
+
+```text
+lokaler numerischer Owner
+→ auth_dev_owner
+
+bestehender anderer kanonischer Owner
+→ bleibt erhalten
+```
+
+### 39.3 Access-Pflicht
+
+Jeder Dev-Projekt-Seed aktiviert die Access-Initialisierung.
+
+### 39.4 Debug-Blöcke
+
+Debug-Blöcke sind nur dann Readiness-Pflicht, wenn ihr Seed aktiviert ist.
+
+Weiterhin zwingend:
+
+```text
+BlockRegistry
+Air-Invariante
+system_railing
+Project
+Project Access
+Universe
+World
+```
+
+### 39.5 Aktuelle Kompatibilitätseinordnung
+
+Der aktuell eingesetzte `default_seed.py` besitzt weiterhin einen Legacy-
+Projektaccess-Adapter unter:
+
+```text
+src.project_access
+project_access
+```
+
+Der finale `db_bootstrap.py` enthält deshalb zusätzlich einen direkten kanonischen
+und Legacy-ORM-Fallback.
+
+Damit bleibt der Start nicht von der vollständigen Verfügbarkeit dieses älteren
+Packages abhängig.
+
+---
+
+## 40. Reparatur in `scripts/bootstrap_db.py`
+
+### 40.1 Datei
+
+```text
+services/vectoplan-chunk/scripts/bootstrap_db.py
+```
+
+### 40.2 Owner-Weitergabe
+
+Der direkte Fallback übergibt den Owner ausdrücklich an die Projektfactory.
+
+Nicht mehr als Benutzeridentität verwendet:
+
+```text
+bootstrap
+```
+
+`bootstrap` darf weiterhin als technischer Actor-/Metadatenhinweis vorkommen, aber
+nicht als kanonischer Projekt-Owner.
+
+### 40.3 Direkter Access-Fallback
+
+Das Script kann innerhalb derselben Bootstrap-Transaktion sicherstellen:
+
+```text
+project_access_assignments
+project_roles
+project_role_assignments
+project_groups
+project_group_members
+```
+
+### 40.4 Rollen
+
+Idempotent sichergestellt werden:
+
+```text
+owner
+admin
+editor
+viewer
+```
+
+### 40.5 Owner-Regel
+
+```text
+genau ein aktiver Owner
+weitere Owner → admin
+Gruppen bleiben erhalten
+```
+
+### 40.6 Check-only
+
+```text
+--check-only
+→ keine Access-Mutation
+→ Access bleibt dennoch Readiness-Anforderung
+```
+
+Damit kann Check-only einen unvollständigen Access-Zustand erkennen, ohne ihn zu
+reparieren.
+
+---
+
+## 41. Finale Reparatur in `src/bootstrap/db_bootstrap.py`
+
+### 41.1 Datei
+
+```text
+services/vectoplan-chunk/src/bootstrap/db_bootstrap.py
+```
+
+### 41.2 Aktueller Ergebnisvertrag
+
+```text
+db-bootstrap-result.v5
+```
+
+### 41.3 Lazy Einzel-Export-Auflösung
+
+`default_seed.py` wird nicht mehr als unteilbarer API-Block behandelt.
+
+Jeder Export wird separat aufgelöst:
+
+```text
+run_default_seed
+build_default_seed_status
+build_default_seed_summary
+weitere optionale Helfer
+```
+
+Unterstützte Importpfade:
+
+```text
+.default_seed
+src.bootstrap.default_seed
+bootstrap.default_seed
+```
+
+Ein fehlender Statushelfer deaktiviert nicht mehr den vorhandenen Seed-Runner.
+
+### 41.4 Direkte Session-Readiness
+
+Nach der Initialisierung werden Project- und Access-Zeilen direkt in derselben
+SQLAlchemy-Session geprüft.
+
+Statusquelle:
+
+```text
+current_session_direct_query
+```
+
+Dadurch gilt jetzt korrekt:
+
+```text
+flushte, noch nicht committed Zeilen
+→ sind für die Bootstrap-Readiness sichtbar
+```
+
+### 41.5 Direkte Legacy-Reparatur
+
+Wenn das alte Projektaccess-Package fehlt oder unvollständig arbeitet, erzeugt der
+Orchestrator direkt:
+
+```text
+vier Standardrollen
+eine aktive Legacy-Owner-Zuweisung
+kanonische direkte Owner-Projektion
+```
+
+### 41.6 Gruppenbehandlung
+
+```text
+bestehende Gruppenassignments bleiben erhalten
+keine Gruppe wird Owner
+keine Gruppe wird in ein Direct Assignment umgewandelt
+```
+
+### 41.7 Fail-closed bleibt erhalten
+
+Die Reparatur macht einen fehlenden Adapter nicht mehr automatisch fatal.
+
+Tatsächlich unvollständige Daten bleiben jedoch blockierend:
+
+```text
+kein Owner
+mehrere Owner
+fehlende Standardrollen
+fehlende direkte Owner-Projektion
+ungültige lokale User-ID
+```
+
+### 41.8 Transaktionsgrenze
+
+Alle Schritte bleiben Teil der äußeren Bootstrap-Transaktion:
+
+```text
+Registry
+Systemblöcke
+Project
+Access
+Universe
+World
+```
+
+Erst wenn der vollständige Status bereit ist, wird committed.
+
+---
+
+## 42. Aktualisierte Runtime-Startup-Prüfung
+
+### 42.1 Datei
+
+```text
+services/vectoplan-chunk/src/bootstrap/startup.py
+```
+
+### 42.2 Verträge
+
+```text
+startup-state.v3
+runtime-startup.v3
+```
+
+### 42.3 Verhalten
+
+Der Startup-Pfad bleibt strikt read-only.
+
+Er führt nicht aus:
+
+```text
+kein create_all
+kein commit
+kein seed
+kein repair
+kein run_db_bootstrap
+```
+
+### 42.4 Zusammengeführte Readiness
+
+Der Runtime-Start kombiniert:
+
+```text
+Runtime-Datei-/Route-/Modelchecks
+DB-Bootstrap-Readiness
+Owner-Readiness
+kanonische Access-Readiness
+Legacy-Access-Readiness
+Systemblock-Readiness
+World-Readiness
+```
+
+### 42.5 Owner-Diagnostik
+
+Standardmäßig wird nur ausgegeben:
+
+```text
+ownerIdFingerprint
+```
+
+Rohe Owner-ID nur bei explizitem privaten Diagnose-Opt-in.
+
+### 42.6 Routenvertrag
+
+Erkannt werden:
+
+```text
+Legacy-Assignment-Route
+kanonische Access-Assignment-Route
+Flask-Konverter wie <string:project_id>
+konfigurierte API-Präfixe
+```
+
+Eine dedizierte Owner-Transfer-Route kann separat als verpflichtend aktiviert
+werden.
+
+---
+
+## 43. Aktualisierte Runtime-Checks
+
+### 43.1 Datei
+
+```text
+services/vectoplan-chunk/src/bootstrap/runtime_checks.py
+```
+
+### 43.2 Ergebnisvertrag
+
+```text
+runtime-checks-result.v3
+```
+
+### 43.3 Default-Owner
+
+```text
+auth_dev_owner
+```
+
+Nicht mehr:
+
+```text
+"1"
+```
+
+### 43.4 Access-Prüfung
+
+Runtime prüft read-only:
+
+```text
+Project.owner_auth_user_id
+Project.access_sync_status
+ProjectAccessAssignment
+ProjectRole
+ProjectRoleAssignment
+```
+
+Erforderlich:
+
+```text
+kanonischer Owner
+genau eine aktive direkte Owner-Projektion
+vier Legacy-Standardrollen
+genau eine passende Legacy-Owner-Zuweisung
+vectoplan-app als Source of Truth
+Viewer read-only
+default deny
+keine Public-Mutationen
+keine Client-Identity-Overrides
+```
+
+### 43.5 Skalierungsfix
+
+Viele Editor-/Viewer-Zuweisungen blockieren die Owner-Readiness nicht.
+
+Die Eindeutigkeitsabfrage lädt nur direkte Owner-Zeilen.
+
+Gruppen- und normale Member-Assignments werden nicht unnötig geladen.
+
+### 43.6 Read-only-Vertrag
+
+Nicht vorhanden:
+
+```text
+session.add
+session.delete
+flush
+commit
+create_all
+seed
+repair
+```
+
+---
+
+## 44. Bestätigte Wiederherstellung des Starts
+
+### 44.1 Bestätigtes Ergebnis
+
+Nach Übernahme der Bootstrap-Orchestrierungsreparatur wurde vom realen System
+bestätigt:
+
+```text
+vectoplan-chunk startet wieder
+```
+
+### 44.2 Bedeutung
+
+Damit ist der konkrete Blocker behoben:
+
+```text
+uncommitted Access-Zeilen wurden fälschlich als nicht vorhanden bewertet
+→ korrigiert
+
+partieller default_seed-Import deaktivierte vorhandene Exporte
+→ korrigiert
+
+fehlender/inkompletter Legacy-Adapter blockierte den gesamten Seed
+→ direkter idempotenter Fallback ergänzt
+```
+
+### 44.3 Was damit bestätigt ist
+
+```text
+PostgreSQL erreichbar
+Init-/Bootstrap-Pfad kann abschließen
+Seed-Transaktion wird nicht mehr wegen falscher Access-Readiness zurückgerollt
+Runtime-Container kann anschließend starten
+```
+
+### 44.4 Was nach dem letzten Fix noch separat zu testen ist
+
+Nicht allein durch die Startbestätigung nachgewiesen:
+
+```text
+jede einzelne Statusroute nach dem finalen Fix
+alle App-Provisionierungsrouten mit Service-Auth
+Access-Sync über reale vectoplan-app Membership-Änderung
+Owner-Transfer über HTTP
+Viewer-read-only über reale Editor-/Public-Sitzung
+Earth-Provisionierung mit realer App-Georeferenz
+```
+
+Diese Punkte bleiben gezielte Ende-zu-Ende-Smoke-Tests.
+
+---
+
+## 45. Aktualisierte relevante Dateistruktur
+
+Neu beziehungsweise wesentlich erweitert:
+
+```text
+services/vectoplan-chunk/
+├── config.py
+├── models/
+│   ├── __init__.py
+│   ├── project.py
+│   └── project_access_assignment.py
+├── scripts/
+│   └── bootstrap_db.py
+└── src/
+    ├── services/
+    │   ├── service_auth_service.py
+    │   ├── project_access_service.py
+    │   └── project_provisioning_service.py
+    └── bootstrap/
+        ├── settings.py
+        ├── default_seed.py
+        ├── db_bootstrap.py
+        ├── startup.py
+        └── runtime_checks.py
+```
+
+Weiterhin vorhandene Legacy-/Kompatibilitätsmodelle:
+
+```text
+models/project_access.py beziehungsweise entsprechende Rollenmodelle
+ProjectRole
+ProjectGroup
+ProjectGroupMember
+ProjectRoleAssignment
+```
+
+Die neue kanonische Projektion ergänzt diese Modelle, ersetzt sie im aktuellen
+Bootstrapstatus aber noch nicht vollständig.
+
+---
+
+## 46. Aktualisierte Invarianten 131 bis 190
+
+Zusätzlich zu den bisherigen Invarianten gelten:
+
+```text
+131. Serviceübergreifende Benutzeridentität ist ausschließlich auth_user_id.
+132. Lokale numerische User-IDs dürfen den Service nicht verlassen.
+133. E-Mail-Adressen sind keine Access-Principal-IDs.
+134. vectoplan-app ist Source of Truth für App-Projektmitgliedschaften.
+135. vectoplan-chunk persistiert eine synchronisierte Access-Projektion.
+136. Rollen sind exakt owner/admin/editor/viewer.
+137. Viewer ist strikt read-only.
+138. Public-Mutationen sind immer verboten.
+139. Clientseitige Identity-Overrides sind verboten.
+140. Owner ist immer ein direktes User-Assignment.
+141. Gruppen können keine Owner sein.
+142. Eine gültige Projektion besitzt genau einen aktiven Owner.
+143. Ownerwechsel erfolgt nur über eine dedizierte Transfer-Operation.
+144. Normale Provisionierung darf den Owner nicht ändern.
+145. Normale Access-Synchronisierung darf den Owner nicht still ändern.
+146. Stale direkte managed Assignments dürfen entfernt werden.
+147. Gruppenzuweisungen bleiben bei App-Reconciliation erhalten.
+148. App-Projekt-Provisionierung fordert standardmäßig Earth an.
+149. Globaler Dev-/Bootstrap-Default bleibt Flat.
+150. Earth→Flat-Fallback ist nur für bekannte Fach-/Vorbedingungsfehler erlaubt.
+151. Infrastrukturfehler dürfen keinen Flat-Fallback auslösen.
+152. Authfehler dürfen keinen Flat-Fallback auslösen.
+153. HTTP-5xx dürfen keinen Flat-Fallback auslösen.
+154. Datenbankfehler dürfen keinen Flat-Fallback auslösen.
+155. Bestehende requested/effective Templates sind im Retry unveränderlich.
+156. Templatewechsel benötigt eine dedizierte Migration.
+157. Provisionierung ist idempotent.
+158. Ressourcenidentitäten werden deterministisch abgeleitet.
+159. Parallel identische Provisionierungen erzeugen nur einen Ressourcengraphen.
+160. Projektressourcen dürfen bei nachgelagertem Access-Fehler erhalten bleiben.
+161. Access-Fehler wird als pending/failed/repair_required dokumentiert.
+162. Schema-Mutationspolicy und Business-Mutationspolicy sind getrennt.
+163. Produktionsruntime darf keine Schemaänderungen ausführen.
+164. Produktionsruntime darf authentifizierte Business-Mutationen ausführen.
+165. Interne Mutationen benötigen einen vertrauenswürdigen Service-Principal.
+166. vectoplan-app und vectoplan-chunk-init dürfen Access mutieren.
+167. vectoplan-editor darf Access-Entscheidungen anfragen, aber nicht verwalten.
+168. Service-Auth-Secrets dürfen nicht in Statuspayloads erscheinen.
+169. Auth-Ausnahmepfade müssen exakt sein.
+170. Health-Prefixe dürfen keinen Auth-Bypass erzeugen.
+171. ProjectAccessAssignment direct besitzt auth_user_id und keine group_id.
+172. ProjectAccessAssignment group besitzt group_id und keine auth_user_id.
+173. ProjectAccessAssignment Owner darf nur direct sein.
+174. Direkte Assignments sind pro Projekt und auth_user_id eindeutig.
+175. Gruppenassignments sind pro Projekt und group_id eindeutig.
+176. Owner-Eindeutigkeit wird transaktional im Service erzwungen.
+177. Eine DB-Partial-Unique-Constraint darf Owner-Transfer nicht durch Autoflush blockieren.
+178. Public-Serialisierung enthält keine rohen Auth-/Gruppen-IDs.
+179. Models führen keine Netzwerkoperationen aus.
+180. Models besitzen keine äußere Commit-Verantwortung.
+181. Runtime-Checks bleiben vollständig read-only.
+182. Check-only darf keine Access-Daten reparieren.
+183. Check-only muss fehlende Access-Daten dennoch melden.
+184. Flushte Seed-Daten müssen innerhalb derselben Session für Readiness sichtbar sein.
+185. Ein fehlender optionaler Seed-Statusadapter darf vorhandene Seed-Funktionen nicht deaktivieren.
+186. Ein fehlender Legacy-Access-Adapter darf durch einen direkten sicheren ORM-Fallback repariert werden.
+187. Tatsächlich unvollständige Access-Daten bleiben fail-closed.
+188. PostgreSQL "Skipping initialization" bei vorhandenem Volume ist kein Startfehler.
+189. Runtime startet erst nach erfolgreichem explizitem Init-/Readiness-Pfad.
+190. Der am 2026-07-19 bestätigte Chunk-Start belegt die Reparatur des konkreten Bootstrap-Blockers.
+```
+
+---
+
+## 47. Aktualisierte Tests und Validierung
+
+### 47.1 Service-Authentifizierung
+
+Geprüft:
+
+```text
+API-Key
+Bearer
+interner Token
+fehlende Credentials
+falsche Credentials
+nicht zugelassener Service
+Credential-Konflikt
+überlange Werte
+exakte Path-Exemption
+kein Prefix-Bypass
+Redaction
+Flask-Decorator
+globale Hooks
+```
+
+### 47.2 Projektzugriffsservice
+
+Geprüft:
+
+```text
+initiale Synchronisierung
+idempotente Synchronisierung
+stale direkte Assignments entfernen
+Gruppen erhalten
+Viewer lesen erlaubt
+Viewer Mutation abgelehnt
+Editor Commands erlaubt
+Editor Access-Management abgelehnt
+Admin Access-Management erlaubt
+Admin Owner-Transfer abgelehnt
+Owner-Transfer erlaubt
+Public verified read
+Public mutation denied
+numerische Identität abgelehnt
+E-Mail-Identität abgelehnt
+nested user.id abgelehnt
+doppelte Subjects abgelehnt
+Owner fehlt / mehrere Owner abgelehnt
+falscher Service-Principal abgelehnt
+Rollback bei injiziertem Fehler
+Status-Redaction
+SQLAlchemy-Adapter
+commit=false ohne Commit
+Parallelität
+```
+
+### 47.3 Projekt-Provisionierungsservice
+
+Geprüft:
+
+```text
+Earth Happy Path
+EPSG:4979 Referenz
+deterministische IDs
+idempotenter Retry
+Projektname-Update
+fehlende Earth-Referenz mit kontrolliertem Flat-Fallback
+ungültige Koordinaten mit kontrolliertem Flat-Fallback
+Timeout ohne Fallback
+Provider-/DB-Fehler ohne Fallback
+Fallback deaktiviert
+numerischer Owner abgelehnt
+Owner-E-Mail abgelehnt
+lokale Identity-Felder abgelehnt
+Ownerwechsel abgelehnt
+Templatewechsel abgelehnt
+commit=false
+Rollback bei World-Erstellungsfehler
+Access ready
+Access pending und später ready
+Access failure erhält Ressourcen
+Preview ohne Mutation
+falscher Service-Principal
+Public-Redaction
+Parallelität
+SQLAlchemy-Adapter
+```
+
+### 47.4 Projektmodell
+
+Geprüft:
+
+```text
+SQLAlchemy-Mapping
+SQLite-Persistenz
+Listener
+kanonische ID-Validierung
+Dev-Bootstrap
+Fallback-Vertrag
+Template-Unveränderlichkeit
+Public-/Private-Serialisierung
+Metadaten-Redaction
+Patch-Schutz
+Provisionierungs-/Access-Lifecycle
+Synonym-Ausdrücke
+Provisionierungsrepository-Kompatibilität
+Accessrepository-Kompatibilität
+ISO-Zeitnormalisierung
+Retry-Flag-Clearing
+```
+
+### 47.5 ProjectAccessAssignment-Modell
+
+Geprüft:
+
+```text
+direct create
+group create
+Subject-XOR
+kanonische Auth-ID
+Rollen-/Typvalidierung
+direct uniqueness
+group uniqueness
+öffentliche/private Serialisierung
+Listener-Normalisierung
+SQLAlchemy-Adapter upsert/list/delete
+Owner-Transfer in beide Richtungen
+Gruppenerhalt bei Reconciliation
+Viewer-Entscheidung read-only
+```
+
+### 47.6 Bootstrap
+
+Geprüft:
+
+```text
+Owner "1" → auth_dev_owner
+individueller kanonischer Owner bleibt erhalten
+vier Standardrollen
+kanonische Owner-Projektion
+Legacy-Owner-Zuweisung
+zusätzlicher Owner → admin
+Gruppenzuweisung bleibt erhalten
+zweiter Lauf idempotent
+Debug-Blöcke optional/erforderlich
+check-only read-only
+uncommitted Session-Readiness
+partieller default_seed-Import
+fehlender Statusadapter
+fehlender/inkompletter Legacy-Adapter
+vollständiger Rollback bei echten Fehlern
+```
+
+### 47.7 Bestätigter Realbetrieb
+
+```text
+vectoplan-chunk startete nach der finalen Bootstrap-Reparatur wieder.
+```
+
+---
+
+## 48. Aktuelle offene Punkte
+
+### 48.1 HTTP-Access-Routen vollständig anbinden
+
+Noch umzusetzen beziehungsweise Ende-zu-Ende zu bestätigen:
+
+```text
+kanonische Access-Initialize-Route
+Assignment-Sync-Route
+dedizierte Owner-Transfer-Route
+Service-Auth auf allen Access-Mutationen
+Access-Decision-Guard auf Projekt-/World-/Block-/Chunk-/Command-Routen
+```
+
+### 48.2 `routes/project_access.py`
+
+Der Route-Layer muss den neuen Servicevertrag vollständig abbilden.
+
+Er muss insbesondere verhindern:
+
+```text
+Client setzt auth_user_id frei
+Viewer führt Mutation aus
+Admin transferiert Owner über generischen Assignment-Patch
+öffentlicher Request mutiert Access
+nicht authentifizierter Service synchronisiert Projektion
+```
+
+### 48.3 Legacy-Projektaccess konsolidieren
+
+Aktuell existieren parallel:
+
+```text
+kanonische project_access_assignments
+Legacy ProjectRole/ProjectRoleAssignment/Group-Modelle
+Legacy src.project_access Package
+```
+
+Langfristig entscheiden:
+
+```text
+Legacy nur als Kompatibilitätsprojektion behalten
+oder vollständig auf kanonischen Service umstellen
+```
+
+### 48.4 Migrationen
+
+Es wurde bewusst keine neue Alembic-Migration in dieser Reparaturrunde erstellt.
+
+Ein frischer Bootstrap kann das aktuelle Schema erzeugen.
+
+Für bestehende produktive Datenbanken bleibt erforderlich:
+
+```text
+kontrollierte Migration der neuen Project-Spalten
+Erstellung project_access_assignments
+Migration numerischer Owner wie "1"
+Backfill kanonischer auth_user_id
+Backfill Access-Projektion
+Verifikation genau eines Owners
+```
+
+### 48.5 Earth-App-Provisionierung Ende-zu-Ende
+
+Noch zu bestätigen:
+
+```text
+vectoplan-app liefert reale Georeferenz
+Chunk provisioniert Earth
+WorldInstance persistiert Earth-Vertrag
+Editor lädt Earth-World
+Flat-Fallback nur bei erlaubtem Code
+kein Fallback bei Timeout/5xx
+```
+
+### 48.6 Runtime-Routen nach finalem Startfix
+
+Nach der bestätigten Startwiederherstellung sollten erneut geprüft werden:
+
+```text
+GET /
+GET /projects/_status
+GET /worlds/_status
+GET /blocks/_status
+GET /chunks/_status
+GET /commands/_status
+```
+
+Zusätzlich:
+
+```text
+Service-Auth-Status
+Project-Access-Status
+Provisionierungsstatus
+Owner-Fingerprint
+Viewer-read-only Status
+```
+
+### 48.7 Command-Guards
+
+Noch anzubinden:
+
+```text
+Viewer Commands blockieren
+Editor Commands erlauben
+Admin/Owner Commands gemäß Policy
+öffentliche Commands blockieren
+Service-Principal und kanonischen Userkontext gemeinsam prüfen
+```
+
+### 48.8 Owner-Transfer HTTP-Ende-zu-Ende
+
+Noch zu testen:
+
+```text
+Owner A → Owner B
+A wird definierte Zielrolle, typischerweise admin
+B wird einziger Owner
+Retry idempotent
+falscher Principal denied
+Admin denied
+Viewer denied
+Gruppen unverändert
+```
+
+---
+
+## 49. Aktualisierte Stabilitätsbewertung
+
+### 49.1 Bestätigt stabil genug
+
+```text
+PostgreSQL-Start
+expliziter Init-/Bootstrap-Pfad
+Runtime-/Bootstrap-Trennung
+Chunk-Start nach Access-Readiness-Fix
+kanonischer Dev-Owner auth_dev_owner
+Systemblock-Bootstrap
+Project/Universe/world_spawn Seed-Grundgraph
+Modelregistrierung mit 15 Tabellen
+Service-Auth-Kern
+Projekt-Provisionierungsservice
+Projektzugriffsservice
+Project-Modellvertrag
+ProjectAccessAssignment-Modellvertrag
+read-only Startup-/Runtime-Checks
+```
+
+### 49.2 Implementiert und isoliert geprüft, aber noch nicht vollständig als HTTP-End-to-End bestätigt
+
+```text
+Earth-Standard für App-Projekte
+kontrollierter Earth→Flat-Fallback
+App-Mitgliedschaftsprojektion in Chunk
+reale Access-Synchronisierung über HTTP
+dedizierter Owner-Transfer über HTTP
+Viewer-Guard auf allen bestehenden Routen
+Service-Auth auf allen bestehenden Routen
+Reconciliation mehrerer realer App-Projekte
+```
+
+### 49.3 Noch nicht final
+
+```text
+Legacy-Access-Konsolidierung
+Alembic-/Produktionsmigration
+vollständiger Earth-Resolverpfad
+Earth-Snapshot-/Command-Kanonisierung
+Editor-Command-Integration mit neuen Access-Guards
+Public-/Unlisted-Read-End-to-End
+Mehrbenutzer-Konflikte
+optimistische Concurrency
+```
+
+---
+
+## 50. Aktualisierter Gesamtbefund 2026-07-19
+
+Der `vectoplan-chunk` ist nicht mehr nur ein projektgescopter Chunk-/World-Service
+mit PostgreSQL, Commands, Systemblöcken und einem isolierten Earth-Kern.
+
+Er besitzt nun zusätzlich eine belastbare Grundlage für:
+
+```text
+serviceauthentifiziertes App-Provisioning
+kanonische externe Benutzeridentitäten
+synchronisierte Projektzugriffsprojektion
+rollenbasierte Durchsetzung
+Viewer-read-only
+Owner-Transfer als dedizierte Operation
+Earth-Standard mit kontrolliertem Flat-Fallback
+idempotente Repair-/Reconciliation-Pfade
+```
+
+Der wichtigste bestätigte Betriebsbefund dieser Fortschreibung lautet:
+
+```text
+Der durch die neue Access-/Owner-Struktur ausgelöste Init-/Startup-Blocker
+wurde diagnostiziert und behoben.
+
+vectoplan-chunk startet wieder.
+```
+
+Technisch präzise Ursache und Reparatur:
+
+```text
+PostgreSQL und Schema waren bereit.
+Der Seed legte Daten in einer offenen Transaktion an.
+Eine getrennte/optionale Access-Statusprüfung sah diese Daten nicht zuverlässig.
+Der Bootstrap wertete Access als not ready und rollte alles zurück.
+
+Die Readiness prüft nun direkt in derselben Session.
+Default-Seed-Exporte werden einzeln geladen.
+Legacy-Access kann direkt idempotent repariert werden.
+Echte unvollständige Zustände bleiben fail-closed.
+```
+
+Damit gilt aktuell:
+
+```text
+Runtime bleibt read-only hinsichtlich Schema und Bootstrap.
+Init darf kontrolliert mutieren.
+Business-Mutationen benötigen Service-Auth und Projektrolle.
+App-Projekte können Earth anfordern.
+Flat bleibt kontrollierter Fallback und technischer Bootstrap-Default.
+App bleibt Membership-Source-of-Truth.
+Chunk bleibt Access-Enforcement- und World-State-Service.
+```
+
+Die nächsten Arbeiten sollten nicht erneut den gesamten Bootstrap umbauen, sondern
+gezielt die noch fehlende HTTP-Routen- und Guard-Integration des bereits vorhandenen
+Servicekerns abschließen.
+

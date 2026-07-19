@@ -53,6 +53,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -68,7 +69,7 @@ from typing import Any, Mapping, Sequence
 # Constants
 # -----------------------------------------------------------------------------
 
-SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v5"
+SCRIPT_RESULT_VERSION = "bootstrap-db-script-result.v6"
 
 EXIT_OK = 0
 EXIT_BOOTSTRAP_FAILED = 1
@@ -92,6 +93,13 @@ DEFAULT_BLOCK_REGISTRY_ID = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION = "1"
 DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID = "system_railing"
 DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID = "vectoplan-system-block-bootstrap"
+
+DEFAULT_PROJECT_OWNER_AUTH_USER_ID = "auth_dev_owner"
+DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE = "vectoplan-app"
+DEFAULT_PROJECT_ACCESS_SERVICE_ID = "vectoplan-chunk-init"
+DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION = "app-project-access-v1"
+DEFAULT_PROJECT_ACCESS_ROLE = "owner"
+DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE = "direct"
 
 
 # -----------------------------------------------------------------------------
@@ -204,6 +212,112 @@ def _env_str_any(names: Sequence[str], default: str = "") -> str:
     return default
 
 
+def _looks_like_unsafe_auth_user_id(value: Any) -> bool:
+    """Return whether a value is a local/anonymous identity, not a canonical auth id."""
+    text = _safe_str(value, "")
+    if not text:
+        return True
+    lowered = text.lower()
+    if text.isdigit() or lowered in {
+        "none",
+        "null",
+        "undefined",
+        "anonymous",
+        "guest",
+        "bootstrap",
+        "system",
+    }:
+        return True
+    if "@" in text or "://" in text:
+        return True
+    if any(character.isspace() or ord(character) < 32 for character in text):
+        return True
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-")
+    return len(text) > 255 or any(character not in allowed for character in text)
+
+
+def _normalize_auth_user_id(
+    value: Any,
+    default: str = DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+) -> str:
+    """Normalize a cross-service auth id and replace legacy numeric placeholders."""
+    candidate = _safe_str(value, "")
+    if not _looks_like_unsafe_auth_user_id(candidate):
+        return candidate
+
+    fallback = _safe_str(default, "")
+    if fallback and not _looks_like_unsafe_auth_user_id(fallback):
+        return fallback
+    return ""
+
+
+def _resolve_project_owner_auth_user_id() -> str:
+    """Resolve the canonical development-project owner from compatible env aliases."""
+    names = (
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEV_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_OWNER_USER_ID",
+        "VECTOPLAN_CHUNK_PROJECT_OWNER_USER_ID",
+    )
+    for name in names:
+        raw_value = _env_str(name, "")
+        if raw_value:
+            return _normalize_auth_user_id(
+                raw_value,
+                DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+            )
+    return DEFAULT_PROJECT_OWNER_AUTH_USER_ID
+
+
+def _ensure_project_owner_env_defaults(
+    *,
+    seed_project_access: bool | None = None,
+) -> str:
+    """Publish one canonical owner/access policy to old and new bootstrap readers."""
+    owner_auth_user_id = _resolve_project_owner_auth_user_id()
+    for name in (
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEV_PROJECT_OWNER_AUTH_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+        "VECTOPLAN_CHUNK_DEFAULT_OWNER_USER_ID",
+        "VECTOPLAN_CHUNK_PROJECT_OWNER_USER_ID",
+    ):
+        set_env_value(name, owner_auth_user_id, override=True)
+
+    if seed_project_access is not None:
+        enabled = "true" if seed_project_access else "false"
+        for name in (
+            "VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS",
+            "VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS_PROJECTION",
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS_PROJECTION",
+        ):
+            set_env_value(name, enabled, override=True)
+
+    return owner_auth_user_id
+
+
+def _project_access_required() -> bool:
+    """Return whether a seeded development project requires a ready access projection."""
+    return _env_bool(
+        "VECTOPLAN_CHUNK_PROJECT_ACCESS_REQUIRED",
+        _env_bool("VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED", True),
+    )
+
+
+def _debug_blocks_required() -> bool:
+    """Return whether debug blocks are an explicit seed/readiness requirement."""
+    return _env_bool(
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+        _env_bool("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", False),
+    )
+
+
 def _safe_exception_message(exc: BaseException | Any) -> str:
     """Return robust exception message."""
     try:
@@ -286,6 +400,8 @@ def _print_human_result(result: dict[str, Any]) -> None:
     print(f"default world ready:   {result.get('defaultWorldReady')}")
     print(f"block registry ready:  {result.get('blockRegistryReady')}")
     print(f"debug blocks ready:    {result.get('debugBlocksReady')}")
+    print(f"project access ready:  {result.get('projectAccessReady')}")
+    print(f"project owner:         {result.get('projectOwnerAuthUserId')}")
     print(f"system blocks ready:   {result.get('systemBlocksReady')}")
     print(f"Air invariant ready:   {result.get('airInvariantReady')}")
     print(f"system railing ready:  {result.get('systemRailingReady')}")
@@ -460,6 +576,9 @@ def set_default_env(
     effective_mode = "check-only" if check_only else mode or "db-bootstrap"
 
     _ensure_world_id_env_defaults()
+    _ensure_project_owner_env_defaults(
+        seed_project_access=bool(seed and not check_only),
+    )
 
     set_env_value("VECTOPLAN_CHUNK_MODE", effective_mode, override=True)
     set_env_value("VECTOPLAN_CHUNK_STARTUP_MODE", effective_mode, override=True)
@@ -478,6 +597,8 @@ def set_default_env(
         set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_SYSTEM_BLOCKS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS", "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "false", override=True)
     else:
@@ -489,6 +610,8 @@ def set_default_env(
         set_env_value("VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS", "true" if seed else "false", override=True)
+        set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
         set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_REPAIR_SEED_INVARIANTS", "true" if repair_seed_invariants else "false", override=True)
 
@@ -497,6 +620,7 @@ def set_default_env(
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_SYSTEM_BLOCKS", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT", "true" if seed else "false", override=True)
+    set_env_value("VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS", "true" if seed else "false", override=True)
     set_env_value("VECTOPLAN_CHUNK_BOOTSTRAP_REPAIR_MISSING_COLUMNS", "true" if repair_missing_columns else "false", override=False)
 
     set_env_value("VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY", "true", override=False)
@@ -588,6 +712,11 @@ def _get_model_classes() -> dict[str, Any]:
         ChunkEvent,
         ChunkSnapshot,
         Project,
+        ProjectAccessAssignment,
+        ProjectGroup,
+        ProjectGroupMember,
+        ProjectRole,
+        ProjectRoleAssignment,
         Universe,
         WorldCommandLog,
         WorldInstance,
@@ -597,6 +726,11 @@ def _get_model_classes() -> dict[str, Any]:
 
     return {
         "Project": Project,
+        "ProjectAccessAssignment": ProjectAccessAssignment,
+        "ProjectRole": ProjectRole,
+        "ProjectGroup": ProjectGroup,
+        "ProjectGroupMember": ProjectGroupMember,
+        "ProjectRoleAssignment": ProjectRoleAssignment,
         "Universe": Universe,
         "WorldInstance": WorldInstance,
         "BlockRegistry": BlockRegistry,
@@ -1098,6 +1232,610 @@ def _query_first_by_field(session: Any, model: Any, field_name: str, value: Any)
     return _query_first_by_fields(session, model, **{field_name: value})
 
 
+def _project_owner_from_model(project: Any, fallback: str) -> str:
+    """Return a canonical persisted project owner, falling back from legacy placeholders."""
+    for name in (
+        "owner_auth_user_id",
+        "owner_id",
+        "owner_user_id",
+        "created_by_auth_user_id",
+        "created_by_user_id",
+    ):
+        try:
+            value = getattr(project, name, None)
+        except Exception:
+            value = None
+        normalized = _normalize_auth_user_id(value, "")
+        if normalized:
+            return normalized
+    return _normalize_auth_user_id(fallback, DEFAULT_PROJECT_OWNER_AUTH_USER_ID)
+
+
+def _apply_project_owner_fields(project: Any, owner_auth_user_id: str) -> str:
+    """Repair all compatible owner/actor fields to one canonical auth identity."""
+    owner = _normalize_auth_user_id(
+        owner_auth_user_id,
+        DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+    )
+    setter = getattr(project, "set_owner_user", None)
+    if callable(setter):
+        try:
+            setter(owner, updated_by_user_id=owner)
+        except TypeError:
+            try:
+                setter(owner)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _set_attr_if_supported(project, "owner_type", "user")
+    for field_name in (
+        "owner_auth_user_id",
+        "owner_id",
+        "owner_user_id",
+        "created_by_auth_user_id",
+        "updated_by_auth_user_id",
+        "created_by_user_id",
+        "updated_by_user_id",
+    ):
+        _set_attr_if_supported(project, field_name, owner)
+    return owner
+
+
+def _project_access_projection_fingerprint(
+    project_id: str,
+    owner_auth_user_id: str,
+) -> str:
+    """Build the stable one-owner bootstrap projection fingerprint."""
+    canonical = json.dumps(
+        {
+            "assignments": [
+                {
+                    "active": True,
+                    "assignment_type": DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                    "auth_user_id": owner_auth_user_id,
+                    "role": DEFAULT_PROJECT_ACCESS_ROLE,
+                }
+            ],
+            "chunk_project_id": project_id,
+            "projection_version": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+            "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _result_to_dict_with_variants(value: Any) -> dict[str, Any]:
+    """Serialize service result objects whose to_dict signatures differ by generation."""
+    data = _to_plain_dict(value)
+    if data:
+        return data
+    serializer = getattr(value, "to_dict", None)
+    if not callable(serializer):
+        return {}
+    for kwargs in (
+        {"include_internal": True, "include_metadata": False},
+        {"include_private": False},
+        {},
+    ):
+        try:
+            candidate = serializer(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return {}
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
+
+
+def _initialize_canonical_project_access_inner(
+    project: Any,
+    owner_auth_user_id: str,
+) -> dict[str, Any]:
+    """Initialize the canonical ProjectAccessAssignment projection without committing."""
+    db = _get_db()
+    models = _get_model_classes()
+    assignment_model = models.get("ProjectAccessAssignment")
+    project_model = models.get("Project") or project.__class__
+    project_id = _safe_str(getattr(project, "project_id", None), DEFAULT_PROJECT_ID)
+    owner = _normalize_auth_user_id(owner_auth_user_id)
+    fingerprint = _project_access_projection_fingerprint(project_id, owner)
+    request_id = f"bootstrap-{project_id}"
+    correlation_id = request_id
+    service_errors: list[str] = []
+
+    if assignment_model is None:
+        raise RuntimeError("ProjectAccessAssignment model is unavailable.")
+
+    for module_name in (
+        "src.services.project_access_service",
+        "services.project_access_service",
+        "project_access_service",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            initialize = getattr(module, "initialize_project_access", None)
+            if not callable(initialize):
+                raise RuntimeError("initialize_project_access export is unavailable")
+            payload = {
+                "owner_auth_user_id": owner,
+                "assignments": [
+                    {
+                        "auth_user_id": owner,
+                        "role": DEFAULT_PROJECT_ACCESS_ROLE,
+                        "assignment_type": DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                        "active": True,
+                        "managed": True,
+                        "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                    }
+                ],
+                "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                "projection_version": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+            }
+            principal = {
+                "service_id": DEFAULT_PROJECT_ACCESS_SERVICE_ID,
+                "authenticated": True,
+                "exempt": False,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+            }
+            config = {
+                "VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED": True,
+                "VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY": True,
+                "VECTOPLAN_CHUNK_ACCESS_SOURCE_SERVICE": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                "VECTOPLAN_CHUNK_ACCESS_PROJECTION_VERSION": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+                "VECTOPLAN_CHUNK_ACCESS_PRUNE_STALE_DIRECT_ASSIGNMENTS": True,
+                "VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS": True,
+                "VECTOPLAN_CHUNK_ACCESS_VERIFY_AFTER_SYNC": True,
+                "VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED": True,
+                "VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED": True,
+            }
+            result = initialize(
+                project_id,
+                payload,
+                session=db.session,
+                assignment_model=assignment_model,
+                project_model=project_model,
+                principal=principal,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                idempotency_key=f"bootstrap:{project_id}:{fingerprint}",
+                commit=False,
+                dry_run=False,
+                force=True,
+                raise_on_error=True,
+                config=config,
+            )
+            data = _result_to_dict_with_variants(result)
+            if data and not _safe_bool(data.get("ok"), False):
+                raise RuntimeError(
+                    _safe_str(data.get("error"), data.get("code") or "canonical access sync failed")
+                )
+            db.session.flush()
+            return {
+                "ok": True,
+                "backend": module_name,
+                "result": data,
+                "projectionFingerprint": fingerprint,
+                "ownerAuthUserId": owner,
+            }
+        except Exception as exc:
+            service_errors.append(
+                f"{module_name}: {exc.__class__.__name__}: {_safe_exception_message(exc)}"
+            )
+
+    # Direct ORM fallback: preserve groups and non-owner direct members, but ensure
+    # exactly one active canonical owner for the development project.
+    query = db.session.query(assignment_model)
+    try:
+        rows = query.filter(
+            getattr(assignment_model, "chunk_project_id") == project_id
+        ).all()
+    except Exception:
+        rows = query.all()
+        rows = [
+            row
+            for row in rows
+            if _safe_str(getattr(row, "chunk_project_id", ""), "") == project_id
+        ]
+
+    owner_row = None
+    demoted_count = 0
+    for row in rows:
+        assignment_type = _safe_str(
+            getattr(row, "assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+            DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+        ).lower()
+        if assignment_type == "group":
+            continue
+        row_owner = _normalize_auth_user_id(getattr(row, "auth_user_id", None), "")
+        row_role = _safe_str(getattr(row, "role", ""), "").lower()
+        row_active = _safe_bool(getattr(row, "active", True), True)
+        if row_owner == owner:
+            owner_row = row
+            continue
+        if row_role == DEFAULT_PROJECT_ACCESS_ROLE and row_active:
+            _set_attr_if_supported(row, "role", "admin")
+            _set_attr_if_supported(row, "updated_at", _utc_now())
+            db.session.add(row)
+            demoted_count += 1
+
+    created = False
+    if owner_row is None:
+        factory = getattr(assignment_model, "create_direct", None)
+        if callable(factory):
+            owner_row = factory(
+                chunk_project_id=project_id,
+                auth_user_id=owner,
+                role=DEFAULT_PROJECT_ACCESS_ROLE,
+                active=True,
+                managed=True,
+                source_service=DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                projection_version=DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+                projection_fingerprint=fingerprint,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                metadata_json={
+                    "seededBy": "bootstrap_db.py",
+                    "bootstrapService": DEFAULT_PROJECT_ACCESS_SERVICE_ID,
+                },
+            )
+        else:
+            owner_row = assignment_model(
+                chunk_project_id=project_id,
+                auth_user_id=owner,
+                group_id=None,
+                role=DEFAULT_PROJECT_ACCESS_ROLE,
+                assignment_type=DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                active=True,
+                managed=True,
+                source_service=DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                projection_version=DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+                projection_fingerprint=fingerprint,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                metadata_json={"seededBy": "bootstrap_db.py"},
+            )
+        db.session.add(owner_row)
+        created = True
+    else:
+        for field_name, value in (
+            ("role", DEFAULT_PROJECT_ACCESS_ROLE),
+            ("assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+            ("active", True),
+            ("managed", True),
+            ("source_service", DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE),
+            ("projection_version", DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION),
+            ("projection_fingerprint", fingerprint),
+            ("request_id", request_id),
+            ("correlation_id", correlation_id),
+            ("deactivated_at", None),
+            ("updated_at", _utc_now()),
+        ):
+            _set_attr_if_supported(owner_row, field_name, value)
+        db.session.add(owner_row)
+
+    db.session.flush()
+    now = _utc_now()
+    for field_name, value in (
+        ("access_sync_status", "ready"),
+        ("access_projection_version", DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION),
+        ("access_projection_fingerprint", fingerprint),
+        ("access_sync_request_id", request_id),
+        ("access_sync_correlation_id", correlation_id),
+        ("access_sync_error_code", None),
+        ("access_sync_retryable", False),
+        ("access_sync_repair_required", False),
+        ("access_synced_at", now),
+        ("access_sync_updated_at", now),
+    ):
+        _set_attr_if_supported(project, field_name, value)
+    db.session.add(project)
+    db.session.flush()
+    return {
+        "ok": True,
+        "backend": "direct_project_access_assignment",
+        "created": created,
+        "demotedExtraOwners": demoted_count,
+        "projectionFingerprint": fingerprint,
+        "ownerAuthUserId": owner,
+        "serviceErrors": service_errors,
+    }
+
+
+def _initialize_legacy_project_access_inner(
+    project: Any,
+    owner_auth_user_id: str,
+) -> dict[str, Any]:
+    """Maintain legacy role/group rows while the canonical projection is adopted."""
+    models = _get_model_classes()
+    legacy_names = (
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+    legacy_models_present = all(models.get(name) is not None for name in legacy_names)
+    if not legacy_models_present:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "legacy access models are not installed",
+        }
+
+    import_errors: list[str] = []
+    for module_name in ("src.project_access", "project_access"):
+        try:
+            module = importlib.import_module(module_name)
+            initialize = getattr(module, "ensure_project_access_initialized", None)
+            if not callable(initialize):
+                raise RuntimeError("ensure_project_access_initialized export is unavailable")
+            result = initialize(
+                project=project,
+                owner_user_id=owner_auth_user_id,
+                actor_user_id=owner_auth_user_id,
+                session=_get_db().session,
+                synchronize_default_roles=True,
+                restore_deleted_roles=True,
+                replace_existing_owner=True,
+                allow_missing_owner=False,
+                lock_project=True,
+                flush=True,
+            )
+            data = _result_to_dict_with_variants(result)
+            ready = _safe_bool(
+                data.get("accessInitialized", data.get("ok", True)),
+                True,
+            )
+            if not ready:
+                raise RuntimeError("legacy project access initialization returned not ready")
+            return {
+                "ok": True,
+                "backend": module_name,
+                "result": data,
+            }
+        except Exception as exc:
+            import_errors.append(
+                f"{module_name}: {exc.__class__.__name__}: {_safe_exception_message(exc)}"
+            )
+
+    raise RuntimeError(
+        "Legacy project-access compatibility initialization failed: "
+        + " | ".join(import_errors)
+    )
+
+
+def _build_project_access_status_inner(
+    project: Any | None = None,
+    owner_auth_user_id: str | None = None,
+) -> dict[str, Any]:
+    """Build read-only canonical and legacy access readiness for the default project."""
+    db = _get_db()
+    models = _get_model_classes()
+    Project = models.get("Project")
+    project_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
+    if project is None and Project is not None:
+        project = _query_first_by_field(db.session, Project, "project_id", project_id)
+    if project is None:
+        return {
+            "ready": False,
+            "projectExists": False,
+            "projectId": project_id,
+            "canonicalReady": False,
+            "legacyReady": False,
+        }
+
+    project_id = _safe_str(getattr(project, "project_id", None), project_id)
+    configured_owner = _normalize_auth_user_id(
+        owner_auth_user_id or _resolve_project_owner_auth_user_id()
+    )
+    owner = _project_owner_from_model(project, configured_owner)
+    owner_ready = owner == configured_owner or bool(owner)
+
+    assignment_model = models.get("ProjectAccessAssignment")
+    canonical_owner_count = 0
+    canonical_owner_total = 0
+    canonical_assignment_count = 0
+    if assignment_model is not None:
+        try:
+            rows = db.session.query(assignment_model).filter(
+                getattr(assignment_model, "chunk_project_id") == project_id
+            ).all()
+        except Exception:
+            try:
+                rows = db.session.query(assignment_model).all()
+            except Exception:
+                rows = []
+        for row in rows:
+            if _safe_str(getattr(row, "chunk_project_id", ""), "") != project_id:
+                continue
+            if not _safe_bool(getattr(row, "active", True), True):
+                continue
+            canonical_assignment_count += 1
+            assignment_type = _safe_str(
+                getattr(row, "assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+                DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+            ).lower()
+            role = _safe_str(getattr(row, "role", ""), "").lower()
+            if assignment_type == "group" or role != DEFAULT_PROJECT_ACCESS_ROLE:
+                continue
+            canonical_owner_total += 1
+            if _normalize_auth_user_id(getattr(row, "auth_user_id", None), "") == owner:
+                canonical_owner_count += 1
+
+    canonical_ready = bool(
+        assignment_model is not None
+        and owner_ready
+        and canonical_owner_total == 1
+        and canonical_owner_count == 1
+    )
+
+    legacy_names = (
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+    legacy_models_present = all(models.get(name) is not None for name in legacy_names)
+    legacy_ready = not legacy_models_present
+    legacy_role_keys: set[str] = set()
+    legacy_owner_assignment_count = 0
+    if legacy_models_present:
+        ProjectRole = models["ProjectRole"]
+        ProjectRoleAssignment = models["ProjectRoleAssignment"]
+        project_db_id = getattr(project, "id", None)
+        try:
+            roles = db.session.query(ProjectRole).filter(
+                getattr(ProjectRole, "project_db_id") == project_db_id
+            ).all()
+        except Exception:
+            roles = []
+        owner_role_db_ids: set[Any] = set()
+        owner_role_ids: set[str] = set()
+        for role_row in roles:
+            if _safe_str(getattr(role_row, "status", "active"), "active").lower() != "active":
+                continue
+            role_key = _safe_str(getattr(role_row, "role_key", ""), "").lower()
+            if role_key:
+                legacy_role_keys.add(role_key)
+            if role_key == "owner":
+                owner_role_db_ids.add(getattr(role_row, "id", None))
+                owner_role_ids.add(_safe_str(getattr(role_row, "role_id", ""), ""))
+        try:
+            assignments = db.session.query(ProjectRoleAssignment).filter(
+                getattr(ProjectRoleAssignment, "project_db_id") == project_db_id
+            ).all()
+        except Exception:
+            assignments = []
+        for assignment in assignments:
+            if _safe_str(getattr(assignment, "status", "active"), "active").lower() != "active":
+                continue
+            if _safe_str(getattr(assignment, "subject_type", ""), "").lower() != "user":
+                continue
+            assignment_owner = _normalize_auth_user_id(
+                getattr(assignment, "user_id", None),
+                "",
+            )
+            if assignment_owner != owner:
+                continue
+            role_db_id = getattr(assignment, "role_db_id", None)
+            role_id = _safe_str(getattr(assignment, "role_id", ""), "")
+            if role_db_id in owner_role_db_ids or role_id in owner_role_ids:
+                legacy_owner_assignment_count += 1
+        legacy_ready = bool(
+            {"owner", "admin", "editor", "viewer"}.issubset(legacy_role_keys)
+            and legacy_owner_assignment_count == 1
+        )
+
+    ready = bool(owner_ready and canonical_ready and legacy_ready)
+    return {
+        "ready": ready,
+        "projectExists": True,
+        "projectId": project_id,
+        "projectDbId": getattr(project, "id", None),
+        "ownerAuthUserId": owner,
+        "ownerReady": owner_ready,
+        "canonicalReady": canonical_ready,
+        "canonicalAssignmentCount": canonical_assignment_count,
+        "canonicalOwnerAssignmentCount": canonical_owner_count,
+        "canonicalOwnerTotal": canonical_owner_total,
+        "legacyModelsPresent": legacy_models_present,
+        "legacyReady": legacy_ready,
+        "legacyRoleKeys": sorted(legacy_role_keys),
+        "legacyOwnerAssignmentCount": legacy_owner_assignment_count,
+    }
+
+
+def _build_project_access_status(app: Any) -> dict[str, Any]:
+    """Build project-access readiness with the required Flask app context."""
+    if _has_app_context():
+        return _build_project_access_status_inner()
+    with app.app_context():
+        return _build_project_access_status_inner()
+
+
+def _ensure_project_access_inner(
+    project: Any,
+    owner_auth_user_id: str,
+) -> dict[str, Any]:
+    """Initialize canonical and legacy access rows in the surrounding seed transaction."""
+    canonical = _initialize_canonical_project_access_inner(
+        project,
+        owner_auth_user_id,
+    )
+    legacy = _initialize_legacy_project_access_inner(
+        project,
+        owner_auth_user_id,
+    )
+    status = _build_project_access_status_inner(project, owner_auth_user_id)
+    if not _safe_bool(status.get("ready"), False):
+        raise RuntimeError(
+            "Project access is not ready after canonical and legacy initialization."
+        )
+    return {
+        "ok": True,
+        "canonical": canonical,
+        "legacy": legacy,
+        "status": status,
+    }
+
+
+def _repair_project_access_if_needed_inner(*, commit: bool = True) -> dict[str, Any]:
+    """Repair missing canonical/legacy access rows during explicit bootstrap only."""
+    status_before = _build_project_access_status_inner()
+    if _safe_bool(status_before.get("ready"), False) or not _project_access_required():
+        return {
+            "ok": True,
+            "changed": False,
+            "status": status_before,
+        }
+
+    db = _get_db()
+    models = _get_model_classes()
+    Project = models.get("Project")
+    project_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID)
+    project = None
+    if Project is not None:
+        project = _query_first_by_field(db.session, Project, "project_id", project_id)
+    if project is None:
+        return {
+            "ok": False,
+            "changed": False,
+            "status": status_before,
+            "error": "Default project does not exist for project-access repair.",
+        }
+
+    configured_owner = _resolve_project_owner_auth_user_id()
+    owner = _project_owner_from_model(project, configured_owner)
+    owner = _apply_project_owner_fields(project, owner)
+    try:
+        repair = _ensure_project_access_inner(project, owner)
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        raise
+
+    status_after = _build_project_access_status_inner(project, owner)
+    return {
+        "ok": _safe_bool(status_after.get("ready"), False),
+        "changed": True,
+        "ownerAuthUserId": owner,
+        "repair": repair,
+        "statusBefore": status_before,
+        "status": status_after,
+    }
+
+
 def _direct_seed_defaults_inner() -> dict[str, Any]:
     """
     Seed minimal dev Project/Universe/WorldInstance fallback.
@@ -1120,6 +1858,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
     provider_world_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_PROVIDER_WORLD_ID", DEFAULT_PROVIDER_WORLD_ID)
     block_registry_id = _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_ID", DEFAULT_BLOCK_REGISTRY_ID)
     block_registry_version = _env_str("VECTOPLAN_CHUNK_DEFAULT_BLOCK_REGISTRY_VERSION", DEFAULT_BLOCK_REGISTRY_VERSION)
+    owner_auth_user_id = _ensure_project_owner_env_defaults(seed_project_access=True)
 
     project = _query_first_by_field(db.session, Project, "project_id", project_id)
 
@@ -1131,7 +1870,8 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                     default_universe_id=universe_id,
                     default_world_id=world_id,
                     spawn_world_id=world_id,
-                    created_by_user_id="bootstrap",
+                    owner_user_id=owner_auth_user_id,
+                    created_by_user_id=owner_auth_user_id,
                 )
             except TypeError:
                 try:
@@ -1139,13 +1879,15 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                         project_id=project_id,
                         default_universe_id=universe_id,
                         default_world_id=world_id,
-                        created_by_user_id="bootstrap",
+                        owner_user_id=owner_auth_user_id,
+                        created_by_user_id=owner_auth_user_id,
                     )
                 except TypeError:
                     project = Project.create_dev_project(
                         project_id=project_id,
                         default_universe_id=universe_id,
-                        created_by_user_id="bootstrap",
+                        owner_user_id=owner_auth_user_id,
+                        created_by_user_id=owner_auth_user_id,
                     )
         else:
             project = Project(
@@ -1155,6 +1897,11 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                 default_universe_id=universe_id,
                 default_world_id=world_id,
                 spawn_world_id=world_id,
+                owner_type="user",
+                owner_id=owner_auth_user_id,
+                owner_auth_user_id=owner_auth_user_id,
+                created_by_user_id=owner_auth_user_id,
+                updated_by_user_id=owner_auth_user_id,
                 metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
             )
 
@@ -1167,10 +1914,12 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
     _set_attr_if_empty(project, "slug", project_id)
     _set_attr_if_empty(project, "name", "Dev Project")
     _set_attr_if_empty(project, "status", "active")
+    owner_auth_user_id = _project_owner_from_model(project, owner_auth_user_id)
+    owner_auth_user_id = _apply_project_owner_fields(project, owner_auth_user_id)
     _set_attr_if_supported(project, "default_universe_id", universe_id)
     _set_attr_if_supported(project, "default_world_id", world_id)
     _set_attr_if_supported(project, "spawn_world_id", world_id)
-    _set_attr_if_supported(project, "updated_by_user_id", "bootstrap")
+    _set_attr_if_supported(project, "updated_by_user_id", owner_auth_user_id)
     _merge_metadata_json(
         project,
         {
@@ -1179,6 +1928,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             "defaultUniverseId": universe_id,
             "defaultWorldId": world_id,
             "spawnWorldId": world_id,
+            "ownerAuthUserId": owner_auth_user_id,
         },
     )
 
@@ -1203,7 +1953,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                     slug=universe_id,
                     default_world_id=world_id,
                     spawn_world_id=world_id,
-                    created_by_user_id="bootstrap",
+                    created_by_user_id=owner_auth_user_id,
                     metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
                 )
             except TypeError:
@@ -1239,7 +1989,8 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
     _set_attr_if_empty(universe, "status", "active")
     _set_attr_if_supported(universe, "default_world_id", world_id)
     _set_attr_if_supported(universe, "spawn_world_id", world_id)
-    _set_attr_if_supported(universe, "updated_by_user_id", "bootstrap")
+    _set_attr_if_supported(universe, "created_by_user_id", owner_auth_user_id)
+    _set_attr_if_supported(universe, "updated_by_user_id", owner_auth_user_id)
     _merge_metadata_json(
         universe,
         {
@@ -1270,7 +2021,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                     world_id=world_id,
                     slug="spawn",
                     name="Flat Spawn World",
-                    created_by_user_id="bootstrap",
+                    created_by_user_id=owner_auth_user_id,
                     metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
                 )
             except TypeError:
@@ -1280,7 +2031,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                     world_id=world_id,
                     slug="spawn",
                     name="Flat Spawn World",
-                    created_by_user_id="bootstrap",
+                    created_by_user_id=owner_auth_user_id,
                     metadata_json={"seed": True, "createdBy": "bootstrap_db.py"},
                 )
         else:
@@ -1338,7 +2089,8 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
     _set_attr_if_supported(world, "spawn_pitch", _safe_float(_env_str("VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", "0.0"), 0.0))
     _set_attr_if_supported(world, "source_service", "vectoplan-chunk-bootstrap")
     _set_attr_if_supported(world, "external_ref", world_id)
-    _set_attr_if_supported(world, "updated_by_user_id", "bootstrap")
+    _set_attr_if_supported(world, "created_by_user_id", owner_auth_user_id)
+    _set_attr_if_supported(world, "updated_by_user_id", owner_auth_user_id)
     _merge_metadata_json(
         world,
         {
@@ -1357,7 +2109,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                 default_universe_id=universe_id,
                 default_world_id=world_id,
                 spawn_world_id=world_id,
-                updated_by_user_id="bootstrap",
+                updated_by_user_id=owner_auth_user_id,
             )
         else:
             _set_attr_if_supported(project, "default_universe_id", universe_id)
@@ -1368,7 +2120,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             universe.set_world_defaults(
                 default_world_id=world_id,
                 spawn_world_id=world_id,
-                updated_by_user_id="bootstrap",
+                updated_by_user_id=owner_auth_user_id,
             )
         else:
             _set_attr_if_supported(universe, "default_world_id", world_id)
@@ -1380,6 +2132,11 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
                 "message": _safe_exception_message(exc),
             }
         )
+
+    project_access = _ensure_project_access_inner(
+        project,
+        owner_auth_user_id,
+    )
 
     system_blocks = _run_system_block_repair_inner(commit=False)
     system_readiness = _extract_system_block_readiness(system_blocks)
@@ -1403,6 +2160,9 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
         "defaultUniverseReady": True,
         "defaultWorldReady": True,
         "blockRegistryReady": True,
+        "projectAccessReady": True,
+        "projectOwnerAuthUserId": owner_auth_user_id,
+        "projectAccess": project_access,
         "systemBlocksReady": system_readiness["systemBlocksReady"],
         "systemRailingReady": system_readiness["systemRailingReady"],
         "airInvariantReady": system_readiness["airInvariantReady"],
@@ -1421,6 +2181,8 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             "providerWorldId": provider_world_id,
             "blockRegistryId": block_registry_id,
             "blockRegistryVersion": block_registry_version,
+            "ownerAuthUserId": owner_auth_user_id,
+            "seedProjectAccess": True,
         },
     }
 
@@ -1554,6 +2316,8 @@ def _fallback_bootstrap(
             "systemBlocks": system_status,
         }
     )
+    project_access_status = _build_project_access_status(app)
+    project_access_ready = _safe_bool(project_access_status.get("ready"), False)
 
     default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
     default_universe_ready = _nested_bool(invariant_status, ("ready", "universe"))
@@ -1563,7 +2327,14 @@ def _fallback_bootstrap(
         and (default_world_ready is not False)
         and (
             not run_seed
-            or system_readiness["systemBlocksReady"]
+            or (
+                system_readiness["systemBlocksReady"]
+                and (not _project_access_required() or project_access_ready)
+                and (
+                    not _debug_blocks_required()
+                    or _nested_bool(invariant_status, ("ready", "debugBlocks")) is not False
+                )
+            )
         )
     )
 
@@ -1573,7 +2344,17 @@ def _fallback_bootstrap(
         and bool(seed_result.get("ok"))
         and bool(post_status.get("ok"))
         and (default_world_ready is not False)
-        and (not run_seed or system_readiness["systemBlocksReady"])
+        and (
+            not run_seed
+            or (
+                system_readiness["systemBlocksReady"]
+                and (not _project_access_required() or project_access_ready)
+                and (
+                    not _debug_blocks_required()
+                    or _nested_bool(invariant_status, ("ready", "debugBlocks")) is not False
+                )
+            )
+        )
     )
 
     if not post_status.get("ok"):
@@ -1594,6 +2375,15 @@ def _fallback_bootstrap(
                 "code": "post_bootstrap_default_world_not_ready",
                 "message": "Default concrete world is not ready after bootstrap.",
                 "details": invariant_status,
+            }
+        )
+
+    if run_seed and _project_access_required() and not project_access_ready:
+        errors.append(
+            {
+                "code": "post_bootstrap_project_access_not_ready",
+                "message": "Default project owner/access projection is not ready after bootstrap.",
+                "details": project_access_status,
             }
         )
 
@@ -1621,6 +2411,9 @@ def _fallback_bootstrap(
         "defaultWorldReady": default_world_ready,
         "blockRegistryReady": _nested_bool(invariant_status, ("ready", "blockRegistry")),
         "debugBlocksReady": _nested_bool(invariant_status, ("ready", "debugBlocks")),
+        "projectAccessReady": project_access_ready,
+        "projectOwnerAuthUserId": project_access_status.get("ownerAuthUserId"),
+        "projectAccess": project_access_status,
         "systemBlocksReady": system_readiness["systemBlocksReady"],
         "systemRailingReady": system_readiness["systemRailingReady"],
         "airInvariantReady": system_readiness["airInvariantReady"],
@@ -2215,6 +3008,11 @@ def _bootstrap_indicates_seed_not_ready(result: Mapping[str, Any] | Any) -> bool
     if data.get("default_world_ready") is False or data.get("defaultWorldReady") is False:
         return True
 
+    if data.get("project_access_ready") is False or data.get("projectAccessReady") is False:
+        return True
+    if data.get("project_owner_ready") is False or data.get("projectOwnerReady") is False:
+        return True
+
     for key in (
         "system_blocks_ready",
         "systemBlocksReady",
@@ -2338,6 +3136,8 @@ def make_script_result(
                 "defaultWorldReady": summary.get("defaultWorldReady", bootstrap_result.get("defaultWorldReady")),
                 "blockRegistryReady": summary.get("blockRegistryReady", bootstrap_result.get("blockRegistryReady")),
                 "debugBlocksReady": summary.get("debugBlocksReady", bootstrap_result.get("debugBlocksReady")),
+                "projectAccessReady": summary.get("projectAccessReady", bootstrap_result.get("projectAccessReady")),
+                "projectOwnerAuthUserId": summary.get("projectOwnerAuthUserId", bootstrap_result.get("projectOwnerAuthUserId")),
                 "systemBlocksReady": summary.get("systemBlocksReady", bootstrap_result.get("systemBlocksReady")),
                 "systemRailingReady": summary.get("systemRailingReady", bootstrap_result.get("systemRailingReady")),
                 "airInvariantReady": summary.get("airInvariantReady", bootstrap_result.get("airInvariantReady")),
@@ -2382,6 +3182,8 @@ def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
             summary.setdefault("defaultWorldReady", plain.get("default_world_ready", plain.get("defaultWorldReady")))
             summary.setdefault("blockRegistryReady", plain.get("block_registry_ready", plain.get("blockRegistryReady")))
             summary.setdefault("debugBlocksReady", plain.get("debug_blocks_ready", plain.get("debugBlocksReady")))
+            summary.setdefault("projectAccessReady", plain.get("project_access_ready", plain.get("projectAccessReady")))
+            summary.setdefault("projectOwnerAuthUserId", plain.get("project_owner_auth_user_id", plain.get("projectOwnerAuthUserId")))
             system_readiness = _extract_system_block_readiness(plain)
             for key, value in system_readiness.items():
                 if key != "systemBlocks":
@@ -2410,6 +3212,8 @@ def summarize_bootstrap_result(result: Any) -> dict[str, Any]:
         "defaultWorldReady": data.get("default_world_ready", data.get("defaultWorldReady")),
         "blockRegistryReady": data.get("block_registry_ready", data.get("blockRegistryReady")),
         "debugBlocksReady": data.get("debug_blocks_ready", data.get("debugBlocksReady")),
+        "projectAccessReady": data.get("project_access_ready", data.get("projectAccessReady")),
+        "projectOwnerAuthUserId": data.get("project_owner_auth_user_id", data.get("projectOwnerAuthUserId")),
         **{
             key: value
             for key, value in _extract_system_block_readiness(data).items()
@@ -2467,6 +3271,8 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
                 "systemBlocks": system_status,
             }
         )
+        project_access_status = _build_project_access_status_inner()
+        project_access_ready = _safe_bool(project_access_status.get("ready"), False)
 
         if default_project_ready is None:
             default_project_ready = _nested_bool(invariant_status, ("ready", "project"))
@@ -2475,11 +3281,24 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
         if default_world_ready is None:
             default_world_ready = _nested_bool(invariant_status, ("ready", "world"))
 
+        core_seed_ready = bool(
+            default_project_ready is not False
+            and default_universe_ready is not False
+            and default_world_ready is not False
+            and project_access_ready
+            and system_readiness["systemBlocksReady"]
+            and (
+                not _debug_blocks_required()
+                or status.get("debugBlocksReady") is not False
+            )
+        )
+        if core_seed_ready:
+            seed_ready = True
+
         ok = bool(
             schema_ready
             and seed_ready
-            and default_world_ready is not False
-            and system_readiness["systemBlocksReady"]
+            and core_seed_ready
         )
 
         errors = [] if ok else [
@@ -2506,6 +3325,9 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
             "defaultWorldReady": default_world_ready,
             "blockRegistryReady": status.get("blockRegistryReady"),
             "debugBlocksReady": status.get("debugBlocksReady"),
+            "projectAccessReady": project_access_ready,
+            "projectOwnerAuthUserId": project_access_status.get("ownerAuthUserId"),
+            "projectAccess": project_access_status,
             "systemBlocksReady": system_readiness["systemBlocksReady"],
             "systemRailingReady": system_readiness["systemRailingReady"],
             "airInvariantReady": system_readiness["airInvariantReady"],
@@ -2540,8 +3362,11 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
         schema_audit = _inspect_database_schema_inner()
         system_status = _build_system_block_status_inner()
         system_readiness = _extract_system_block_readiness(system_status)
+        project_access_status = _build_project_access_status_inner()
+        project_access_ready = _safe_bool(project_access_status.get("ready"), False)
         ok = bool(
             schema_audit.get("ok")
+            and project_access_ready
             and system_readiness["systemBlocksReady"]
         )
 
@@ -2572,6 +3397,9 @@ def _check_only_result_inner(app: Any) -> dict[str, Any]:
             "defaultWorldReady": None,
             "blockRegistryReady": None,
             "debugBlocksReady": None,
+            "projectAccessReady": project_access_ready,
+            "projectOwnerAuthUserId": project_access_status.get("ownerAuthUserId"),
+            "projectAccess": project_access_status,
             "systemBlocksReady": system_readiness["systemBlocksReady"],
             "systemRailingReady": system_readiness["systemRailingReady"],
             "airInvariantReady": system_readiness["airInvariantReady"],
@@ -2716,10 +3544,26 @@ def _run_preferred_or_fallback_bootstrap(
                         "systemBlocks": system_status_after,
                     }
                 )
+                project_access_repair_after = _repair_project_access_if_needed_inner(
+                    commit=True,
+                )
+                project_access_after = _to_plain_dict(
+                    project_access_repair_after.get("status")
+                )
+                project_access_ready_after = _safe_bool(
+                    project_access_after.get("ready"),
+                    False,
+                )
+                bootstrap_result["projectAccessRepairFallback"] = project_access_repair_after
                 seed_ready = bool(
                     seed_repair_result.get("ok")
                     and default_world_ready is not False
                     and system_readiness_after["systemBlocksReady"]
+                    and (not _project_access_required() or project_access_ready_after)
+                    and (
+                        not _debug_blocks_required()
+                        or _nested_bool(invariant_after, ("ready", "debugBlocks")) is not False
+                    )
                 )
                 schema_ready = bool(schema_audit_after_seed_repair.get("ok"))
 
@@ -2728,6 +3572,9 @@ def _run_preferred_or_fallback_bootstrap(
                 bootstrap_result["defaultProjectReady"] = default_project_ready
                 bootstrap_result["defaultUniverseReady"] = default_universe_ready
                 bootstrap_result["defaultWorldReady"] = default_world_ready
+                bootstrap_result["projectAccessReady"] = project_access_ready_after
+                bootstrap_result["projectOwnerAuthUserId"] = project_access_after.get("ownerAuthUserId")
+                bootstrap_result["projectAccess"] = project_access_after
                 bootstrap_result["systemBlocksReady"] = system_readiness_after["systemBlocksReady"]
                 bootstrap_result["systemRailingReady"] = system_readiness_after["systemRailingReady"]
                 bootstrap_result["airInvariantReady"] = system_readiness_after["airInvariantReady"]
@@ -2743,6 +3590,7 @@ def _run_preferred_or_fallback_bootstrap(
                     and seed_ready
                     and default_world_ready
                     and system_readiness_after["systemBlocksReady"]
+                    and (not _project_access_required() or project_access_ready_after)
                 ):
                     bootstrap_result["ok"] = True
                     bootstrap_result["status"] = "completed"
@@ -2758,6 +3606,10 @@ def _run_preferred_or_fallback_bootstrap(
                                 or "system" in _safe_str(item.get("code"), "").lower()
                                 or "railing" in _safe_str(item.get("code"), "").lower()
                                 or "air" in _safe_str(item.get("code"), "").lower()
+                                or "access" in _safe_str(item.get("code"), "").lower()
+                                or "owner" in _safe_str(item.get("code"), "").lower()
+                                or "role" in _safe_str(item.get("code"), "").lower()
+                                or "assignment" in _safe_str(item.get("code"), "").lower()
                             )
                         )
                     ]
@@ -2777,7 +3629,7 @@ def _run_preferred_or_fallback_bootstrap(
                             "code": "seed_invariant_repair_fallback_failed",
                             "message": (
                                 "Seed invariant repair fallback did not produce a ready "
-                                "default world and Air/Railing system-block state."
+                                "default world, project access and Air/Railing system-block state."
                             ),
                             "details": {
                                 "seedRepair": seed_repair_result,
@@ -2858,6 +3710,27 @@ def _run_preferred_or_fallback_bootstrap(
             bootstrap_result["systemBlocksMissing"] = final_system_readiness["systemBlocksMissing"]
             bootstrap_result["systemBlocksDrifted"] = final_system_readiness["systemBlocksDrifted"]
             bootstrap_result["systemBlocks"] = final_system_status
+            if effective_seed:
+                final_project_access_repair = _repair_project_access_if_needed_inner(
+                    commit=True,
+                )
+            else:
+                final_project_access_repair = {
+                    "ok": True,
+                    "changed": False,
+                    "status": _build_project_access_status_inner(),
+                }
+            final_project_access = _to_plain_dict(
+                final_project_access_repair.get("status")
+            )
+            final_project_access_ready = _safe_bool(
+                final_project_access.get("ready"),
+                False,
+            )
+            bootstrap_result["projectAccessRepair"] = final_project_access_repair
+            bootstrap_result["projectAccessReady"] = final_project_access_ready
+            bootstrap_result["projectOwnerAuthUserId"] = final_project_access.get("ownerAuthUserId")
+            bootstrap_result["projectAccess"] = final_project_access
 
             if effective_seed and bootstrap_result.get("defaultWorldReady") is False:
                 bootstrap_result.setdefault("errors", []).append(
@@ -2865,6 +3738,16 @@ def _run_preferred_or_fallback_bootstrap(
                         "code": "default_world_not_ready_after_bootstrap",
                         "message": "Default concrete world is not ready after bootstrap.",
                         "details": invariant_status,
+                    }
+                )
+                bootstrap_result["ok"] = False
+
+            if effective_seed and _project_access_required() and not final_project_access_ready:
+                bootstrap_result.setdefault("errors", []).append(
+                    {
+                        "code": "project_access_not_ready_after_bootstrap",
+                        "message": "Default project owner/access projection is not ready after bootstrap.",
+                        "details": final_project_access,
                     }
                 )
                 bootstrap_result["ok"] = False
@@ -2881,6 +3764,21 @@ def _run_preferred_or_fallback_bootstrap(
                     }
                 )
                 bootstrap_result["ok"] = False
+
+            hard_seed_ready = bool(
+                not effective_seed
+                or (
+                    bootstrap_result.get("defaultWorldReady") is not False
+                    and final_system_readiness["systemBlocksReady"]
+                    and (not _project_access_required() or final_project_access_ready)
+                    and (
+                        not _debug_blocks_required()
+                        or _nested_bool(invariant_status, ("ready", "debugBlocks")) is not False
+                    )
+                )
+            )
+            if hard_seed_ready:
+                bootstrap_result["seedReady"] = True
 
             bootstrap_result["summary"] = summarize_bootstrap_result(bootstrap_result)
             return bootstrap_result

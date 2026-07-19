@@ -1,60 +1,45 @@
 # services/vectoplan-chunk/models/__init__.py
 """
-Model registration package for vectoplan-chunk.
+Model registration package for ``vectoplan-chunk``.
 
-This package imports and exposes all SQLAlchemy models used by the chunk
-service. Importing this package should register every model class with the
-Flask-SQLAlchemy metadata so migrations and explicit bootstrap paths can see
-the full schema.
+Importing this package registers every persistent SQLAlchemy model with the
+shared Flask-SQLAlchemy metadata. The module itself remains side-effect free
+with regard to database contents: it does not create tables, run migrations,
+seed data, provision projects or reconcile access.
 
-Current persistent model groups:
+Persistent model groups:
 
     Project / Universe / WorldInstance
+    ProjectAccessAssignment
     ProjectRole / ProjectGroup / ProjectGroupMember / ProjectRoleAssignment
     BlockRegistry / BlockType
     ChunkSnapshot
     WorldCommandLog / ChunkEvent
     WorldObjectInstance / WorldObjectChunkRef
 
-App integration model fields:
+Service-boundary rules:
 
-    Project.external_app_project_id
-    Project.default_universe_id
-    Project.default_world_id
-    Project.spawn_world_id
+- ``vectoplan-app`` owns App projects and project membership.
+- ``vectoplan-chunk`` owns Chunk projects, universes, worlds and the synchronized
+  access projection used for enforcement.
+- ``Project.external_app_project_id`` is an opaque App-project public id, never a
+  foreign key into the App database.
+- Direct access assignments contain only canonical ``auth_user_id`` values.
+- Local AppUser ids, account ids and e-mail addresses are not user identities.
+- Public/API ids are distinct from local database primary keys.
+- Viewer and public-viewer access remains read-only in the service layer.
+- Import order is intentional because migrations and bootstrap code inspect the
+  complete metadata graph.
 
-    Universe.default_world_id
-    Universe.spawn_world_id
-
-    WorldInstance.world_id
-    WorldInstance.template_id
-    WorldInstance.provider_world_id
-    WorldInstance.block_registry_id
-
-Important design rules:
-- import order is intentional,
-- public/API ids are not internal database ids,
-- Project.project_id is the chunk-service public project id,
-- Project.external_app_project_id links to vectoplan-app without DB FK,
-- project access user ids are external strings without cross-service DB FK,
-- access models store future roles/groups but do not authorize requests,
-- Universe.universe_id is unique inside one project,
-- WorldInstance.world_id is unique inside one universe,
-- ChunkSnapshot uniqueness uses internal world_db_id + chunk_x/y/z,
-- ChunkEvent is append-only historical truth,
-- ChunkSnapshot is current load-truth,
-- WorldObjectInstance prepares future multi-block object support.
-
-This package does not:
-- create tables,
-- run migrations,
-- seed data,
-- create default projects,
-- create chunk projects for app projects.
+The package exposes diagnostics for model imports, table/column shape, App
+provisioning readiness, the legacy role/group schema and the canonical access
+projection schema. Missing columns are reported without mutating the database.
 """
+
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import traceback
 from dataclasses import dataclass, field
@@ -62,10 +47,11 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type
 
 
-PACKAGE_NAME = "models"
+PACKAGE_NAME = __name__
 
 MODEL_IMPORT_ORDER: Tuple[str, ...] = (
     "project",
+    "project_access_assignment",
     "project_access",
     "universe",
     "world",
@@ -77,6 +63,7 @@ MODEL_IMPORT_ORDER: Tuple[str, ...] = (
 
 EXPECTED_MODEL_CLASSES: Tuple[str, ...] = (
     "Project",
+    "ProjectAccessAssignment",
     "ProjectRole",
     "ProjectGroup",
     "ProjectGroupMember",
@@ -94,6 +81,7 @@ EXPECTED_MODEL_CLASSES: Tuple[str, ...] = (
 
 MODEL_CLASS_TO_MODULE: Dict[str, str] = {
     "Project": "project",
+    "ProjectAccessAssignment": "project_access_assignment",
     "ProjectRole": "project_access",
     "ProjectGroup": "project_access",
     "ProjectGroupMember": "project_access",
@@ -111,6 +99,7 @@ MODEL_CLASS_TO_MODULE: Dict[str, str] = {
 
 MODEL_CLASS_TO_TABLE: Dict[str, str] = {
     "Project": "projects",
+    "ProjectAccessAssignment": "project_access_assignments",
     "ProjectRole": "project_roles",
     "ProjectGroup": "project_groups",
     "ProjectGroupMember": "project_group_members",
@@ -135,6 +124,7 @@ EXPECTED_MODEL_COLUMNS: Dict[str, Tuple[str, ...]] = {
         "project_id",
         "slug",
         "name",
+        "description",
         "status",
         "schema_version",
         "revision",
@@ -143,14 +133,68 @@ EXPECTED_MODEL_COLUMNS: Dict[str, Tuple[str, ...]] = {
         "spawn_world_id",
         "external_app_project_id",
         "source_service",
+        "external_url",
+        "owner_auth_user_id",
         "owner_type",
         "owner_id",
+        "created_by_auth_user_id",
+        "updated_by_auth_user_id",
         "created_by_user_id",
         "updated_by_user_id",
+        "world_template_requested",
+        "world_template_effective",
+        "world_fallback_used",
+        "world_fallback_code",
+        "earth_reference_fingerprint",
+        "world_metadata_json",
+        "provisioning_status",
+        "provisioning_fingerprint",
+        "provisioning_request_id",
+        "provisioning_correlation_id",
+        "provisioning_error_code",
+        "provisioning_retryable",
+        "provisioning_repair_required",
+        "provisioning_attempts",
+        "provisioned_at",
+        "provisioning_updated_at",
+        "access_sync_status",
+        "access_projection_version",
+        "access_projection_fingerprint",
+        "access_sync_request_id",
+        "access_sync_correlation_id",
+        "access_sync_error_code",
+        "access_sync_retryable",
+        "access_sync_repair_required",
+        "access_sync_attempts",
+        "access_synced_at",
+        "access_sync_updated_at",
         "metadata_json",
         "created_at",
         "updated_at",
+        "archived_at",
         "deleted_at",
+    ),
+    "ProjectAccessAssignment": (
+        "id",
+        "assignment_id",
+        "chunk_project_id",
+        "auth_user_id",
+        "group_id",
+        "role",
+        "assignment_type",
+        "active",
+        "managed",
+        "source_service",
+        "projection_version",
+        "projection_fingerprint",
+        "request_id",
+        "correlation_id",
+        "metadata_json",
+        "schema_version",
+        "revision",
+        "created_at",
+        "updated_at",
+        "deactivated_at",
     ),
     "ProjectRole": (
         "id",
@@ -588,6 +632,8 @@ def reset_model_import_cache() -> None:
     get_model_column_map.cache_clear()
     get_model_relationship_map.cache_clear()
     get_project_access_model_contract.cache_clear()
+    get_project_access_projection_contract.cache_clear()
+    get_legacy_project_access_model_contract.cache_clear()
 
 
 @lru_cache(maxsize=1)
@@ -840,6 +886,9 @@ def get_model_debug_summary() -> Dict[str, Any]:
         },
         "appIntegrationReady": is_app_integration_model_shape_ready(),
         "projectAccessShapeReady": is_project_access_model_shape_ready(),
+        "accessProjectionShapeReady": is_project_access_projection_model_shape_ready(),
+        "legacyProjectAccessShapeReady": is_legacy_project_access_model_shape_ready(),
+        "projectAccessContract": get_project_access_model_contract(),
         "coreWorldShapeReady": is_core_world_model_shape_ready(),
     }
 
@@ -853,20 +902,40 @@ def is_model_column_available(class_name: str, column_name: str) -> bool:
     return str(column_name) in set(columns)
 
 
+def _model_shape_has_columns(
+    class_name: str,
+    required_columns: Sequence[str],
+) -> bool:
+    """Return whether one registered model exposes all requested DB columns."""
+    if not class_name or not required_columns:
+        return False
+
+    available_columns = set(get_model_column_map().get(str(class_name), tuple()))
+    return all(str(column) in available_columns for column in required_columns)
+
+
 def is_app_integration_model_shape_ready() -> bool:
-    """
-    Return whether model classes expose the columns needed by app provisioning.
-    """
+    """Return whether models expose the complete App provisioning contract."""
     required = {
         "Project": (
             "project_id",
             "external_app_project_id",
-            "owner_type",
-            "owner_id",
-            "created_by_user_id",
+            "source_service",
+            "owner_auth_user_id",
+            "created_by_auth_user_id",
             "default_universe_id",
             "default_world_id",
             "spawn_world_id",
+            "world_template_requested",
+            "world_template_effective",
+            "world_fallback_used",
+            "earth_reference_fingerprint",
+            "provisioning_status",
+            "provisioning_fingerprint",
+            "provisioning_repair_required",
+            "access_sync_status",
+            "access_projection_fingerprint",
+            "access_sync_repair_required",
             "metadata_json",
         ),
         "Universe": (
@@ -887,26 +956,55 @@ def is_app_integration_model_shape_ready() -> bool:
         ),
     }
 
-    column_map = get_model_column_map()
-
-    for class_name, required_columns in required.items():
-        available = set(column_map.get(class_name, tuple()))
-        for column in required_columns:
-            if column not in available:
-                return False
-
-    return True
+    return all(
+        _model_shape_has_columns(class_name, required_columns)
+        for class_name, required_columns in required.items()
+    )
 
 
 @lru_cache(maxsize=1)
-def get_project_access_model_contract() -> Dict[str, Any]:
-    """Return the DB-free contract exported by ``models.project_access``.
+def get_project_access_projection_contract() -> Dict[str, Any]:
+    """Return a DB-free contract for the canonical access projection model."""
+    class_name = "ProjectAccessAssignment"
+    model_class = get_model_class(class_name)
+    expected_columns = EXPECTED_MODEL_COLUMNS.get(class_name, tuple())
+    available_columns = _model_columns(model_class)
+    missing_columns = tuple(
+        column for column in expected_columns if column not in set(available_columns)
+    )
 
-    Import and contract failures are converted into diagnostic data so status
-    and bootstrap callers can report the cause without duplicating defensive
-    import logic. Only immutable/schema-derived information is cached; ORM
-    instances and database state are never cached.
-    """
+    module_record = _MODEL_IMPORT_RECORDS.get("project_access_assignment")
+    return {
+        "ok": model_class is not None and not missing_columns,
+        "moduleName": "project_access_assignment",
+        "model": class_name,
+        "models": [class_name] if model_class is not None else [],
+        "table": _model_table_name(model_class),
+        "tables": [
+            table_name
+            for table_name in (_model_table_name(model_class),)
+            if table_name
+        ],
+        "columns": list(available_columns),
+        "expectedColumns": {class_name: list(expected_columns)},
+        "missingExpectedColumns": list(missing_columns),
+        "importError": (
+            module_record.error
+            if module_record is not None and not module_record.imported
+            else None
+        ),
+        "canonicalUserIdField": "auth_user_id",
+        "projectIdField": "chunk_project_id",
+        "roles": ["owner", "admin", "editor", "viewer"],
+        "assignmentTypes": ["direct", "group"],
+        "viewerReadOnly": True,
+        "groupAssignmentsPreserved": True,
+    }
+
+
+@lru_cache(maxsize=1)
+def get_legacy_project_access_model_contract() -> Dict[str, Any]:
+    """Return the legacy role/group model contract without raising on import."""
     module = _MODEL_MODULES.get("project_access")
     if module is None:
         module = _safe_import_model_module("project_access")
@@ -961,25 +1059,86 @@ def get_project_access_model_contract() -> Dict[str, Any]:
     return normalized
 
 
-def is_project_access_model_shape_ready() -> bool:
-    """Return whether all access models expose their critical columns."""
+@lru_cache(maxsize=1)
+def get_project_access_model_contract() -> Dict[str, Any]:
+    """Return the combined canonical and legacy project-access model contract."""
+    projection = get_project_access_projection_contract()
+    legacy = get_legacy_project_access_model_contract()
+
+    models = []
+    tables = []
+    for contract in (projection, legacy):
+        for model_name in contract.get("models", []) or []:
+            if model_name not in models:
+                models.append(model_name)
+        for table_name in contract.get("tables", []) or []:
+            if table_name not in tables:
+                tables.append(table_name)
+
+    expected_columns: Dict[str, Any] = {}
+    for contract in (projection, legacy):
+        candidate = contract.get("expectedColumns", {})
+        if isinstance(candidate, Mapping):
+            expected_columns.update(dict(candidate))
+
+    return {
+        "ok": bool(projection.get("ok")) and bool(legacy.get("ok")),
+        "moduleName": "project_access",
+        "canonicalProjection": projection,
+        "legacyRoleGroups": legacy,
+        "models": models,
+        "tables": tables,
+        "expectedColumns": expected_columns,
+        "canonicalUserIdField": "auth_user_id",
+        "sourceOfTruth": "vectoplan-app",
+        "viewerReadOnly": True,
+    }
+
+
+def is_project_access_projection_model_shape_ready() -> bool:
+    """Return whether the canonical synchronized assignment model is ready."""
+    required = EXPECTED_MODEL_COLUMNS.get("ProjectAccessAssignment", tuple())
+    project_required = (
+        "project_id",
+        "owner_auth_user_id",
+        "access_sync_status",
+        "access_projection_version",
+        "access_projection_fingerprint",
+        "access_sync_repair_required",
+        "access_sync_updated_at",
+    )
+    return (
+        bool(required)
+        and _model_shape_has_columns("ProjectAccessAssignment", required)
+        and _model_shape_has_columns("Project", project_required)
+    )
+
+
+def is_legacy_project_access_model_shape_ready() -> bool:
+    """Return whether the pre-existing role/group schema is registered."""
     required_class_names = (
         "ProjectRole",
         "ProjectGroup",
         "ProjectGroupMember",
         "ProjectRoleAssignment",
     )
-    column_map = get_model_column_map()
 
     for class_name in required_class_names:
         required_columns = EXPECTED_MODEL_COLUMNS.get(class_name, tuple())
-        available_columns = set(column_map.get(class_name, tuple()))
         if not required_columns:
             return False
-        if any(column not in available_columns for column in required_columns):
+        if not _model_shape_has_columns(class_name, required_columns):
             return False
 
     return True
+
+
+def is_project_access_model_shape_ready() -> bool:
+    """Return whether canonical projection and legacy group models are both ready."""
+    return (
+        is_project_access_projection_model_shape_ready()
+        and is_legacy_project_access_model_shape_ready()
+    )
 
 
 def is_core_world_model_shape_ready() -> bool:
@@ -1093,32 +1252,67 @@ def serialize_model_instance(
     include_internal: bool = False,
     include_content: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Serialize one model instance defensively.
-
-    Uses the model's own to_dict() if available.
-    """
+    """Serialize one model instance without leaking private identities by default."""
     if instance is None:
         return {}
 
-    serializer = getattr(instance, "to_dict", None)
-
-    if callable(serializer):
-        try:
-            return serializer(
-                include_internal=include_internal,
-                include_content=include_content,
-            )
-        except TypeError:
+    if not include_internal:
+        public_serializer = getattr(instance, "to_public_dict", None)
+        if callable(public_serializer):
             try:
-                return serializer(include_internal=include_internal)
-            except TypeError:
-                return serializer()
-        except Exception as exc:
-            return {
-                "type": type(instance).__name__,
-                "serializationError": f"{type(exc).__name__}: {exc}",
-            }
+                result = public_serializer()
+                if isinstance(result, Mapping):
+                    return dict(result)
+            except Exception:
+                pass
+
+    serializer = getattr(instance, "to_dict", None)
+    if callable(serializer):
+        attempts = (
+            {
+                "include_internal": include_internal,
+                "include_content": include_content,
+            },
+            {
+                "include_internal": include_internal,
+                "include_private": include_internal,
+                "include_metadata": include_content,
+            },
+            {
+                "include_internal": include_internal,
+                "include_metadata": include_content,
+            },
+            {"include_internal": include_internal},
+            {},
+        )
+
+        last_error: Exception | None = None
+        for kwargs in attempts:
+            try:
+                result = serializer(**kwargs)
+                if isinstance(result, Mapping):
+                    return dict(result)
+                return {
+                    "type": type(instance).__name__,
+                    "serializationError": "model serializer did not return a mapping",
+                }
+            except TypeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                return {
+                    "type": type(instance).__name__,
+                    "serializationError": f"{type(exc).__name__}: {exc}",
+                }
+
+        return {
+            "type": type(instance).__name__,
+            "serializationError": (
+                f"{type(last_error).__name__}: {last_error}"
+                if last_error is not None
+                else "no compatible serializer signature"
+            ),
+        }
 
     return {
         "type": type(instance).__name__,
@@ -1143,28 +1337,80 @@ def serialize_model_instances(
     ]
 
 
-def build_model_identity(instance: Any) -> Dict[str, Any]:
-    """Build compact identity information for one model instance."""
+def _fingerprint_model_identifier(value: Any) -> Optional[str]:
+    """Return a short non-reversible fingerprint for diagnostic identities."""
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def build_model_identity(
+    instance: Any,
+    *,
+    include_internal: bool = False,
+    include_private_identifiers: bool = False,
+) -> Dict[str, Any]:
+    """Build compact diagnostic identity without exposing users by default."""
     if instance is None:
         return {}
 
-    return {
+    result: Dict[str, Any] = {
         "type": type(instance).__name__,
-        "id": getattr(instance, "id", None),
-        "projectId": getattr(instance, "project_id", None),
+        "projectId": getattr(
+            instance,
+            "project_id",
+            getattr(instance, "chunk_project_id", None),
+        ),
         "externalAppProjectId": getattr(instance, "external_app_project_id", None),
         "universeId": getattr(instance, "universe_id", None),
         "worldId": getattr(instance, "world_id", None),
         "roleId": getattr(instance, "role_id", None),
-        "groupId": getattr(instance, "group_id", None),
         "membershipId": getattr(instance, "membership_id", None),
         "assignmentId": getattr(instance, "assignment_id", None),
-        "userId": getattr(instance, "user_id", None),
-        "subjectType": getattr(instance, "subject_type", None),
+        "subjectType": getattr(
+            instance,
+            "assignment_type",
+            getattr(instance, "subject_type", None),
+        ),
         "chunkSnapshotId": getattr(instance, "snapshot_id", None),
         "commandId": getattr(instance, "command_id", None),
         "eventId": getattr(instance, "event_id", None),
         "objectInstanceId": getattr(instance, "object_instance_id", None),
+    }
+
+    auth_user_id = getattr(
+        instance,
+        "auth_user_id",
+        getattr(instance, "user_id", None),
+    )
+    group_id = getattr(instance, "group_id", None)
+    owner_auth_user_id = getattr(instance, "owner_auth_user_id", None)
+
+    if include_private_identifiers:
+        result["authUserId"] = auth_user_id
+        result["groupId"] = group_id
+        result["ownerAuthUserId"] = owner_auth_user_id
+    else:
+        result["authUserFingerprint"] = _fingerprint_model_identifier(auth_user_id)
+        result["groupFingerprint"] = _fingerprint_model_identifier(group_id)
+        result["ownerFingerprint"] = _fingerprint_model_identifier(owner_auth_user_id)
+
+    if include_internal:
+        result["id"] = getattr(instance, "id", None)
+
+    return {
+        key: value
+        for key, value in result.items()
+        if value is not None
     }
 
 
@@ -1177,6 +1423,8 @@ def build_model_schema_report() -> Dict[str, Any]:
         "ready": status.ready,
         "appIntegrationReady": is_app_integration_model_shape_ready(),
         "projectAccessShapeReady": is_project_access_model_shape_ready(),
+        "accessProjectionShapeReady": is_project_access_projection_model_shape_ready(),
+        "legacyProjectAccessShapeReady": is_legacy_project_access_model_shape_ready(),
         "projectAccessContract": get_project_access_model_contract(),
         "coreWorldShapeReady": is_core_world_model_shape_ready(),
         "tableNames": get_model_table_names(),
@@ -1200,6 +1448,7 @@ _collect_model_classes()
 
 # Public class aliases.
 Project = _MODEL_CLASSES.get("Project")
+ProjectAccessAssignment = _MODEL_CLASSES.get("ProjectAccessAssignment")
 ProjectRole = _MODEL_CLASSES.get("ProjectRole")
 ProjectGroup = _MODEL_CLASSES.get("ProjectGroup")
 ProjectGroupMember = _MODEL_CLASSES.get("ProjectGroupMember")
@@ -1226,6 +1475,7 @@ __all__ = [
     "ModelClassRecord",
     "ModelPackageStatus",
     "Project",
+    "ProjectAccessAssignment",
     "ProjectRole",
     "ProjectGroup",
     "ProjectGroupMember",
@@ -1256,7 +1506,11 @@ __all__ = [
     "get_model_debug_summary",
     "is_model_column_available",
     "is_app_integration_model_shape_ready",
+    "get_project_access_projection_contract",
+    "get_legacy_project_access_model_contract",
     "get_project_access_model_contract",
+    "is_project_access_projection_model_shape_ready",
+    "is_legacy_project_access_model_shape_ready",
     "is_project_access_model_shape_ready",
     "is_core_world_model_shape_ready",
     "validate_model_instances",

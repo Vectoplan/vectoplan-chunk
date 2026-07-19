@@ -8,8 +8,8 @@ Responsibilities:
 - seed the default development Project,
 - seed the default development Universe,
 - seed the default editable WorldInstance,
-- persist the temporary default project owner user id,
-- seed the default project roles and owner role assignment,
+- persist the canonical external auth user id for the default project owner,
+- seed/repair the default project roles and owner role assignment,
 - seed the default runtime BlockRegistry,
 - optionally seed the default debug BlockType entries,
 - reconcile built-in system blocks into the runtime BlockRegistry,
@@ -39,9 +39,9 @@ Design rule:
 
 Target default graph:
 
-    Project(project_id="dev-project", owner_user_id="1")
+    Project(project_id="dev-project", owner_user_id="auth_dev_owner")
       -> ProjectRole(owner/admin/editor/viewer)
-      -> ProjectRoleAssignment(owner -> user "1")
+      -> ProjectRoleAssignment(owner -> external auth user "auth_dev_owner")
       -> Universe(universe_id="dev-universe")
           -> WorldInstance(world_id="world_spawn", provider_world_id="flat")
 
@@ -153,12 +153,13 @@ except Exception:  # pragma: no cover - fallback for direct import tests
 # Constants
 # -----------------------------------------------------------------------------
 
-DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v4"
+DEFAULT_SEED_RESULT_VERSION: Final[str] = "default-seed-result.v5"
 
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
 DEFAULT_PROJECT_SLUG: Final[str] = "dev-project"
 DEFAULT_PROJECT_NAME: Final[str] = "Dev Project"
-DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = "1"
+DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = "auth_dev_owner"
+LEGACY_LOCAL_PROJECT_OWNER_USER_IDS: Final[frozenset[str]] = frozenset({"1"})
 DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID: Final[str] = "bootstrap"
 DEFAULT_PROJECT_ROLE_KEYS: Final[tuple[str, ...]] = (
     "owner",
@@ -365,6 +366,38 @@ def _safe_str(value: Any, default: str = "") -> str:
         return default
 
     return result or default
+
+
+def _is_legacy_local_user_identifier(value: Any) -> bool:
+    """
+    Return whether a user id is an obsolete service-local placeholder.
+
+    Cross-service identities must be canonical auth user ids. Bare decimal ids
+    were used by the old development bootstrap and must never be written back
+    into the repaired default graph.
+    """
+    text_value = _safe_str(value, "")
+    if not text_value:
+        return True
+    return (
+        text_value in LEGACY_LOCAL_PROJECT_OWNER_USER_IDS
+        or text_value.isdecimal()
+    )
+
+
+def _normalize_external_auth_user_id(
+    value: Any,
+    default: str = DEFAULT_PROJECT_OWNER_USER_ID,
+) -> str:
+    """Normalize a canonical external auth user id and reject local DB ids."""
+    fallback = _safe_str(default, DEFAULT_PROJECT_OWNER_USER_ID)
+    if _is_legacy_local_user_identifier(fallback):
+        fallback = DEFAULT_PROJECT_OWNER_USER_ID
+
+    normalized = _safe_str(value, "")
+    if _is_legacy_local_user_identifier(normalized):
+        return fallback
+    return normalized
 
 
 def _safe_int(value: Any, default: int = 0, minimum: int | None = None) -> int:
@@ -1039,18 +1072,47 @@ def _empty_project_access_status(
     }
 
 
+def _project_stored_owner_user_id(project: Any) -> str:
+    """Return the canonical external owner id stored on a Project."""
+    if project is None:
+        return ""
+
+    canonical = _safe_str(
+        getattr(project, "owner_auth_user_id", None),
+        "",
+    )
+    if canonical and not _is_legacy_local_user_identifier(canonical):
+        return canonical
+
+    actual_type = _safe_str(
+        getattr(project, "owner_type", None),
+        "",
+    ).lower()
+    legacy_compatible = _safe_str(
+        getattr(project, "owner_id", None),
+        "",
+    )
+    if (
+        actual_type == "user"
+        and legacy_compatible
+        and not _is_legacy_local_user_identifier(legacy_compatible)
+    ):
+        return legacy_compatible
+
+    return ""
+
+
 def _project_owner_ready(project: Any, owner_user_id: Any) -> bool:
-    """Return whether Project itself stores the expected external user owner."""
+    """Return whether Project stores the expected canonical auth user owner."""
     if project is None:
         return False
 
-    expected = _safe_str(owner_user_id, "")
-    if not expected:
-        return False
-
-    actual_type = _safe_str(getattr(project, "owner_type", None), "").lower()
-    actual_id = _safe_str(getattr(project, "owner_id", None), "")
-    return actual_type == "user" and actual_id == expected
+    expected = _normalize_external_auth_user_id(
+        owner_user_id,
+        DEFAULT_PROJECT_OWNER_USER_ID,
+    )
+    actual = _project_stored_owner_user_id(project)
+    return bool(actual and actual == expected)
 
 
 def build_default_project_access_status(
@@ -1060,7 +1122,13 @@ def build_default_project_access_status(
     db_extension: Any = None,
 ) -> dict[str, Any]:
     """Build a read-only status for default roles and the owner assignment."""
-    owner = _safe_str(owner_user_id, DEFAULT_PROJECT_OWNER_USER_ID)
+    owner = (
+        _project_stored_owner_user_id(project)
+        or _normalize_external_auth_user_id(
+            owner_user_id,
+            DEFAULT_PROJECT_OWNER_USER_ID,
+        )
+    )
     if project is None:
         return _empty_project_access_status(
             project=None,
@@ -1210,7 +1278,13 @@ def seed_default_project_access(
     if project is None:
         raise RuntimeError("Default project is required before access seeding.")
 
-    owner = _safe_str(owner_user_id, DEFAULT_PROJECT_OWNER_USER_ID)
+    owner = (
+        _project_stored_owner_user_id(project)
+        or _normalize_external_auth_user_id(
+            owner_user_id,
+            DEFAULT_PROJECT_OWNER_USER_ID,
+        )
+    )
     try:
         api = load_project_access_seed_api()
         initialize = api["ensure_project_access_initialized"]
@@ -2005,14 +2079,19 @@ def _resolve_project_name(world_defaults: Any) -> str:
 
 
 def _resolve_project_owner_user_id(world_defaults: Any) -> str:
-    """Resolve the temporary external owner user id for the default project."""
-    return _safe_str(
+    """Resolve a canonical external auth owner id for the default project."""
+    return _normalize_external_auth_user_id(
         _first_attr(
             world_defaults,
             (
+                "project_owner_auth_user_id",
+                "default_project_owner_auth_user_id",
+                "owner_auth_user_id",
                 "project_owner_user_id",
                 "default_project_owner_user_id",
                 "owner_user_id",
+                "projectOwnerAuthUserId",
+                "ownerAuthUserId",
                 "projectOwnerUserId",
                 "ownerUserId",
             ),
@@ -2020,6 +2099,23 @@ def _resolve_project_owner_user_id(world_defaults: Any) -> str:
         ),
         DEFAULT_PROJECT_OWNER_USER_ID,
     )
+
+
+def _resolve_effective_project_owner_user_id(
+    world_defaults: Any,
+    project: Any = None,
+) -> str:
+    """
+    Resolve the effective canonical owner.
+
+    Existing canonical project state wins over stale bootstrap configuration so
+    a runtime or repair pass can never downgrade an auth identity to the former
+    numeric placeholder.
+    """
+    stored_owner = _project_stored_owner_user_id(project)
+    if stored_owner:
+        return stored_owner
+    return _resolve_project_owner_user_id(world_defaults)
 
 
 def _resolve_universe_id(world_defaults: Any) -> str:
@@ -2086,11 +2182,15 @@ def _fallback_world_defaults(app: Any = None) -> Any:
         project_id = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_ID", DEFAULT_PROJECT_ID), DEFAULT_PROJECT_ID)
         project_slug = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_SLUG", project_id), project_id)
         project_name = _safe_str(_config_get(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECT_NAME", DEFAULT_PROJECT_NAME), DEFAULT_PROJECT_NAME)
-        project_owner_user_id = _safe_str(
+        project_owner_user_id = _normalize_external_auth_user_id(
             _config_get(
                 app,
-                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
-                DEFAULT_PROJECT_OWNER_USER_ID,
+                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+                _config_get(
+                    app,
+                    "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+                    DEFAULT_PROJECT_OWNER_USER_ID,
+                ),
             ),
             DEFAULT_PROJECT_OWNER_USER_ID,
         )
@@ -2423,7 +2523,10 @@ def is_default_seed_complete(
             if project is None:
                 return False
 
-            owner_user_id = _resolve_project_owner_user_id(world_defaults)
+            owner_user_id = _resolve_effective_project_owner_user_id(
+                world_defaults,
+                project,
+            )
             if not _project_owner_ready(project, owner_user_id):
                 return False
 
@@ -2452,7 +2555,7 @@ def is_default_seed_complete(
 # -----------------------------------------------------------------------------
 
 def create_project_object(model_class: Any, world_defaults: Any) -> Any:
-    """Create the default Project with the external placeholder owner user id."""
+    """Create the default Project with a canonical external auth user id."""
     project_id = _resolve_project_id(world_defaults)
     project_slug = _resolve_project_slug(world_defaults)
     project_name = _resolve_project_name(world_defaults)
@@ -2544,11 +2647,14 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
 
 
 def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
-    """Repair default world references and the temporary user owner."""
+    """Repair default world references and preserve the canonical auth owner."""
     changed = False
     universe_id = _resolve_universe_id(world_defaults)
     world_id = _resolve_world_id(world_defaults)
-    owner_user_id = _resolve_project_owner_user_id(world_defaults)
+    owner_user_id = _resolve_effective_project_owner_user_id(
+        world_defaults,
+        project,
+    )
 
     if _call_if_available(
         project,
@@ -2579,9 +2685,21 @@ def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
             overwrite=True,
         ) or changed
 
-    current_owner_type = _safe_str(getattr(project, "owner_type", None), "").lower()
-    current_owner_id = _safe_str(getattr(project, "owner_id", None), "")
-    if current_owner_type != "user" or current_owner_id != owner_user_id:
+    current_owner = _project_stored_owner_user_id(project)
+    current_owner_type = _safe_str(
+        getattr(project, "owner_type", None),
+        "",
+    ).lower()
+    current_owner_id = _safe_str(
+        getattr(project, "owner_id", None),
+        "",
+    )
+
+    if (
+        current_owner != owner_user_id
+        or current_owner_type != "user"
+        or current_owner_id != owner_user_id
+    ):
         if _call_if_available(
             project,
             "set_owner_user",
@@ -2602,6 +2720,27 @@ def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
                 owner_user_id,
                 overwrite=True,
             ) or changed
+
+    # Newer Project models expose the canonical field explicitly. Keep the
+    # compatibility owner_id mirror aligned for older route/service code.
+    changed = _set_attr_if_supported(
+        project,
+        "owner_auth_user_id",
+        owner_user_id,
+        overwrite=True,
+    ) or changed
+    changed = _set_attr_if_supported(
+        project,
+        "owner_type",
+        "user",
+        overwrite=True,
+    ) or changed
+    changed = _set_attr_if_supported(
+        project,
+        "owner_id",
+        owner_user_id,
+        overwrite=True,
+    ) or changed
 
     changed = _set_attr_if_supported(project, "status", "active", overwrite=False) or changed
     changed = _set_attr_if_supported(
@@ -3585,6 +3724,11 @@ def run_default_seed(
                 resolved_seed_project,
             )
         )
+        # A default project without its owner role assignment is not a valid
+        # bootstrap target. Project seeding therefore always implies access
+        # seeding, including repair runs against partially initialized DBs.
+        if resolved_seed_project:
+            resolved_seed_project_access = True
         resolved_seed_on_empty_only = bool(
             seed_on_empty_only
             if seed_on_empty_only is not None
@@ -3708,7 +3852,11 @@ def run_default_seed(
             return _finish_or_raise(app, result, resolved_fail_on_error)
 
         try:
-            result.pre_status = build_default_seed_status(app, db_extension=db_extension)
+            result.pre_status = build_default_seed_status(
+                app,
+                db_extension=db_extension,
+                debug_blocks_required=resolved_seed_blocks,
+            )
         except Exception:
             result.pre_status = {}
 
@@ -3808,11 +3956,23 @@ def run_default_seed(
                     models,
                     resolved_world_defaults,
                 )
+                effective_owner_user_id = (
+                    _resolve_effective_project_owner_user_id(
+                        resolved_world_defaults,
+                        project,
+                    )
+                )
+                result.owner_user_id = effective_owner_user_id
+                defaults_metadata = _safe_dict(
+                    result.metadata.get("defaults")
+                )
+                defaults_metadata["ownerUserId"] = effective_owner_user_id
+                result.metadata["defaults"] = defaults_metadata
                 result.operations.extend(
                     seed_default_project_access(
                         app,
                         project,
-                        result.owner_user_id or DEFAULT_PROJECT_OWNER_USER_ID,
+                        effective_owner_user_id,
                         db_extension=db_extension,
                     )
                 )
@@ -3863,7 +4023,11 @@ def run_default_seed(
 
             _commit_session(db_extension)
 
-            result.post_status = build_default_seed_status(app, db_extension=db_extension)
+            result.post_status = build_default_seed_status(
+                app,
+                db_extension=db_extension,
+                debug_blocks_required=resolved_seed_blocks,
+            )
             _apply_status_to_result(result, result.post_status)
 
             if resolved_seed_project_access and not result.default_project_access_ready:
@@ -4049,8 +4213,12 @@ def _apply_status_to_result(
             (status.get("blockRegistry") or {}).get("exists"),
             False,
         )
+        debug_block_status = _safe_dict(status.get("debugBlocks"))
         result.debug_blocks_ready = _safe_bool(
-            (status.get("debugBlocks") or {}).get("complete"),
+            debug_block_status.get(
+                "ready",
+                debug_block_status.get("complete"),
+            ),
             False,
         )
 
@@ -4195,6 +4363,7 @@ def build_default_seed_status(
     app: Flask,
     *,
     db_extension: Any = None,
+    debug_blocks_required: bool | None = None,
 ) -> dict[str, Any]:
     """Build the complete read-only default seed status."""
     started_at = _utc_now_iso()
@@ -4204,6 +4373,16 @@ def build_default_seed_status(
             models = load_seed_model_classes()
             world_defaults = resolve_world_defaults(app, None)
             block_defaults = resolve_block_defaults(app, None)
+            seed_settings = resolve_seed_settings(app, None)
+
+            resolved_debug_blocks_required = bool(
+                debug_blocks_required
+                if debug_blocks_required is not None
+                else _safe_bool(
+                    getattr(seed_settings, "seed_debug_blocks", False),
+                    False,
+                )
+            )
 
             registry = find_default_block_registry(models, block_defaults)
             project = find_default_project(models, world_defaults)
@@ -4223,6 +4402,9 @@ def build_default_seed_status(
                 registry,
                 block_defaults,
             )
+            debug_blocks_ready = bool(
+                debug_blocks_ok or not resolved_debug_blocks_required
+            )
             system_blocks_status = build_default_system_blocks_status(registry)
             system_blocks_ready = _safe_bool(
                 system_blocks_status.get("ready"),
@@ -4235,7 +4417,10 @@ def build_default_seed_status(
             system_railing_ready = _system_railing_ready(system_blocks_status)
             system_counts = _system_block_status_counts(system_blocks_status)
 
-            owner_user_id = _resolve_project_owner_user_id(world_defaults)
+            owner_user_id = _resolve_effective_project_owner_user_id(
+                world_defaults,
+                project,
+            )
             project_access_status = build_default_project_access_status(
                 project,
                 owner_user_id,
@@ -4252,7 +4437,7 @@ def build_default_seed_status(
             registry_exists = registry is not None
             complete = bool(
                 registry_exists
-                and debug_blocks_ok
+                and debug_blocks_ready
                 and system_blocks_ready
                 and air_invariant_ready
                 and system_railing_ready
@@ -4288,6 +4473,11 @@ def build_default_seed_status(
                 "startedAt": started_at,
                 "completedAt": completed_at,
                 "durationMs": _duration_ms(started_at, completed_at),
+                "requirements": {
+                    "debugBlocksRequired": resolved_debug_blocks_required,
+                    "projectAccessRequired": True,
+                    "systemBlocksRequired": True,
+                },
                 "defaults": {
                     "projectId": project_id,
                     "ownerUserId": owner_user_id,
@@ -4312,7 +4502,7 @@ def build_default_seed_status(
                         else None
                     ),
                     "ownerUserId": (
-                        _safe_str(getattr(project, "owner_id", None), "") or None
+                        _project_stored_owner_user_id(project) or None
                         if project is not None
                         else None
                     ),
@@ -4391,7 +4581,11 @@ def build_default_seed_status(
                     "registryVersion": registry_version,
                     "dbId": _safe_model_id(registry),
                 },
-                "debugBlocks": {"complete": debug_blocks_ok},
+                "debugBlocks": {
+                    "required": resolved_debug_blocks_required,
+                    "complete": debug_blocks_ok,
+                    "ready": debug_blocks_ready,
+                },
                 "systemBlocks": {
                     **system_blocks_status,
                     "summary": {
@@ -4422,7 +4616,7 @@ def build_default_seed_status(
                     "universe": universe_exists,
                     "world": world_exists,
                     "blockRegistry": registry_exists,
-                    "debugBlocks": debug_blocks_ok,
+                    "debugBlocks": debug_blocks_ready,
                     "systemBlocks": system_blocks_ready,
                     "airInvariant": air_invariant_ready,
                     "systemRailing": system_railing_ready,
