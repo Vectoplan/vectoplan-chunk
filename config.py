@@ -32,21 +32,33 @@ Default local/dev seed semantics:
 
 Production/runtime rule:
 
-    Runtime startup is read-only.
-    db.create_all() and default seeding are not part of normal Gunicorn startup.
-    Schema/bootstrap/seeding must run through explicit bootstrap paths.
+    Runtime startup is schema-read-only, not business-read-only.
+    db.create_all(), schema repair, migrations and default seeding are never part of
+    normal Gunicorn startup. Authorized project provisioning, access projection,
+    chunk writes and editor commands remain available through guarded API paths.
 
-Future app integration rule:
+App integration rule:
 
-    vectoplan-app creates the app project.
-    vectoplan-app calls vectoplan-chunk via INTERNAL_URL.
-    vectoplan-chunk creates or returns a chunk project by external app project id.
+    vectoplan-app owns App Projects and project membership.
+    vectoplan-app calls vectoplan-chunk via INTERNAL_URL with a service identity.
+    vectoplan-chunk creates or returns a Chunk Project by external App Project id.
+    App project provisioning requests Earth by default; Flat is a controlled fallback
+    only for explicit Earth-reference business codes. Existing world template types
+    are immutable unless a dedicated migration explicitly allows a change.
     vectoplan-app stores only returned references such as chunk_project_id,
     chunk_universe_id and chunk_world_id.
+
+Access integration rule:
+
+    vectoplan-app is the source of truth for owner/admin/editor/viewer membership.
+    vectoplan-chunk stores and enforces a synchronized direct access projection.
+    Only canonical vectoplan-auth auth_user_id values cross the service boundary.
+    Viewer and public access are strictly read-only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from functools import lru_cache
@@ -154,9 +166,97 @@ DEFAULT_PROVISIONING_SOURCE_SERVICE: Final[str] = "vectoplan-app"
 DEFAULT_PROVISIONING_PROJECT_PREFIX: Final[str] = "chk_prj_"
 DEFAULT_PROVISIONING_UNIVERSE_PREFIX: Final[str] = "chk_uni_"
 DEFAULT_PROVISIONING_WORLD_PREFIX: Final[str] = "chk_wld_"
+DEFAULT_PROJECT_PROVISIONING_TEMPLATE_ID: Final[str] = "earth"
+DEFAULT_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID: Final[str] = "flat"
+DEFAULT_EARTH_CRS_ID: Final[str] = "EPSG:4979"
+DEFAULT_EARTH_HEIGHT: Final[float] = 0.0
+
+DEFAULT_ACCESS_ROLES: Final[tuple[str, ...]] = (
+    "owner",
+    "admin",
+    "editor",
+    "viewer",
+)
+DEFAULT_ACCESS_PROJECTION_VERSION: Final[str] = "app-project-access-v1"
+DEFAULT_CANONICAL_USER_ID_FIELD: Final[str] = "auth_user_id"
+DEFAULT_SERVICE_AUTH_EXEMPT_PATHS: Final[tuple[str, ...]] = (
+    "/",
+    "/health",
+    "/health/live",
+    "/health/ready",
+    "/projects/_status",
+    "/chunks/_status",
+    "/commands/_status",
+)
+DEFAULT_ALLOWED_SERVICE_IDS: Final[tuple[str, ...]] = (
+    "vectoplan-app",
+    "vectoplan-editor",
+    "vectoplan-chunk-init",
+)
+DEFAULT_SERVICE_ID_HEADERS: Final[tuple[str, ...]] = (
+    "X-VECTOPLAN-Service-ID",
+    "X-VECTOPLAN-Service",
+)
+DEFAULT_SERVICE_API_KEY_HEADERS: Final[tuple[str, ...]] = (
+    "Authorization",
+    "X-API-Key",
+    "X-Vectoplan-Internal-Token",
+)
+DEFAULT_PROVISIONING_FALLBACK_ERROR_CODES: Final[tuple[str, ...]] = (
+    "coordinates_unavailable",
+    "earth_reference_missing",
+    "earth_reference_required",
+    "earth_reference_incomplete",
+    "earth_reference_invalid",
+    "earth_reference_not_available",
+    "invalid_earth_reference",
+    "project_coordinates_unavailable",
+    "unsupported_coordinate_reference",
+)
+FORBIDDEN_PROVISIONING_FALLBACK_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "auth_failed",
+        "authentication_failed",
+        "database_error",
+        "dns_error",
+        "forbidden",
+        "http_5xx",
+        "internal_error",
+        "internal_server_error",
+        "network_error",
+        "provider_initialization_failed",
+        "service_unavailable",
+        "timeout",
+        "transport_error",
+        "unauthorized",
+    }
+)
+DEFAULT_VIEWER_ALLOWED_OPERATIONS: Final[tuple[str, ...]] = (
+    "project.read",
+    "world.read",
+    "blocks.read",
+    "chunks.read",
+    "chunks.batch.read",
+)
+DEFAULT_VIEWER_DENIED_OPERATIONS: Final[tuple[str, ...]] = (
+    "commands.execute",
+    "chunks.materialize",
+    "chunks.write",
+    "project.manage",
+    "access.manage",
+    "world.mutate",
+)
+DEFAULT_ROLE_CAPABILITIES: Final[dict[str, tuple[str, ...]]] = {
+    "owner": ("view", "edit", "command", "materialize", "manage", "manage_access", "transfer_owner"),
+    "admin": ("view", "edit", "command", "materialize", "manage", "manage_access"),
+    "editor": ("view", "edit", "command", "materialize"),
+    "viewer": ("view",),
+}
 
 _SAFE_ID_RE: Final[re.Pattern[str]] = re.compile(r"[^a-zA-Z0-9_\-:.]+")
 _MULTI_DASH_RE: Final[re.Pattern[str]] = re.compile(r"-+")
+_HEADER_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+_PATH_TEMPLATE_RE: Final[re.Pattern[str]] = re.compile(r"^/[A-Za-z0-9_./{}:-]*$")
 
 
 # -----------------------------------------------------------------------------
@@ -388,6 +488,196 @@ def _read_float_env_any(
         value = min(maximum, value)
 
     return value
+
+
+def _normalize_csv_item(
+    value: Any,
+    *,
+    lower: bool = False,
+    max_len: int = 256,
+) -> str | None:
+    """Normalize one comma-separated configuration item."""
+    text = _normalize_text(value)
+    if text is None:
+        return None
+
+    try:
+        text = text[: max(1, max_len)]
+        return text.lower() if lower else text
+    except Exception:
+        return None
+
+
+def _parse_csv(
+    value: Any,
+    default: tuple[str, ...] = (),
+    *,
+    lower: bool = False,
+    max_items: int = 256,
+    max_len: int = 256,
+) -> tuple[str, ...]:
+    """Parse a bounded, ordered, duplicate-free comma-separated value."""
+    try:
+        if value is None:
+            raw_items: list[Any] = list(default)
+        elif isinstance(value, str):
+            raw_items = value.replace(";", ",").split(",")
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            raw_items = list(value)
+        else:
+            raw_items = [value]
+
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for raw_item in raw_items[: max(1, max_items)]:
+            item = _normalize_csv_item(raw_item, lower=lower, max_len=max_len)
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+
+        if result:
+            return tuple(result)
+
+        if value is not None:
+            return _parse_csv(
+                None,
+                default,
+                lower=lower,
+                max_items=max_items,
+                max_len=max_len,
+            )
+    except Exception:
+        pass
+
+    return tuple(default)
+
+
+def _read_csv_env(
+    name: str,
+    default: tuple[str, ...] = (),
+    *,
+    lower: bool = False,
+    max_items: int = 256,
+    max_len: int = 256,
+) -> tuple[str, ...]:
+    """Read a bounded comma-separated environment variable."""
+    return _parse_csv(
+        _safe_getenv(name),
+        default,
+        lower=lower,
+        max_items=max_items,
+        max_len=max_len,
+    )
+
+
+def _read_csv_env_any(
+    names: tuple[str, ...],
+    default: tuple[str, ...] = (),
+    *,
+    lower: bool = False,
+    max_items: int = 256,
+    max_len: int = 256,
+) -> tuple[str, ...]:
+    """Read the first configured comma-separated environment variable."""
+    for name in names:
+        raw_value = _normalize_text(_safe_getenv(name))
+        if raw_value is None:
+            continue
+        return _parse_csv(
+            raw_value,
+            default,
+            lower=lower,
+            max_items=max_items,
+            max_len=max_len,
+        )
+
+    return tuple(default)
+
+
+def _normalize_header_name(value: Any, default: str) -> str:
+    """Normalize one HTTP header name without accepting CR/LF or whitespace."""
+    text = _normalize_text(value)
+    if text is None:
+        return default
+
+    try:
+        if len(text) > 128 or not _HEADER_NAME_RE.fullmatch(text):
+            return default
+        return text
+    except Exception:
+        return default
+
+
+def _normalize_path_template(
+    value: Any,
+    default: str,
+    *,
+    required_placeholders: tuple[str, ...] = (),
+) -> str:
+    """Normalize an internal relative route template."""
+    text = _normalize_text(value)
+    candidate = text if text is not None else default
+
+    try:
+        if len(candidate) > 512 or not _PATH_TEMPLATE_RE.fullmatch(candidate):
+            candidate = default
+        if not candidate.startswith("/") or candidate.startswith("//"):
+            candidate = default
+        if any(placeholder not in candidate for placeholder in required_placeholders):
+            candidate = default
+        return candidate
+    except Exception:
+        return default
+
+
+def _secret_fingerprint(value: Any) -> str | None:
+    """Return a short one-way fingerprint suitable for diagnostics."""
+    text = _normalize_text(value)
+    if text is None:
+        return None
+
+    try:
+        return hashlib.sha256(text.encode("utf-8", "strict")).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def _looks_like_development_secret(value: Any) -> bool:
+    """Detect known unsafe placeholder secrets without exposing them."""
+    text = (_normalize_text(value) or "").lower()
+    if not text:
+        return True
+
+    return any(
+        marker in text
+        for marker in (
+            "change-me",
+            "changeme",
+            "dev-secret",
+            "dev-vectoplan",
+            "example-secret",
+            "test-secret",
+        )
+    )
+
+
+def _normalize_role(value: Any, default: str = "viewer") -> str:
+    """Normalize a project role to the canonical four-role contract."""
+    text = (_normalize_text(value) or default).lower().replace("-", "_")
+    aliases = {
+        "read": "viewer",
+        "readonly": "viewer",
+        "read_only": "viewer",
+        "write": "editor",
+        "member": "editor",
+        "manager": "admin",
+        "administrator": "admin",
+        "project_owner": "owner",
+    }
+    role = aliases.get(text, text)
+    return role if role in DEFAULT_ACCESS_ROLES else default
 
 
 def _normalize_mode(value: Any, default: str = "runtime") -> str:
@@ -680,7 +970,6 @@ def _resolve_template_id() -> str:
             (
                 "VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID",
                 "VECTOPLAN_CHUNK_DEFAULT_WORLD_TEMPLATE_ID",
-                "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID",
             ),
             DEFAULT_WORLD_TEMPLATE_ID,
         ),
@@ -893,15 +1182,40 @@ class BaseConfig:
         "gunicorn",
     )
 
+    # Legacy/effective business read-only switch. This is deliberately false
+    # for the normal service runtime: authorized domain writes must remain possible.
     VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = _read_bool_env(
         "VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY",
+        False,
+    )
+
+    # Legacy broad mutation switch retained for existing guards. It now means
+    # domain/API database writes, not schema creation or migration.
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
         True,
     )
 
-    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = _read_bool_env(
-        "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS",
         False,
     )
+
+    VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY",
+        not VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS,
+    )
+
+    _runtime_business_mutations_requested = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED",
+        True,
+    )
+    VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED = bool(
+        _runtime_business_mutations_requested
+        and VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS
+        and not VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY
+    )
+    del _runtime_business_mutations_requested
 
     VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS = _read_bool_env(
         "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS",
@@ -1009,6 +1323,127 @@ class BaseConfig:
     VECTOPLAN_APP_INTERNAL_URL = _read_optional_str_env(
         "VECTOPLAN_APP_INTERNAL_URL",
         None,
+    )
+
+    VECTOPLAN_AUTH_INTERNAL_URL = _read_optional_str_env(
+        "VECTOPLAN_AUTH_INTERNAL_URL",
+        None,
+    )
+
+    VECTOPLAN_AUTH_SERVICE_NAME = _safe_identifier(
+        _read_str_env("VECTOPLAN_AUTH_SERVICE_NAME", "vectoplan-auth"),
+        "vectoplan-auth",
+    )
+
+    # -------------------------------------------------------------------------
+    # Service-to-service authentication and request correlation
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED = _read_bool_env(
+        "VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_API_KEY = _read_optional_str_env_any(
+        (
+            "VECTOPLAN_CHUNK_SERVICE_API_KEY",
+            "VECTOPLAN_CHUNK_INTERNAL_TOKEN",
+            "VECTOPLAN_CHUNK_API_TOKEN",
+        ),
+        "dev-vectoplan-chunk-service-key-change-me",
+    )
+    VECTOPLAN_CHUNK_INTERNAL_TOKEN = VECTOPLAN_CHUNK_SERVICE_API_KEY
+    VECTOPLAN_CHUNK_API_TOKEN = VECTOPLAN_CHUNK_SERVICE_API_KEY
+
+    VECTOPLAN_CHUNK_ALLOWED_SERVICE_IDS = _read_csv_env(
+        "VECTOPLAN_CHUNK_ALLOWED_SERVICE_IDS",
+        DEFAULT_ALLOWED_SERVICE_IDS,
+        lower=True,
+        max_items=32,
+        max_len=120,
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_ID_HEADER = _normalize_header_name(
+        _read_str_env("VECTOPLAN_CHUNK_SERVICE_ID_HEADER", "X-VECTOPLAN-Service-ID"),
+        "X-VECTOPLAN-Service-ID",
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_ID_HEADERS = tuple(
+        _normalize_header_name(item, "")
+        for item in _read_csv_env(
+            "VECTOPLAN_CHUNK_SERVICE_ID_HEADERS",
+            DEFAULT_SERVICE_ID_HEADERS,
+            max_items=16,
+            max_len=128,
+        )
+        if _normalize_header_name(item, "")
+    ) or DEFAULT_SERVICE_ID_HEADERS
+
+    VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADER = _normalize_header_name(
+        _read_str_env("VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADER", "X-API-Key"),
+        "X-API-Key",
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADERS = tuple(
+        _normalize_header_name(item, "")
+        for item in _read_csv_env(
+            "VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADERS",
+            DEFAULT_SERVICE_API_KEY_HEADERS,
+            max_items=16,
+            max_len=128,
+        )
+        if _normalize_header_name(item, "")
+    ) or DEFAULT_SERVICE_API_KEY_HEADERS
+
+    VECTOPLAN_CHUNK_SERVICE_AUTH_EXEMPT_PATHS = tuple(
+        _normalize_path_template(item, "/")
+        for item in _read_csv_env(
+            "VECTOPLAN_CHUNK_SERVICE_AUTH_EXEMPT_PATHS",
+            DEFAULT_SERVICE_AUTH_EXEMPT_PATHS,
+            max_items=64,
+            max_len=256,
+        )
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_AUTH_ALLOW_BEARER = _read_bool_env(
+        "VECTOPLAN_CHUNK_SERVICE_AUTH_ALLOW_BEARER",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_SERVICE_AUTH_MAX_TOKEN_LENGTH = _read_int_env(
+        "VECTOPLAN_CHUNK_SERVICE_AUTH_MAX_TOKEN_LENGTH",
+        default=4096,
+        minimum=32,
+        maximum=16384,
+    )
+
+    VECTOPLAN_CHUNK_IDEMPOTENCY_KEY_HEADER = _normalize_header_name(
+        _read_str_env("VECTOPLAN_CHUNK_IDEMPOTENCY_KEY_HEADER", "Idempotency-Key"),
+        "Idempotency-Key",
+    )
+
+    VECTOPLAN_CHUNK_REQUEST_ID_HEADER = _normalize_header_name(
+        _read_str_env("VECTOPLAN_CHUNK_REQUEST_ID_HEADER", "X-Request-ID"),
+        "X-Request-ID",
+    )
+
+    VECTOPLAN_CHUNK_CORRELATION_ID_HEADER = _normalize_header_name(
+        _read_str_env("VECTOPLAN_CHUNK_CORRELATION_ID_HEADER", "X-Correlation-ID"),
+        "X-Correlation-ID",
+    )
+
+    VECTOPLAN_CHUNK_MAX_IDEMPOTENCY_KEY_LENGTH = _read_int_env(
+        "VECTOPLAN_CHUNK_MAX_IDEMPOTENCY_KEY_LENGTH",
+        default=255,
+        minimum=32,
+        maximum=2048,
+    )
+
+    VECTOPLAN_CHUNK_MAX_REQUEST_ID_LENGTH = _read_int_env(
+        "VECTOPLAN_CHUNK_MAX_REQUEST_ID_LENGTH",
+        default=160,
+        minimum=32,
+        maximum=1024,
     )
 
     # -------------------------------------------------------------------------
@@ -1570,12 +2005,70 @@ class BaseConfig:
         DEFAULT_PROVISIONING_WORLD_PREFIX,
     )
 
+    # Global/bootstrap defaults remain Flat. App-project provisioning is a
+    # separate policy and requests Earth by default.
     VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID = _safe_identifier(
         _read_str_env(
             "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID",
-            VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID,
+            DEFAULT_PROJECT_PROVISIONING_TEMPLATE_ID,
         ),
-        VECTOPLAN_CHUNK_DEFAULT_TEMPLATE_ID,
+        DEFAULT_PROJECT_PROVISIONING_TEMPLATE_ID,
+    ).lower()
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID",
+            DEFAULT_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID,
+        ),
+        DEFAULT_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID,
+    ).lower()
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SUPPORTED_TEMPLATE_IDS = _parse_csv(
+        (
+            VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID,
+            VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID,
+            "earth",
+            "flat",
+        ),
+        ("earth", "flat"),
+        lower=True,
+        max_items=16,
+        max_len=80,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_FALLBACK = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_FALLBACK",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_TEMPLATE_CHANGE = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_TEMPLATE_CHANGE",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_ERROR_CODES = _read_csv_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_ERROR_CODES",
+        DEFAULT_PROVISIONING_FALLBACK_ERROR_CODES,
+        lower=True,
+        max_items=128,
+        max_len=160,
+    )
+
+    VECTOPLAN_CHUNK_EARTH_CRS_ID = _read_str_env(
+        "VECTOPLAN_CHUNK_EARTH_CRS_ID",
+        DEFAULT_EARTH_CRS_ID,
+    ).upper()
+
+    VECTOPLAN_CHUNK_DEFAULT_EARTH_HEIGHT = _read_float_env(
+        "VECTOPLAN_CHUNK_DEFAULT_EARTH_HEIGHT",
+        default=DEFAULT_EARTH_HEIGHT,
+        minimum=-12000.0,
+        maximum=100000.0,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EARTH_REFERENCE = _read_bool_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EARTH_REFERENCE",
+        True,
     )
 
     VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID = (
@@ -1602,11 +2095,183 @@ class BaseConfig:
         True,
     )
 
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_BY_APP_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_BY_APP_PATH",
+            "/projects/by-app/{app_project_public_id}",
+        ),
+        "/projects/by-app/{app_project_public_id}",
+        required_placeholders=("{app_project_public_id}",),
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENSURE_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENSURE_PATH",
+            "/projects/ensure",
+        ),
+        "/projects/ensure",
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PREVIEW_BY_APP_PATH = (
+        _normalize_path_template(
+            _read_str_env(
+                "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PREVIEW_BY_APP_PATH",
+                "/projects/preview/by-app/{app_project_public_id}",
+            ),
+            "/projects/preview/by-app/{app_project_public_id}",
+            required_placeholders=("{app_project_public_id}",),
+        )
+    )
+
     VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES = _read_int_env(
         "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES",
         default=64 * 1024,
         minimum=1024,
         maximum=1024 * 1024,
+    )
+
+    VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_REQUEST_BYTES = _read_int_env(
+        "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_REQUEST_BYTES",
+        default=256 * 1024,
+        minimum=4096,
+        maximum=4 * 1024 * 1024,
+    )
+
+    # -------------------------------------------------------------------------
+    # App-owned project access projection
+    # -------------------------------------------------------------------------
+
+    VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_STRICT_CANONICAL_USER_IDS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_STRICT_CANONICAL_USER_IDS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_CANONICAL_USER_ID_FIELD = _read_str_env(
+        "VECTOPLAN_CHUNK_ACCESS_CANONICAL_USER_ID_FIELD",
+        DEFAULT_CANONICAL_USER_ID_FIELD,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_ALLOWED_ROLES = _read_csv_env(
+        "VECTOPLAN_CHUNK_ACCESS_ALLOWED_ROLES",
+        DEFAULT_ACCESS_ROLES,
+        lower=True,
+        max_items=16,
+        max_len=40,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_VIEWER_READ_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_VIEWER_READ_ONLY",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_ALLOW_PUBLIC_MUTATIONS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_ALLOW_PUBLIC_MUTATIONS",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_ALLOW_IDENTITY_OVERRIDE = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_ALLOW_IDENTITY_OVERRIDE",
+        False,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_PRUNE_STALE_DIRECT_ASSIGNMENTS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_PRUNE_STALE_DIRECT_ASSIGNMENTS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_VERIFY_AFTER_SYNC = _read_bool_env(
+        "VECTOPLAN_CHUNK_ACCESS_VERIFY_AFTER_SYNC",
+        True,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_SOURCE_SERVICE = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_ACCESS_SOURCE_SERVICE",
+            DEFAULT_PROVISIONING_SOURCE_SERVICE,
+        ),
+        DEFAULT_PROVISIONING_SOURCE_SERVICE,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_PROJECTION_VERSION = _safe_identifier(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_ACCESS_PROJECTION_VERSION",
+            DEFAULT_ACCESS_PROJECTION_VERSION,
+        ),
+        DEFAULT_ACCESS_PROJECTION_VERSION,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_MAX_DIRECT_ASSIGNMENTS = _read_int_env(
+        "VECTOPLAN_CHUNK_ACCESS_MAX_DIRECT_ASSIGNMENTS",
+        default=10000,
+        minimum=1,
+        maximum=1000000,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_VIEWER_ALLOWED_OPERATIONS = _read_csv_env(
+        "VECTOPLAN_CHUNK_ACCESS_VIEWER_ALLOWED_OPERATIONS",
+        DEFAULT_VIEWER_ALLOWED_OPERATIONS,
+        lower=True,
+        max_items=64,
+        max_len=120,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_VIEWER_DENIED_OPERATIONS = _read_csv_env(
+        "VECTOPLAN_CHUNK_ACCESS_VIEWER_DENIED_OPERATIONS",
+        DEFAULT_VIEWER_DENIED_OPERATIONS,
+        lower=True,
+        max_items=64,
+        max_len=120,
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_API_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_ACCESS_API_PATH",
+            "/projects/{chunk_project_id}/access",
+        ),
+        "/projects/{chunk_project_id}/access",
+        required_placeholders=("{chunk_project_id}",),
+    )
+
+    VECTOPLAN_CHUNK_ACCESS_INITIALIZE_API_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_ACCESS_INITIALIZE_API_PATH",
+            "/projects/{chunk_project_id}/access/initialize",
+        ),
+        "/projects/{chunk_project_id}/access/initialize",
+        required_placeholders=("{chunk_project_id}",),
+    )
+
+    VECTOPLAN_CHUNK_ASSIGNMENTS_API_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_ASSIGNMENTS_API_PATH",
+            "/projects/{chunk_project_id}/assignments",
+        ),
+        "/projects/{chunk_project_id}/assignments",
+        required_placeholders=("{chunk_project_id}",),
+    )
+
+    VECTOPLAN_CHUNK_TRANSFER_OWNER_API_PATH = _normalize_path_template(
+        _read_str_env(
+            "VECTOPLAN_CHUNK_TRANSFER_OWNER_API_PATH",
+            "/projects/{chunk_project_id}/access/transfer-owner",
+        ),
+        "/projects/{chunk_project_id}/access/transfer-owner",
+        required_placeholders=("{chunk_project_id}",),
     )
 
     # -------------------------------------------------------------------------
@@ -1762,6 +2427,102 @@ class BaseConfig:
         }
 
     @classmethod
+    def get_access_role_capabilities(cls, role: Any) -> tuple[str, ...]:
+        """Return immutable capabilities for one canonical project role."""
+        normalized = _normalize_role(role, "viewer")
+        return tuple(DEFAULT_ROLE_CAPABILITIES.get(normalized, ("view",)))
+
+    @classmethod
+    def build_runtime_policy_config(cls) -> dict[str, Any]:
+        """Build the schema/domain runtime mutation policy."""
+        return {
+            "runtimeIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY,
+            "allowRuntimeDbMutations": cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS,
+            "businessMutationsEnabled": (
+                cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+            ),
+            "schemaIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY,
+            "allowSchemaMutations": (
+                cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS
+            ),
+            "autoCreateAll": cls.VECTOPLAN_CHUNK_AUTO_CREATE_ALL,
+            "autoSeedDefaults": cls.VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS,
+            "bootstrapEnabled": cls.VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED,
+        }
+
+    @classmethod
+    def build_service_auth_config(cls) -> dict[str, Any]:
+        """Build redacted service-authentication diagnostics."""
+        secret = getattr(cls, "VECTOPLAN_CHUNK_SERVICE_API_KEY", None)
+        return {
+            "required": cls.VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED,
+            "configured": bool(_normalize_text(secret)),
+            "credentialFingerprint": _secret_fingerprint(secret),
+            "allowedServiceIds": list(cls.VECTOPLAN_CHUNK_ALLOWED_SERVICE_IDS),
+            "serviceIdHeader": cls.VECTOPLAN_CHUNK_SERVICE_ID_HEADER,
+            "serviceIdHeaders": list(cls.VECTOPLAN_CHUNK_SERVICE_ID_HEADERS),
+            "credentialHeader": cls.VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADER,
+            "credentialHeaders": list(cls.VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADERS),
+            "allowBearer": cls.VECTOPLAN_CHUNK_SERVICE_AUTH_ALLOW_BEARER,
+            "exemptPaths": list(cls.VECTOPLAN_CHUNK_SERVICE_AUTH_EXEMPT_PATHS),
+            "authServiceName": cls.VECTOPLAN_AUTH_SERVICE_NAME,
+            "authInternalUrlConfigured": bool(cls.VECTOPLAN_AUTH_INTERNAL_URL),
+            "requestIdHeader": cls.VECTOPLAN_CHUNK_REQUEST_ID_HEADER,
+            "correlationIdHeader": cls.VECTOPLAN_CHUNK_CORRELATION_ID_HEADER,
+            "idempotencyKeyHeader": cls.VECTOPLAN_CHUNK_IDEMPOTENCY_KEY_HEADER,
+        }
+
+    @classmethod
+    def build_access_control_config(cls) -> dict[str, Any]:
+        """Build the App-owned access projection contract."""
+        return {
+            "enabled": cls.VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED,
+            "defaultDeny": cls.VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY,
+            "strictCanonicalUserIds": (
+                cls.VECTOPLAN_CHUNK_ACCESS_STRICT_CANONICAL_USER_IDS
+            ),
+            "canonicalUserIdField": (
+                cls.VECTOPLAN_CHUNK_ACCESS_CANONICAL_USER_ID_FIELD
+            ),
+            "allowedRoles": list(cls.VECTOPLAN_CHUNK_ACCESS_ALLOWED_ROLES),
+            "roleCapabilities": {
+                role: list(cls.get_access_role_capabilities(role))
+                for role in cls.VECTOPLAN_CHUNK_ACCESS_ALLOWED_ROLES
+            },
+            "viewerReadOnly": cls.VECTOPLAN_CHUNK_ACCESS_VIEWER_READ_ONLY,
+            "viewerAllowedOperations": list(
+                cls.VECTOPLAN_CHUNK_ACCESS_VIEWER_ALLOWED_OPERATIONS
+            ),
+            "viewerDeniedOperations": list(
+                cls.VECTOPLAN_CHUNK_ACCESS_VIEWER_DENIED_OPERATIONS
+            ),
+            "allowPublicMutations": (
+                cls.VECTOPLAN_CHUNK_ACCESS_ALLOW_PUBLIC_MUTATIONS
+            ),
+            "allowIdentityOverride": (
+                cls.VECTOPLAN_CHUNK_ACCESS_ALLOW_IDENTITY_OVERRIDE
+            ),
+            "pruneStaleDirectAssignments": (
+                cls.VECTOPLAN_CHUNK_ACCESS_PRUNE_STALE_DIRECT_ASSIGNMENTS
+            ),
+            "preserveGroupAssignments": (
+                cls.VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS
+            ),
+            "verifyAfterSync": cls.VECTOPLAN_CHUNK_ACCESS_VERIFY_AFTER_SYNC,
+            "sourceService": cls.VECTOPLAN_CHUNK_ACCESS_SOURCE_SERVICE,
+            "projectionVersion": cls.VECTOPLAN_CHUNK_ACCESS_PROJECTION_VERSION,
+            "maxDirectAssignments": (
+                cls.VECTOPLAN_CHUNK_ACCESS_MAX_DIRECT_ASSIGNMENTS
+            ),
+            "paths": {
+                "access": cls.VECTOPLAN_CHUNK_ACCESS_API_PATH,
+                "initialize": cls.VECTOPLAN_CHUNK_ACCESS_INITIALIZE_API_PATH,
+                "assignments": cls.VECTOPLAN_CHUNK_ASSIGNMENTS_API_PATH,
+                "transferOwner": cls.VECTOPLAN_CHUNK_TRANSFER_OWNER_API_PATH,
+            },
+        }
+
+    @classmethod
     def build_database_config(cls) -> dict[str, Any]:
         """Build database config metadata for status/debug output."""
         engine_options = getattr(cls, "SQLALCHEMY_ENGINE_OPTIONS", {}) or {}
@@ -1800,6 +2561,15 @@ class BaseConfig:
             "seedOnEmptyOnly": cls.VECTOPLAN_CHUNK_SEED_ON_EMPTY_ONLY,
             "allowRuntimeDbMutations": cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS,
             "runtimeIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY,
+            "runtimeBusinessMutationsEnabled": (
+                cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+            ),
+            "runtimeSchemaIsReadOnly": (
+                cls.VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY
+            ),
+            "allowRuntimeSchemaMutations": (
+                cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS
+            ),
             "autoCreateAll": cls.VECTOPLAN_CHUNK_AUTO_CREATE_ALL,
             "autoSeedDefaults": cls.VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS,
             "seedDebugBlocks": cls.VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS,
@@ -1891,6 +2661,26 @@ class BaseConfig:
             "defaultTemplateId": (
                 cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID
             ),
+            "fallbackTemplateId": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID
+            ),
+            "supportedTemplateIds": list(
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SUPPORTED_TEMPLATE_IDS
+            ),
+            "allowFallback": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_FALLBACK
+            ),
+            "allowTemplateChange": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_TEMPLATE_CHANGE
+            ),
+            "fallbackErrorCodes": list(
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_ERROR_CODES
+            ),
+            "earthCrsId": cls.VECTOPLAN_CHUNK_EARTH_CRS_ID,
+            "defaultEarthHeight": cls.VECTOPLAN_CHUNK_DEFAULT_EARTH_HEIGHT,
+            "requireEarthReference": (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_REQUIRE_EARTH_REFERENCE
+            ),
             "defaultWorldId": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID,
             "defaultWorldName": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_NAME,
             "defaultUniverseName": (
@@ -1902,7 +2692,15 @@ class BaseConfig:
             "routeEnsureEnabled": (
                 cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ROUTE_ENSURE_ENABLED
             ),
+            "paths": {
+                "byApp": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_BY_APP_PATH,
+                "ensure": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENSURE_PATH,
+                "previewByApp": (
+                    cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PREVIEW_BY_APP_PATH
+                ),
+            },
             "maxMetadataBytes": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_METADATA_BYTES,
+            "maxRequestBytes": cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_MAX_REQUEST_BYTES,
         }
 
     @classmethod
@@ -1937,12 +2735,15 @@ class BaseConfig:
             "runStartupHooks": cls.VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS,
             "runtimeIsReadOnly": cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY,
             "allowRuntimeDbMutations": cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS,
+            "runtimePolicy": cls.build_runtime_policy_config(),
+            "serviceAuthentication": cls.build_service_auth_config(),
             "devRoutesEnabled": cls.VECTOPLAN_CHUNK_ENABLE_DEV_ROUTES,
             "legacyRoutesEnabled": cls.VECTOPLAN_CHUNK_ENABLE_LEGACY_ROUTES,
             "projectScopedApiEnabled": True,
             "database": cls.build_database_config(),
             "worldStateDefaults": cls.build_world_state_defaults(),
             "projectProvisioning": cls.build_project_provisioning_config(),
+            "accessControl": cls.build_access_control_config(),
             "readiness": cls.build_readiness_config(),
         }
 
@@ -2037,13 +2838,57 @@ class BaseConfig:
             if surface_y < min_y or surface_y > max_y:
                 errors.append("VECTOPLAN_CHUNK_DEFAULT_SURFACE_Y must be between MIN_Y and MAX_Y.")
 
-        if cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY and cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS:
+        if (
+            cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY
+            and cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+        ):
             errors.append(
-                "Runtime cannot be both read-only and allow runtime DB mutations. "
-                "Set VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS=false for runtime."
+                "Runtime cannot be business-read-only while business mutations are enabled."
+            )
+
+        if (
+            not cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS
+            and cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+        ):
+            errors.append(
+                "Business mutations require VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS=true."
+            )
+
+        if (
+            cls.VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY
+            and cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS
+        ):
+            errors.append(
+                "Schema cannot be read-only while runtime schema mutations are enabled."
             )
 
         if _is_runtime_mode(startup_mode):
+            if cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS:
+                errors.append(
+                    "Runtime startup must not allow runtime schema mutations."
+                )
+            if not cls.VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY:
+                errors.append(
+                    "Runtime startup must keep the schema read-only."
+                )
+            if cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_TEMPLATE_CHANGE:
+                errors.append(
+                    "Runtime provisioning must not allow silent world-template changes."
+                )
+            if (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED
+                and not cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+            ):
+                errors.append(
+                    "Project provisioning requires runtime business mutations."
+                )
+            if (
+                cls.VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED
+                and not cls.VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED
+            ):
+                errors.append(
+                    "Access projection requires runtime business mutations."
+                )
             if cls.VECTOPLAN_CHUNK_AUTO_CREATE_ALL:
                 errors.append("Runtime startup must not enable VECTOPLAN_CHUNK_AUTO_CREATE_ALL.")
             if cls.VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS:
@@ -2061,9 +2906,33 @@ class BaseConfig:
 
         if _is_bootstrap_mode(startup_mode):
             if cls.VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY:
-                errors.append("Bootstrap mode must not be read-only.")
+                errors.append("Bootstrap mode must not be business-read-only.")
             if not cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS:
                 errors.append("Bootstrap mode must allow DB mutations.")
+            if cls.VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY:
+                errors.append("Bootstrap mode must not keep the schema read-only.")
+            if not cls.VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS:
+                errors.append("Bootstrap mode must allow schema mutations.")
+
+        if cls.VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED:
+            if not _normalize_text(cls.VECTOPLAN_CHUNK_SERVICE_API_KEY):
+                errors.append(
+                    "Service authentication is required but no service API key is configured."
+                )
+            if not cls.VECTOPLAN_CHUNK_ALLOWED_SERVICE_IDS:
+                errors.append("At least one allowed service id must be configured.")
+
+        for header_name in (
+            cls.VECTOPLAN_CHUNK_SERVICE_ID_HEADER,
+            cls.VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADER,
+            cls.VECTOPLAN_CHUNK_IDEMPOTENCY_KEY_HEADER,
+            cls.VECTOPLAN_CHUNK_REQUEST_ID_HEADER,
+            cls.VECTOPLAN_CHUNK_CORRELATION_ID_HEADER,
+            *cls.VECTOPLAN_CHUNK_SERVICE_ID_HEADERS,
+            *cls.VECTOPLAN_CHUNK_SERVICE_API_KEY_HEADERS,
+        ):
+            if not isinstance(header_name, str) or not _HEADER_NAME_RE.fullmatch(header_name):
+                errors.append(f"Invalid HTTP header name: {header_name!r}.")
 
         if cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENABLED:
             if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PROJECT_ID_PREFIX:
@@ -2077,6 +2946,62 @@ class BaseConfig:
             if not cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID:
                 errors.append("Provisioning default world id must not be empty.")
 
+            default_template = (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_TEMPLATE_ID
+            )
+            fallback_template = (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID
+            )
+            supported_templates = set(
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_SUPPORTED_TEMPLATE_IDS
+            )
+
+            if default_template not in supported_templates:
+                errors.append("Provisioning default template must be supported.")
+            if fallback_template not in supported_templates:
+                errors.append("Provisioning fallback template must be supported.")
+            if (
+                cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ALLOW_FALLBACK
+                and default_template == fallback_template
+            ):
+                errors.append(
+                    "Provisioning fallback template must differ from the default template."
+                )
+            if default_template == "earth" and not cls.VECTOPLAN_CHUNK_EARTH_CRS_ID:
+                errors.append("Earth provisioning requires VECTOPLAN_CHUNK_EARTH_CRS_ID.")
+
+            unsafe_fallback_codes = (
+                set(cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_FALLBACK_ERROR_CODES)
+                & FORBIDDEN_PROVISIONING_FALLBACK_ERROR_CODES
+            )
+            if unsafe_fallback_codes:
+                errors.append(
+                    "Fallback error codes must not include transport/auth/database/5xx errors: "
+                    + ", ".join(sorted(unsafe_fallback_codes))
+                )
+
+            for path_name, route_template, placeholders in (
+                (
+                    "provisioning by-app path",
+                    cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_BY_APP_PATH,
+                    ("{app_project_public_id}",),
+                ),
+                (
+                    "provisioning ensure path",
+                    cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_ENSURE_PATH,
+                    (),
+                ),
+                (
+                    "provisioning preview path",
+                    cls.VECTOPLAN_CHUNK_PROJECT_PROVISIONING_PREVIEW_BY_APP_PATH,
+                    ("{app_project_public_id}",),
+                ),
+            ):
+                if not isinstance(route_template, str) or not route_template.startswith("/"):
+                    errors.append(f"{path_name} must be a relative absolute path.")
+                elif any(item not in route_template for item in placeholders):
+                    errors.append(f"{path_name} is missing a required placeholder.")
+
         provisioning_world_id = getattr(
             cls,
             "VECTOPLAN_CHUNK_PROJECT_PROVISIONING_DEFAULT_WORLD_ID",
@@ -2087,6 +3012,71 @@ class BaseConfig:
                 errors.append(
                     "Provisioning default world id looks like a provider/template id. "
                     "Use world_spawn or a concrete project world id."
+                )
+
+        if cls.VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED:
+            allowed_roles = tuple(cls.VECTOPLAN_CHUNK_ACCESS_ALLOWED_ROLES)
+            unknown_roles = set(allowed_roles) - set(DEFAULT_ACCESS_ROLES)
+            missing_roles = set(DEFAULT_ACCESS_ROLES) - set(allowed_roles)
+
+            if unknown_roles:
+                errors.append(
+                    "Unknown access roles configured: "
+                    + ", ".join(sorted(unknown_roles))
+                )
+            if missing_roles:
+                errors.append(
+                    "Required access roles are missing: "
+                    + ", ".join(sorted(missing_roles))
+                )
+            if not cls.VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY:
+                errors.append("Chunk access control must use default-deny semantics.")
+            if not cls.VECTOPLAN_CHUNK_ACCESS_VIEWER_READ_ONLY:
+                errors.append("Viewer role must remain read-only.")
+            if cls.VECTOPLAN_CHUNK_ACCESS_ALLOW_PUBLIC_MUTATIONS:
+                errors.append("Public Chunk mutations must remain disabled.")
+            if cls.VECTOPLAN_CHUNK_ACCESS_ALLOW_IDENTITY_OVERRIDE:
+                errors.append("Client identity override must remain disabled.")
+            if (
+                cls.VECTOPLAN_CHUNK_ACCESS_STRICT_CANONICAL_USER_IDS
+                and cls.VECTOPLAN_CHUNK_ACCESS_CANONICAL_USER_ID_FIELD
+                != DEFAULT_CANONICAL_USER_ID_FIELD
+            ):
+                errors.append(
+                    "Strict access control must use the canonical auth_user_id field."
+                )
+            if not cls.VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS:
+                errors.append("Access reconciliation must preserve group assignments.")
+
+            for path_name, route_template in (
+                ("access path", cls.VECTOPLAN_CHUNK_ACCESS_API_PATH),
+                ("access initialize path", cls.VECTOPLAN_CHUNK_ACCESS_INITIALIZE_API_PATH),
+                ("assignments path", cls.VECTOPLAN_CHUNK_ASSIGNMENTS_API_PATH),
+                ("owner transfer path", cls.VECTOPLAN_CHUNK_TRANSFER_OWNER_API_PATH),
+            ):
+                if (
+                    not isinstance(route_template, str)
+                    or not route_template.startswith("/")
+                    or "{chunk_project_id}" not in route_template
+                ):
+                    errors.append(
+                        f"{path_name} must be a relative path containing "
+                        "{chunk_project_id}."
+                    )
+
+        if cls.APP_ENV == "production":
+            if not cls.VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED:
+                errors.append("Production must require service-to-service authentication.")
+            if not cls.VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED:
+                errors.append("Production must enable Chunk project access control.")
+            if _looks_like_development_secret(cls.SECRET_KEY):
+                errors.append("Production SECRET_KEY must not use a development placeholder.")
+            if (
+                cls.VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED
+                and _looks_like_development_secret(cls.VECTOPLAN_CHUNK_SERVICE_API_KEY)
+            ):
+                errors.append(
+                    "Production service API key must not use a development placeholder."
                 )
 
         route_path = getattr(cls, "EDITOR_ROUTE_PATH", None)
@@ -2201,6 +3191,9 @@ class BootstrapConfig(BaseConfig):
     VECTOPLAN_CHUNK_RUN_MODE = "db-bootstrap"
     VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = False
     VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = True
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS = True
+    VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY = False
+    VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED = True
     VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS = _read_bool_env(
         "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS",
         False,
@@ -2296,6 +3289,9 @@ class TestingConfig(BaseConfig):
     VECTOPLAN_CHUNK_STARTUP_MODE = "testing"
     VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = False
     VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = True
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS = True
+    VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY = False
+    VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED = True
 
     VECTOPLAN_CHUNK_AUTO_CREATE_ALL = _read_bool_env(
         "VECTOPLAN_CHUNK_TEST_AUTO_CREATE_ALL",
@@ -2346,8 +3342,28 @@ class ProductionConfig(BaseConfig):
     VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS = False
     VECTOPLAN_CHUNK_BOOTSTRAP_REQUIRE_PROVIDER_WORLDS = True
 
-    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = True
-    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = False
+    # Production is schema-read-only but accepts authorized domain writes. The
+    # legacy read-only switch may still disable all business writes explicitly.
+    VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY",
+        False,
+    )
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS = _read_bool_env(
+        "VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS",
+        True,
+    )
+    VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS = False
+    VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY = True
+    _production_business_mutations_requested = _read_bool_env(
+        "VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED",
+        True,
+    )
+    VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED = bool(
+        _production_business_mutations_requested
+        and VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS
+        and not VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY
+    )
+    del _production_business_mutations_requested
     VECTOPLAN_CHUNK_AUTO_CREATE_ALL = False
     VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS = False
     VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS = False
@@ -2453,6 +3469,22 @@ __all__ = [
     "DEFAULT_PROVISIONING_PROJECT_PREFIX",
     "DEFAULT_PROVISIONING_UNIVERSE_PREFIX",
     "DEFAULT_PROVISIONING_WORLD_PREFIX",
+    "DEFAULT_PROJECT_PROVISIONING_TEMPLATE_ID",
+    "DEFAULT_PROJECT_PROVISIONING_FALLBACK_TEMPLATE_ID",
+    "DEFAULT_EARTH_CRS_ID",
+    "DEFAULT_EARTH_HEIGHT",
+    "DEFAULT_ACCESS_ROLES",
+    "DEFAULT_ACCESS_PROJECTION_VERSION",
+    "DEFAULT_CANONICAL_USER_ID_FIELD",
+    "DEFAULT_SERVICE_AUTH_EXEMPT_PATHS",
+    "DEFAULT_ALLOWED_SERVICE_IDS",
+    "DEFAULT_SERVICE_ID_HEADERS",
+    "DEFAULT_SERVICE_API_KEY_HEADERS",
+    "DEFAULT_PROVISIONING_FALLBACK_ERROR_CODES",
+    "FORBIDDEN_PROVISIONING_FALLBACK_ERROR_CODES",
+    "DEFAULT_VIEWER_ALLOWED_OPERATIONS",
+    "DEFAULT_VIEWER_DENIED_OPERATIONS",
+    "DEFAULT_ROLE_CAPABILITIES",
     "BaseConfig",
     "Config",
     "DevelopmentConfig",

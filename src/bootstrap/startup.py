@@ -11,7 +11,8 @@ Responsibilities:
 - verify important service paths/files/routes through runtime_checks.py,
 - verify model registry availability without loading product data,
 - optionally perform a cheap DB connectivity check,
-- store read-only schema, project-owner and project-access readiness,
+- merge runtime checks with read-only DB-bootstrap readiness,
+- store canonical and legacy project-access readiness without raw user ids,
 - verify the centrally registered project-access route surface,
 - store compact settings/runtime-check/readiness summaries,
 - expose compatibility helpers for existing status routes.
@@ -47,13 +48,19 @@ This prevents Gunicorn worker startup from running DB mutations in parallel.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Final, Mapping
 
-from flask import Flask
+try:
+    from flask import Flask
+except Exception:  # pragma: no cover - partial import/test environments
+    class Flask:  # type: ignore[no-redef]
+        """Minimal typing/runtime placeholder when Flask is unavailable."""
 
 try:
     from extensions import (
@@ -98,6 +105,11 @@ except Exception:  # pragma: no cover - fallback for direct imports
         return _safe_bool(_safe_get_config(app, "VECTOPLAN_CHUNK_RUN_STARTUP_HOOKS", True), True)
 
 try:
+    from .db_bootstrap import build_db_bootstrap_status
+except Exception:  # pragma: no cover - partial import/test environments
+    build_db_bootstrap_status = None  # type: ignore[assignment]
+
+try:
     from .runtime_checks import (
         FileCheckSpec,
         PathCheckSpec,
@@ -138,11 +150,13 @@ except Exception:  # pragma: no cover - fallback if runtime_checks is temporaril
 CHUNK_NAMESPACE: Final[str] = "vectoplan_chunk"
 LEGACY_EDITOR_NAMESPACE: Final[str] = "vectoplan_editor"
 STARTUP_STATE_KEY: Final[str] = "startup"
-STARTUP_STATE_VERSION: Final[str] = "startup-state.v2"
-STARTUP_CONTRACT_VERSION: Final[str] = "runtime-startup.v2"
+STARTUP_STATE_VERSION: Final[str] = "startup-state.v3"
+STARTUP_CONTRACT_VERSION: Final[str] = "runtime-startup.v3"
 
 DEFAULT_SERVICE_NAME: Final[str] = "vectoplan-chunk"
 DEFAULT_DISPLAY_NAME: Final[str] = "VECTOPLAN Chunk Service"
+DEFAULT_ACCESS_SOURCE_SERVICE: Final[str] = "vectoplan-app"
+DEFAULT_CANONICAL_USER_ID_FIELD: Final[str] = "auth_user_id"
 
 STATUS_IDLE: Final[str] = "idle"
 STATUS_RUNNING: Final[str] = "running"
@@ -155,6 +169,9 @@ _TRUE_VALUES: Final[set[str]] = {"1", "true", "t", "yes", "y", "on", "enabled"}
 _FALSE_VALUES: Final[set[str]] = {"0", "false", "f", "no", "n", "off", "disabled"}
 
 PROJECT_ACCESS_BLUEPRINT_NAME: Final[str] = "project_access"
+
+# Retained compatibility surface. New deployments may additionally expose the
+# canonical assignment and owner-transfer routes below.
 PROJECT_ACCESS_CORE_ROUTE_RULES: Final[tuple[str, ...]] = (
     "/project-access/_status",
     "/projects/<project_id>/access",
@@ -162,6 +179,43 @@ PROJECT_ACCESS_CORE_ROUTE_RULES: Final[tuple[str, ...]] = (
     "/projects/<project_id>/roles",
     "/projects/<project_id>/groups",
     "/projects/<project_id>/assignments",
+)
+
+PROJECT_ACCESS_CANONICAL_ROUTE_RULES: Final[tuple[str, ...]] = (
+    "/project-access/_status",
+    "/projects/<project_id>/access",
+    "/projects/<project_id>/access/initialize",
+    "/projects/<project_id>/access/assignments",
+    "/projects/<project_id>/access/transfer-owner",
+)
+
+PROJECT_ACCESS_LEGACY_ROUTE_RULES: Final[tuple[str, ...]] = (
+    "/project-access/_status",
+    "/projects/<project_id>/access",
+    "/projects/<project_id>/access/initialize",
+    "/projects/<project_id>/roles",
+    "/projects/<project_id>/groups",
+    "/projects/<project_id>/assignments",
+)
+
+PROJECT_ACCESS_REQUIRED_ROUTE_GROUPS: Final[
+    tuple[tuple[str, tuple[str, ...]], ...]
+] = (
+    ("status", ("/project-access/_status",)),
+    ("access", ("/projects/<project_id>/access",)),
+    ("initialize", ("/projects/<project_id>/access/initialize",)),
+    (
+        "assignments",
+        (
+            "/projects/<project_id>/access/assignments",
+            "/projects/<project_id>/assignments",
+        ),
+    ),
+)
+
+PROJECT_ACCESS_OWNER_TRANSFER_ROUTE_RULES: Final[tuple[str, ...]] = (
+    "/projects/<project_id>/access/transfer-owner",
+    "/projects/<project_id>/transfer-owner",
 )
 
 
@@ -343,14 +397,40 @@ def _safe_int(
     return result
 
 
+def _sanitize_message_text(value: Any) -> str:
+    """Redact common credentials from free-form diagnostic messages."""
+    text = _safe_str(value, "")
+    if not text:
+        return ""
+
+    patterns = (
+        (
+            r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s/@]+@",
+            r"\1***@",
+        ),
+        (r"(?i)\bBearer\s+[^\s,;]+", "Bearer <redacted>"),
+        (
+            r"(?i)\b(api[_-]?key|token|password|secret|credential)"
+            r"(\s*[:=]\s*)[^\s,;]+",
+            r"\1\2<redacted>",
+        ),
+    )
+    for pattern, replacement in patterns:
+        try:
+            text = re.sub(pattern, replacement, text)
+        except Exception:
+            continue
+    return text[:2000]
+
+
 def _safe_exception_message(exc: BaseException | Any) -> str:
-    """Return robust exception message."""
+    """Return a robust, credential-redacted exception message."""
     try:
         message = str(exc)
     except Exception:
         message = exc.__class__.__name__
 
-    return message or exc.__class__.__name__
+    return _sanitize_message_text(message) or exc.__class__.__name__
 
 
 def _safe_deepcopy(value: Any) -> Any:
@@ -403,6 +483,642 @@ def _safe_optional_bool(value: Any) -> bool | None:
     return _safe_bool(value, False)
 
 
+def _first_mapping_value(
+    payload: Mapping[str, Any] | None,
+    *names: str,
+    default: Any = None,
+) -> Any:
+    """Return the first explicitly present mapping value."""
+    mapping = _safe_dict(payload)
+    for name in names:
+        try:
+            if name in mapping:
+                return mapping.get(name)
+        except Exception:
+            continue
+    return default
+
+
+def _identity_fingerprint(value: Any) -> str | None:
+    """Return a stable non-reversible identity fingerprint for public diagnostics."""
+    text = _safe_str(value, "")
+    if not text:
+        return None
+    try:
+        digest = hashlib.sha256(text.encode("utf-8", errors="strict")).hexdigest()
+    except Exception:
+        return None
+    return f"sha256:{digest[:16]}"
+
+
+def _is_canonical_auth_user_id(value: Any) -> bool:
+    """Reject local numeric ids, e-mail addresses and placeholder identities."""
+    text = _safe_str(value, "")
+    if not text or len(text) > 256:
+        return False
+    if text.isdecimal() or "@" in text or "://" in text:
+        return False
+    if any(character.isspace() or ord(character) < 32 for character in text):
+        return False
+    if text.lower() in {
+        "1",
+        "0",
+        "bootstrap",
+        "system",
+        "anonymous",
+        "guest",
+        "none",
+        "null",
+        "unknown",
+    }:
+        return False
+    return True
+
+
+def _private_identifiers_enabled(app: Any) -> bool:
+    """Allow raw identifiers only behind an explicit diagnostic opt-in."""
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_STARTUP_INCLUDE_PRIVATE_IDENTIFIERS",
+            False,
+        ),
+        False,
+    )
+
+
+def _project_access_required(app: Any) -> bool:
+    """Return whether the synchronized project-access projection is mandatory."""
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_PROJECT_ACCESS_REQUIRED",
+            _safe_config_or_env(
+                app,
+                "VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED",
+                True,
+            ),
+        ),
+        True,
+    )
+
+
+def _access_authz_enforcement_required(app: Any) -> bool:
+    """Require route-level project authorization only after explicit rollout."""
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_AUTHZ_ENFORCEMENT",
+            False,
+        ),
+        False,
+    )
+
+
+def _bootstrap_readiness_required(app: Any) -> bool:
+    """Return whether runtime startup must require explicit bootstrap readiness."""
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_STARTUP_REQUIRE_BOOTSTRAP_READINESS",
+            True,
+        ),
+        True,
+    )
+
+
+def _debug_blocks_required(app: Any) -> bool:
+    """Require debug blocks only when explicitly configured as a runtime invariant."""
+    explicit = _safe_config_or_env(
+        app,
+        "VECTOPLAN_CHUNK_REQUIRE_DEBUG_BLOCKS",
+        None,
+    )
+    if explicit is not None:
+        return _safe_bool(explicit, False)
+
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+            _safe_config_or_env(
+                app,
+                "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+                False,
+            ),
+        ),
+        False,
+    )
+
+
+def _owner_transfer_route_required(app: Any) -> bool:
+    """Require the dedicated owner-transfer route only after explicit rollout."""
+    return _safe_bool(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_REQUIRE_PROJECT_OWNER_TRANSFER_ROUTE",
+            False,
+        ),
+        False,
+    )
+
+
+def _normalize_api_prefix(app: Any) -> str:
+    """Normalize an optional API prefix used by route-surface checks."""
+    prefix = _safe_str(
+        _safe_config_or_env(app, "VECTOPLAN_CHUNK_API_PREFIX", ""),
+        "",
+    )
+    if not prefix or prefix == "/":
+        return ""
+    return "/" + prefix.strip("/")
+
+
+def _normalize_route_template(rule: Any) -> str:
+    """Normalize Flask converter syntax and trailing slashes for comparison."""
+    text = "/" + _safe_str(rule, "").lstrip("/")
+    try:
+        text = re.sub(r"<[^:<>]+:([^<>]+)>", r"<\1>", text)
+    except Exception:
+        pass
+    if len(text) > 1:
+        text = text.rstrip("/")
+    return text
+
+
+def _route_variants(app: Any, rule: str) -> tuple[str, ...]:
+    """Return unprefixed and configured-prefix variants for a Flask rule."""
+    normalized_rule = _normalize_route_template(rule)
+    prefix = _normalize_api_prefix(app)
+    variants = [normalized_rule]
+    if prefix:
+        variants.append(prefix + normalized_rule)
+    return tuple(dict.fromkeys(variants))
+
+
+def _route_registered(app: Any, rule_set: set[str], rule: str) -> bool:
+    """Return whether any accepted variant of a route is registered."""
+    return any(candidate in rule_set for candidate in _route_variants(app, rule))
+
+
+def _normalize_project_access_status(
+    app: Any,
+    payload: Mapping[str, Any] | None,
+    bootstrap_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize legacy and canonical access status without exposing raw identities."""
+    merged: dict[str, Any] = {}
+
+    bootstrap = _safe_dict(bootstrap_status)
+    bootstrap_access = _safe_dict(bootstrap.get("projectAccess"))
+    merged.update(bootstrap_access)
+
+    source = _safe_dict(payload)
+    merged.update(source)
+
+    owner_value = _first_mapping_value(
+        merged,
+        "ownerAuthUserId",
+        "projectOwnerAuthUserId",
+        "ownerUserId",
+        "owner_user_id",
+        default=_first_mapping_value(
+            bootstrap,
+            "projectOwnerAuthUserId",
+            "ownerAuthUserId",
+            "ownerUserId",
+        ),
+    )
+
+    owner_ready = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "projectOwnerReady",
+            "ownerReady",
+            "defaultProjectOwnerReady",
+            default=_first_mapping_value(bootstrap, "projectOwnerReady"),
+        )
+    )
+    canonical_ready = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "canonicalProjectAccessReady",
+            "canonicalReady",
+            "projectionReady",
+            default=_first_mapping_value(
+                bootstrap,
+                "canonicalProjectAccessReady",
+            ),
+        )
+    )
+    legacy_ready = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "legacyProjectAccessReady",
+            "legacyReady",
+            default=_first_mapping_value(
+                bootstrap,
+                "legacyProjectAccessReady",
+            ),
+        )
+    )
+    roles_ready = _safe_optional_bool(
+        _first_mapping_value(merged, "rolesReady", "projectRolesReady")
+    )
+    owner_assignment_ready = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "ownerAssignmentReady",
+            "projectOwnerAssignmentReady",
+        )
+    )
+    if (
+        owner_assignment_ready is None
+        and canonical_ready is not None
+        and legacy_ready is not None
+    ):
+        owner_assignment_ready = bool(canonical_ready and legacy_ready)
+
+    explicit_ready = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "projectAccessReady",
+            "accessReady",
+            "ready",
+            "ok",
+            default=_first_mapping_value(bootstrap, "projectAccessReady"),
+        )
+    )
+
+    if explicit_ready is None:
+        required_parts = [
+            value
+            for value in (
+                owner_ready,
+                canonical_ready,
+                legacy_ready,
+                roles_ready,
+                owner_assignment_ready,
+            )
+            if value is not None
+        ]
+        access_ready = all(required_parts) if required_parts else None
+    else:
+        access_ready = explicit_ready
+
+    expected_source = _safe_str(
+        _safe_config_or_env(
+            app,
+            "VECTOPLAN_CHUNK_PROJECT_ACCESS_SOURCE_SERVICE",
+            DEFAULT_ACCESS_SOURCE_SERVICE,
+        ),
+        DEFAULT_ACCESS_SOURCE_SERVICE,
+    ).lower()
+    actual_source = _safe_str(
+        _first_mapping_value(
+            merged,
+            "sourceOfTruth",
+            "sourceService",
+            "source_service",
+            default=expected_source,
+        ),
+        expected_source,
+    ).lower()
+    source_ready = actual_source == expected_source
+
+    viewer_read_only = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "viewerReadOnly",
+            "viewer_read_only",
+        )
+    )
+    authz_enforced = _safe_optional_bool(
+        _first_mapping_value(
+            merged,
+            "authzEnforced",
+            "authorizationEnforced",
+            "enforced",
+        )
+    )
+
+    counts = _safe_dict(merged.get("counts"))
+    canonical_assignment_count = _safe_int(
+        _first_mapping_value(
+            merged,
+            "projectAccessAssignmentCount",
+            "canonicalAssignmentCount",
+            default=_first_mapping_value(
+                counts,
+                "canonicalAssignments",
+                "assignments",
+                default=_first_mapping_value(
+                    bootstrap,
+                    "projectAccessAssignmentCount",
+                    default=0,
+                ),
+            ),
+        ),
+        0,
+        minimum=0,
+    )
+    legacy_role_count = _safe_int(
+        _first_mapping_value(
+            merged,
+            "projectAccessRoleCount",
+            "legacyRoleCount",
+            default=_first_mapping_value(
+                counts,
+                "legacyRoles",
+                "roles",
+                default=_first_mapping_value(
+                    bootstrap,
+                    "projectAccessRoleCount",
+                    default=0,
+                ),
+            ),
+        ),
+        0,
+        minimum=0,
+    )
+
+    owner_fingerprint = _identity_fingerprint(owner_value)
+    expose_private = _private_identifiers_enabled(app)
+
+    checked = _safe_bool(
+        _first_mapping_value(
+            merged,
+            "checked",
+            default=bool(source or bootstrap_access or bootstrap),
+        ),
+        bool(source or bootstrap_access or bootstrap),
+    )
+    if viewer_read_only is None and checked:
+        viewer_read_only = _safe_bool(
+            _safe_config_or_env(
+                app,
+                "VECTOPLAN_CHUNK_VIEWER_READ_ONLY",
+                True,
+            ),
+            True,
+        )
+    if authz_enforced is None and checked:
+        authz_enforced = _safe_optional_bool(
+            _safe_config_or_env(
+                app,
+                "VECTOPLAN_CHUNK_PROJECT_ACCESS_AUTHZ_ENFORCED",
+                None,
+            )
+        )
+
+    required = _safe_bool(
+        _first_mapping_value(
+            merged,
+            "required",
+            default=_project_access_required(app),
+        ),
+        _project_access_required(app),
+    )
+
+    return {
+        "checked": checked,
+        "required": required,
+        "ready": access_ready,
+        "accessReady": access_ready,
+        "projectId": _first_mapping_value(
+            merged,
+            "projectId",
+            "project_id",
+            default=_first_mapping_value(bootstrap, "defaultProjectId"),
+        ),
+        "ownerUserId": owner_value if expose_private else None,
+        "ownerAuthUserId": owner_value if expose_private else None,
+        "ownerIdFingerprint": owner_fingerprint,
+        "ownerIdentityCanonical": (
+            _is_canonical_auth_user_id(owner_value)
+            if owner_value is not None
+            else None
+        ),
+        "identityExposed": bool(expose_private and owner_value),
+        "canonicalUserIdField": DEFAULT_CANONICAL_USER_ID_FIELD,
+        "ownerReady": owner_ready,
+        "canonicalReady": canonical_ready,
+        "legacyReady": legacy_ready,
+        "rolesReady": roles_ready if roles_ready is not None else legacy_ready,
+        "ownerAssignmentReady": owner_assignment_ready,
+        "canonicalAssignmentCount": canonical_assignment_count,
+        "legacyRoleCount": legacy_role_count,
+        "sourceOfTruth": actual_source,
+        "expectedSourceOfTruth": expected_source,
+        "sourceOfTruthReady": source_ready,
+        "viewerReadOnly": viewer_read_only,
+        "authzEnforced": authz_enforced,
+        "status": _first_mapping_value(merged, "status"),
+        "errors": _safe_list(merged.get("errors")),
+    }
+
+
+def _build_bootstrap_readiness_snapshot(app: Any) -> dict[str, Any]:
+    """Collect the bounded read-only DB-bootstrap status used by runtime startup."""
+    if not callable(build_db_bootstrap_status):
+        return {
+            "checked": False,
+            "ok": None,
+            "status": "unavailable",
+            "error": "build_db_bootstrap_status is unavailable.",
+        }
+
+    try:
+        payload = build_db_bootstrap_status(app)
+        data = _safe_dict(payload)
+        data["checked"] = True
+        return data
+    except Exception as exc:
+        return {
+            "checked": True,
+            "ok": False,
+            "status": "failed",
+            "error": _safe_exception_message(exc),
+            "exceptionType": exc.__class__.__name__,
+        }
+
+
+def _bootstrap_readiness_failures(
+    app: Any,
+    bootstrap_status: Mapping[str, Any] | None,
+    access_status: Mapping[str, Any] | None,
+) -> list[str]:
+    """Return stable failure keys for mandatory runtime bootstrap readiness."""
+    status = _safe_dict(bootstrap_status)
+    access = _safe_dict(access_status)
+
+    if not _bootstrap_readiness_required(app):
+        return []
+
+    if not _safe_bool(status.get("checked"), False):
+        return ["bootstrapStatusUnavailable"]
+
+    failures: list[str] = []
+
+    for key, label in (
+        ("schemaReady", "schema"),
+        ("defaultProjectReady", "defaultProject"),
+        ("projectOwnerReady", "projectOwner"),
+        ("defaultUniverseReady", "defaultUniverse"),
+        ("defaultWorldReady", "defaultWorld"),
+        ("blockRegistryReady", "blockRegistry"),
+        ("systemBlocksReady", "systemBlocks"),
+        ("airInvariantReady", "airInvariant"),
+        ("systemRailingReady", "systemRailing"),
+    ):
+        if not _safe_bool(status.get(key), False):
+            failures.append(label)
+
+    if _project_access_required(app):
+        if not _safe_bool(access.get("ready"), False):
+            failures.append("projectAccess")
+        if access.get("ownerIdentityCanonical") is False:
+            failures.append("projectOwnerIdentity")
+        if access.get("canonicalReady") is False:
+            failures.append("canonicalProjectAccess")
+        if access.get("legacyReady") is False:
+            failures.append("legacyProjectAccess")
+        if access.get("sourceOfTruthReady") is False:
+            failures.append("projectAccessSourceOfTruth")
+        if access.get("viewerReadOnly") is False:
+            failures.append("viewerReadOnly")
+        if (
+            _access_authz_enforcement_required(app)
+            and access.get("authzEnforced") is not True
+        ):
+            failures.append("projectAccessAuthzEnforcement")
+
+    debug_required = bool(
+        _debug_blocks_required(app)
+        or _safe_bool(status.get("debugBlocksRequired"), False)
+    )
+    if debug_required and not _safe_bool(status.get("debugBlocksReady"), False):
+        failures.append("debugBlocks")
+
+    return failures
+
+
+def _runtime_effective_ok(
+    app: Any,
+    runtime_data: Mapping[str, Any] | None,
+    bootstrap_status: Mapping[str, Any] | None,
+    access_status: Mapping[str, Any] | None,
+) -> tuple[bool | None, list[str]]:
+    """Combine runtime checks with mandatory bootstrap/access readiness."""
+    runtime = _safe_dict(runtime_data)
+    raw_runtime_ok = _safe_optional_bool(runtime.get("ok"))
+    failures = _bootstrap_readiness_failures(
+        app,
+        bootstrap_status,
+        access_status,
+    )
+
+    if raw_runtime_ok is False:
+        return False, failures
+    if failures:
+        return False, failures
+    if raw_runtime_ok is None:
+        return True if _safe_bool(_safe_dict(bootstrap_status).get("checked"), False) else None, failures
+    return True, failures
+
+
+def _diagnostic_key_is_secret(key: str) -> bool:
+    """Return whether a diagnostic mapping key may contain a secret."""
+    normalized = _safe_str(key, "").lower().replace("-", "_")
+    return any(
+        marker in normalized
+        for marker in (
+            "authorization",
+            "password",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "credential",
+            "cookie",
+            "private_key",
+            "session",
+        )
+    )
+
+
+def _diagnostic_key_is_identity(key: str) -> bool:
+    """Return whether a mapping key contains a user/owner identity value."""
+    normalized = _safe_str(key, "").lower().replace("-", "_")
+    return normalized in {
+        "auth_user_id",
+        "authuserid",
+        "owner_user_id",
+        "owneruserid",
+        "owner_auth_user_id",
+        "ownerauthuserid",
+        "project_owner_auth_user_id",
+        "projectownerauthuserid",
+        "user_id",
+        "userid",
+        "account_id",
+        "accountid",
+    }
+
+
+def _sanitize_diagnostic_value(
+    value: Any,
+    *,
+    key: str = "",
+    depth: int = 0,
+    max_depth: int = 8,
+) -> Any:
+    """Build a bounded JSON-safe public diagnostic projection."""
+    if depth > max_depth:
+        return "<max-depth>"
+
+    if _diagnostic_key_is_secret(key):
+        return "<redacted>"
+
+    if _diagnostic_key_is_identity(key):
+        if value in (None, ""):
+            return None
+        return _identity_fingerprint(value)
+
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            safe_key = _safe_str(raw_key, "")
+            if not safe_key:
+                continue
+            result[safe_key] = _sanitize_diagnostic_value(
+                raw_value,
+                key=safe_key,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+        return result
+
+    if isinstance(value, (list, tuple, set)):
+        items = _safe_list(value)
+        return [
+            _sanitize_diagnostic_value(
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+            for item in items[:500]
+        ]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    try:
+        return _safe_str(value, value.__class__.__name__)
+    except Exception:
+        return value.__class__.__name__
+
+
 def _is_flask_app(app: object) -> bool:
     """Check whether object can be treated as Flask app."""
     if isinstance(app, Flask):
@@ -419,9 +1135,11 @@ def _message_to_state_item(message: str, code: str = "startup_message", details:
     """Build serializable state warning/error item."""
     return {
         "code": _safe_str(code, "startup_message"),
-        "message": _safe_str(message, ""),
+        "message": _sanitize_message_text(message),
         "timestamp": _utc_now_iso(),
-        "details": details or {},
+        "details": _safe_dict(
+            _sanitize_diagnostic_value(details or {})
+        ),
     }
 
 
@@ -465,6 +1183,10 @@ def _build_empty_readiness_state() -> dict[str, Any]:
     return {
         "startupReady": None,
         "runtimeChecksReady": None,
+        "runtimeChecksRawReady": None,
+        "bootstrapReadinessChecked": False,
+        "bootstrapReadinessReady": None,
+        "bootstrapReadinessFailures": [],
         "databaseReady": None,
         "modelsReady": None,
         "schemaChecked": False,
@@ -473,18 +1195,62 @@ def _build_empty_readiness_state() -> dict[str, Any]:
         "projectAccessSchemaReady": None,
         "projectAccessChecked": False,
         "defaultProjectOwnerReady": None,
+        "defaultProjectOwnerIdentityCanonical": None,
+        "defaultProjectOwnerFingerprint": None,
+        "canonicalProjectAccessReady": None,
+        "legacyProjectAccessReady": None,
         "defaultProjectRolesReady": None,
         "defaultProjectOwnerAssignmentReady": None,
         "defaultProjectAccessReady": None,
+        "projectAccessSourceOfTruthReady": None,
+        "projectAccessViewerReadOnly": None,
         "projectAccessRouteSurfaceReady": None,
+        "projectAccessCanonicalRouteSurfaceReady": None,
+        "projectAccessLegacyRouteSurfaceReady": None,
+        "projectOwnerTransferRouteReady": None,
         "projectAccessApiEnabled": True,
         "projectAccessRoutesRequired": True,
-        "projectAccessAuthzEnforced": False,
+        "projectAccessAuthzEnforced": None,
+    }
+
+
+def _build_empty_project_access_state() -> dict[str, Any]:
+    """Return the public, identity-safe project-access startup placeholder."""
+    return {
+        "checked": False,
+        "ready": None,
+        "accessReady": None,
+        "required": _project_access_required(None),
+        "projectId": None,
+        "ownerUserId": None,
+        "ownerAuthUserId": None,
+        "ownerIdFingerprint": None,
+        "ownerIdentityCanonical": None,
+        "identityExposed": False,
+        "canonicalUserIdField": DEFAULT_CANONICAL_USER_ID_FIELD,
+        "ownerReady": None,
+        "canonicalReady": None,
+        "legacyReady": None,
+        "rolesReady": None,
+        "ownerAssignmentReady": None,
+        "canonicalAssignmentCount": 0,
+        "legacyRoleCount": 0,
+        "sourceOfTruth": DEFAULT_ACCESS_SOURCE_SERVICE,
+        "expectedSourceOfTruth": DEFAULT_ACCESS_SOURCE_SERVICE,
+        "sourceOfTruthReady": None,
+        "viewerReadOnly": None,
+        "authzEnforced": None,
+        "status": None,
+        "errors": [],
     }
 
 
 def _build_empty_routing_state() -> dict[str, Any]:
     """Return a compact routing-state placeholder."""
+    required_groups = {
+        name: list(rules)
+        for name, rules in PROJECT_ACCESS_REQUIRED_ROUTE_GROUPS
+    }
     return {
         "routingInitialized": False,
         "registeredBlueprintNames": [],
@@ -495,9 +1261,21 @@ def _build_empty_routing_state() -> dict[str, Any]:
             "required": True,
             "blueprintRegistered": False,
             "routeSurfaceReady": False,
+            "canonicalRouteSurfaceReady": False,
+            "legacyRouteSurfaceReady": False,
+            "ownerTransferRouteRequired": False,
+            "ownerTransferRouteReady": False,
             "coreRouteRules": list(PROJECT_ACCESS_CORE_ROUTE_RULES),
+            "canonicalRouteRules": list(PROJECT_ACCESS_CANONICAL_ROUTE_RULES),
+            "legacyRouteRules": list(PROJECT_ACCESS_LEGACY_ROUTE_RULES),
+            "requiredRouteGroups": required_groups,
+            "missingRouteGroups": list(required_groups),
             "missingRouteRules": list(PROJECT_ACCESS_CORE_ROUTE_RULES),
-            "authzEnforced": False,
+            "missingCanonicalRouteRules": list(
+                PROJECT_ACCESS_CANONICAL_ROUTE_RULES
+            ),
+            "missingLegacyRouteRules": list(PROJECT_ACCESS_LEGACY_ROUTE_RULES),
+            "authzEnforced": None,
         },
     }
 
@@ -527,7 +1305,7 @@ def _read_central_routing_state(app: Flask) -> dict[str, Any]:
         namespace = _ensure_chunk_namespace(app)
         routing = namespace.get("routing")
         if isinstance(routing, Mapping):
-            return dict(routing)
+            return _safe_dict(_sanitize_diagnostic_value(routing))
     except Exception:
         pass
     return {}
@@ -564,23 +1342,76 @@ def _build_routing_snapshot(app: Flask) -> dict[str, Any]:
     """Build bounded, JSON-safe routing and project-access route diagnostics."""
     central = _read_central_routing_state(app)
     rules = _get_route_rules(app)
-    rule_set = set(rules)
+    rule_set = {_normalize_route_template(rule) for rule in rules}
     blueprint_names = _get_blueprint_names(app)
 
     enabled = _project_access_routes_enabled(app, central)
     required = _project_access_routes_required(app, central, enabled=enabled)
-    blueprint_registered = PROJECT_ACCESS_BLUEPRINT_NAME in blueprint_names
-    missing_rules = [
-        rule for rule in PROJECT_ACCESS_CORE_ROUTE_RULES if rule not in rule_set
-    ]
-    route_surface_ready = bool(
-        not enabled or (blueprint_registered and not missing_rules)
+    owner_transfer_required = _owner_transfer_route_required(app)
+    blueprint_registered = any(
+        name == PROJECT_ACCESS_BLUEPRINT_NAME
+        or name.endswith("." + PROJECT_ACCESS_BLUEPRINT_NAME)
+        for name in blueprint_names
     )
+
+    missing_groups: list[str] = []
+    required_groups: dict[str, list[str]] = {}
+    for group_name, candidates in PROJECT_ACCESS_REQUIRED_ROUTE_GROUPS:
+        required_groups[group_name] = list(candidates)
+        if not any(
+            _route_registered(app, rule_set, candidate)
+            for candidate in candidates
+        ):
+            missing_groups.append(group_name)
+
+    missing_core = [
+        rule
+        for rule in PROJECT_ACCESS_CORE_ROUTE_RULES
+        if not _route_registered(app, rule_set, rule)
+    ]
+    missing_canonical = [
+        rule
+        for rule in PROJECT_ACCESS_CANONICAL_ROUTE_RULES
+        if not _route_registered(app, rule_set, rule)
+    ]
+    missing_legacy = [
+        rule
+        for rule in PROJECT_ACCESS_LEGACY_ROUTE_RULES
+        if not _route_registered(app, rule_set, rule)
+    ]
+
+    owner_transfer_ready = any(
+        _route_registered(app, rule_set, rule)
+        for rule in PROJECT_ACCESS_OWNER_TRANSFER_ROUTE_RULES
+    )
+    route_surface_ready = bool(
+        not enabled
+        or (
+            blueprint_registered
+            and not missing_groups
+            and (owner_transfer_ready or not owner_transfer_required)
+        )
+    )
+    canonical_surface_ready = bool(
+        blueprint_registered and not missing_canonical
+    )
+    legacy_surface_ready = bool(blueprint_registered and not missing_legacy)
 
     central_project_access = _safe_dict(central.get("projectAccess"))
     routing_initialized = _safe_bool(
         central.get("routingInitialized"),
         bool(blueprint_names),
+    )
+    authz_enforced = _safe_optional_bool(
+        _first_mapping_value(
+            central_project_access,
+            "authzEnforced",
+            "authorizationEnforced",
+            default=_first_mapping_value(
+                central,
+                "projectAccessAuthzEnforced",
+            ),
+        )
     )
 
     return {
@@ -589,6 +1420,7 @@ def _build_routing_snapshot(app: Flask) -> dict[str, Any]:
         "registeredBlueprintNames": blueprint_names,
         "routeCount": len(rules),
         "rules": rules,
+        "apiPrefix": _normalize_api_prefix(app),
         "registrationErrorCount": _safe_int(
             central.get("blueprintRegistrationErrorCount"),
             len(_safe_list(central.get("errors"))),
@@ -609,9 +1441,21 @@ def _build_routing_snapshot(app: Flask) -> dict[str, Any]:
             "required": required,
             "blueprintRegistered": blueprint_registered,
             "routeSurfaceReady": route_surface_ready,
+            "canonicalRouteSurfaceReady": canonical_surface_ready,
+            "legacyRouteSurfaceReady": legacy_surface_ready,
+            "ownerTransferRouteRequired": owner_transfer_required,
+            "ownerTransferRouteReady": owner_transfer_ready,
             "coreRouteRules": list(PROJECT_ACCESS_CORE_ROUTE_RULES),
-            "missingRouteRules": missing_rules,
-            "authzEnforced": False,
+            "canonicalRouteRules": list(
+                PROJECT_ACCESS_CANONICAL_ROUTE_RULES
+            ),
+            "legacyRouteRules": list(PROJECT_ACCESS_LEGACY_ROUTE_RULES),
+            "requiredRouteGroups": required_groups,
+            "missingRouteGroups": missing_groups,
+            "missingRouteRules": missing_core,
+            "missingCanonicalRouteRules": missing_canonical,
+            "missingLegacyRouteRules": missing_legacy,
+            "authzEnforced": authz_enforced,
             "registryStatus": central_project_access,
         },
     }
@@ -621,84 +1465,201 @@ def _derive_readiness_state(
     runtime_data: Mapping[str, Any] | None,
     routing_snapshot: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Normalize runtime-check and route-registry results into one readiness view."""
+    """Normalize runtime, bootstrap, access and route results into one view."""
     runtime = _safe_dict(runtime_data)
     routing = _safe_dict(routing_snapshot)
     database = _safe_dict(runtime.get("database"))
     models = _safe_dict(runtime.get("models"))
     schema = _safe_dict(runtime.get("schema"))
-    access = _safe_dict(runtime.get("project_access"))
+    access = _safe_dict(
+        runtime.get("project_access") or runtime.get("projectAccess")
+    )
+    bootstrap_status = _safe_dict(runtime.get("bootstrap_readiness"))
     route_access = _safe_dict(routing.get("projectAccess"))
 
-    schema_checked = _safe_bool(schema.get("checked"), False)
+    schema_checked = _safe_bool(
+        schema.get("checked"),
+        bool(schema),
+    )
     access_checked = _safe_bool(access.get("checked"), False)
-    access_ready = access.get("accessReady", access.get("ok"))
+    access_ready = _safe_optional_bool(
+        _first_mapping_value(
+            access,
+            "accessReady",
+            "ready",
+            "projectAccessReady",
+        )
+    )
     route_ready = route_access.get("routeSurfaceReady")
     routes_enabled = _safe_bool(route_access.get("enabled"), True)
     routes_required = _safe_bool(route_access.get("required"), routes_enabled)
 
-    runtime_ready = runtime.get("ok")
-    if runtime_ready is not None:
-        runtime_ready = _safe_bool(runtime_ready, False)
+    raw_runtime_ready = _safe_optional_bool(
+        runtime.get("rawOk", runtime.get("ok"))
+    )
+    runtime_ready = _safe_optional_bool(
+        runtime.get("startupEffectiveOk", runtime.get("ok"))
+    )
 
     routing_requirement_ready = bool(
         not routes_enabled
         or not routes_required
         or _safe_bool(route_ready, False)
     )
+    access_requirement_ready = bool(
+        not _safe_bool(access.get("required"), False)
+        or _safe_bool(access_ready, False)
+    )
     startup_ready = (
-        bool(runtime_ready and routing_requirement_ready)
+        bool(
+            runtime_ready
+            and routing_requirement_ready
+            and access_requirement_ready
+        )
         if runtime_ready is not None
         else None
     )
 
-    connection_checked = _safe_bool(database.get("connectionChecked"), False)
+    connection_checked = _safe_bool(
+        database.get("connectionChecked", database.get("checked")),
+        False,
+    )
     database_ready = (
-        _safe_optional_bool(database.get("connectionOk"))
+        _safe_optional_bool(
+            database.get("connectionOk", database.get("ok"))
+        )
         if connection_checked
         else None
+    )
+
+    bootstrap_checked = _safe_bool(
+        bootstrap_status.get("checked"),
+        False,
+    )
+    bootstrap_failures = [
+        _safe_str(item, "")
+        for item in _safe_list(runtime.get("bootstrapReadinessFailures"))
+        if _safe_str(item, "")
+    ]
+    bootstrap_ready = (
+        not bootstrap_failures
+        if bootstrap_checked
+        else None
+    )
+
+    schema_ready_value = (
+        _safe_optional_bool(schema.get("ok"))
+        if schema_checked
+        else _safe_optional_bool(bootstrap_status.get("schemaReady"))
     )
 
     return {
         "startupReady": startup_ready,
         "runtimeChecksReady": runtime_ready,
+        "runtimeChecksRawReady": raw_runtime_ready,
+        "bootstrapReadinessChecked": bootstrap_checked,
+        "bootstrapReadinessReady": bootstrap_ready,
+        "bootstrapReadinessFailures": bootstrap_failures,
         "databaseReady": database_ready,
         "modelsReady": _safe_optional_bool(models.get("ok")),
-        "schemaChecked": schema_checked,
-        "schemaReady": _safe_optional_bool(schema.get("ok")) if schema_checked else None,
+        "schemaChecked": bool(schema_checked or bootstrap_checked),
+        "schemaReady": schema_ready_value,
         "projectOwnerColumnsReady": _safe_optional_bool(
-            schema.get("projectOwnerColumnsReady")
+            _first_mapping_value(
+                schema,
+                "projectOwnerColumnsReady",
+                default=bootstrap_status.get("projectOwnerColumnsReady"),
+            )
         ),
         "projectAccessSchemaReady": _safe_optional_bool(
-            schema.get("projectAccessSchemaReady")
+            _first_mapping_value(
+                schema,
+                "projectAccessSchemaReady",
+                default=bootstrap_status.get("projectAccessSchemaReady"),
+            )
         ),
         "projectAccessChecked": access_checked,
-        "defaultProjectOwnerReady": _safe_optional_bool(access.get("ownerReady")),
-        "defaultProjectRolesReady": _safe_optional_bool(access.get("rolesReady")),
+        "defaultProjectOwnerReady": _safe_optional_bool(
+            access.get("ownerReady")
+        ),
+        "defaultProjectOwnerIdentityCanonical": _safe_optional_bool(
+            access.get("ownerIdentityCanonical")
+        ),
+        "defaultProjectOwnerFingerprint": access.get(
+            "ownerIdFingerprint"
+        ),
+        "canonicalProjectAccessReady": _safe_optional_bool(
+            access.get("canonicalReady")
+        ),
+        "legacyProjectAccessReady": _safe_optional_bool(
+            access.get("legacyReady")
+        ),
+        "defaultProjectRolesReady": _safe_optional_bool(
+            access.get("rolesReady")
+        ),
         "defaultProjectOwnerAssignmentReady": _safe_optional_bool(
             access.get("ownerAssignmentReady")
         ),
-        "defaultProjectAccessReady": _safe_optional_bool(access_ready),
+        "defaultProjectAccessReady": access_ready,
+        "projectAccessSourceOfTruthReady": _safe_optional_bool(
+            access.get("sourceOfTruthReady")
+        ),
+        "projectAccessViewerReadOnly": _safe_optional_bool(
+            access.get("viewerReadOnly")
+        ),
         "projectAccessRouteSurfaceReady": _safe_optional_bool(route_ready),
+        "projectAccessCanonicalRouteSurfaceReady": _safe_optional_bool(
+            route_access.get("canonicalRouteSurfaceReady")
+        ),
+        "projectAccessLegacyRouteSurfaceReady": _safe_optional_bool(
+            route_access.get("legacyRouteSurfaceReady")
+        ),
+        "projectOwnerTransferRouteReady": _safe_optional_bool(
+            route_access.get("ownerTransferRouteReady")
+        ),
         "projectAccessApiEnabled": routes_enabled,
         "projectAccessRoutesRequired": routes_required,
-        "projectAccessAuthzEnforced": False,
+        "projectAccessAuthzEnforced": _safe_optional_bool(
+            _first_mapping_value(
+                access,
+                "authzEnforced",
+                default=route_access.get("authzEnforced"),
+            )
+        ),
     }
 
 
-def _store_namespace_startup_projection(app: Flask, state: Mapping[str, Any]) -> None:
-    """Expose compact readiness fields at namespace top-level for old consumers."""
+def _store_namespace_startup_projection(
+    app: Flask,
+    state: Mapping[str, Any],
+) -> None:
+    """Expose compact, identity-safe readiness fields for status consumers."""
     try:
         namespace = _ensure_chunk_namespace(app)
         readiness = _safe_dict(state.get("readiness"))
         routing = _safe_dict(state.get("routing"))
         route_access = _safe_dict(routing.get("projectAccess"))
+        project_access = _safe_dict(state.get("projectAccess"))
 
         namespace["startup_state_version"] = STARTUP_STATE_VERSION
         namespace["startup_contract_version"] = STARTUP_CONTRACT_VERSION
         namespace["startup_status"] = state.get("status")
         namespace["startup_ready"] = readiness.get("startupReady")
-        namespace["runtime_checks_ready"] = readiness.get("runtimeChecksReady")
+        namespace["runtime_checks_ready"] = readiness.get(
+            "runtimeChecksReady"
+        )
+        namespace["runtime_checks_raw_ready"] = readiness.get(
+            "runtimeChecksRawReady"
+        )
+        namespace["bootstrap_readiness_checked"] = readiness.get(
+            "bootstrapReadinessChecked"
+        )
+        namespace["bootstrap_readiness_ready"] = readiness.get(
+            "bootstrapReadinessReady"
+        )
+        namespace["bootstrap_readiness_failures"] = list(
+            readiness.get("bootstrapReadinessFailures") or []
+        )
         namespace["schema_ready"] = readiness.get("schemaReady")
         namespace["project_owner_columns_ready"] = readiness.get(
             "projectOwnerColumnsReady"
@@ -709,6 +1670,18 @@ def _store_namespace_startup_projection(app: Flask, state: Mapping[str, Any]) ->
         namespace["default_project_owner_ready"] = readiness.get(
             "defaultProjectOwnerReady"
         )
+        namespace["default_project_owner_identity_canonical"] = readiness.get(
+            "defaultProjectOwnerIdentityCanonical"
+        )
+        namespace["default_project_owner_fingerprint"] = readiness.get(
+            "defaultProjectOwnerFingerprint"
+        )
+        namespace["canonical_project_access_ready"] = readiness.get(
+            "canonicalProjectAccessReady"
+        )
+        namespace["legacy_project_access_ready"] = readiness.get(
+            "legacyProjectAccessReady"
+        )
         namespace["default_project_roles_ready"] = readiness.get(
             "defaultProjectRolesReady"
         )
@@ -717,6 +1690,12 @@ def _store_namespace_startup_projection(app: Flask, state: Mapping[str, Any]) ->
         )
         namespace["default_project_access_ready"] = readiness.get(
             "defaultProjectAccessReady"
+        )
+        namespace["project_access_source_of_truth_ready"] = readiness.get(
+            "projectAccessSourceOfTruthReady"
+        )
+        namespace["project_access_viewer_read_only"] = readiness.get(
+            "projectAccessViewerReadOnly"
         )
         namespace["project_access_api_enabled"] = readiness.get(
             "projectAccessApiEnabled"
@@ -727,10 +1706,27 @@ def _store_namespace_startup_projection(app: Flask, state: Mapping[str, Any]) ->
         namespace["project_access_route_surface_ready"] = readiness.get(
             "projectAccessRouteSurfaceReady"
         )
+        namespace["project_access_canonical_route_surface_ready"] = (
+            readiness.get("projectAccessCanonicalRouteSurfaceReady")
+        )
+        namespace["project_access_legacy_route_surface_ready"] = (
+            readiness.get("projectAccessLegacyRouteSurfaceReady")
+        )
+        namespace["project_owner_transfer_route_ready"] = readiness.get(
+            "projectOwnerTransferRouteReady"
+        )
         namespace["project_access_blueprint_registered"] = route_access.get(
             "blueprintRegistered"
         )
-        namespace["project_access_authz_enforced"] = False
+        namespace["project_access_authz_enforced"] = readiness.get(
+            "projectAccessAuthzEnforced"
+        )
+        namespace["project_access_owner_fingerprint"] = project_access.get(
+            "ownerIdFingerprint"
+        )
+        namespace["project_access_identity_exposed"] = bool(
+            project_access.get("identityExposed")
+        )
         namespace["startup_readiness"] = dict(readiness)
         namespace["startup_routing"] = dict(routing)
         namespace["runtime_checks_summary"] = _safe_dict(
@@ -760,24 +1756,21 @@ def _build_initial_startup_state() -> dict[str, Any]:
             "models": {},
             "schema": {},
             "project_access": {},
+            "bootstrap": {},
             "routing": {},
             "runtime": {},
         },
         "metadata": {
-            "authzEnforced": False,
+            "authzEnforced": None,
             "runtimeReadOnly": True,
+            "privateIdentifiersExposed": False,
         },
         "settings": {},
         "runtimeChecks": {},
         "runtimeChecksSummary": {},
         "readiness": _build_empty_readiness_state(),
         "routing": _build_empty_routing_state(),
-        "projectAccess": {
-            "checked": False,
-            "ready": None,
-            "required": False,
-            "authzEnforced": False,
-        },
+        "projectAccess": _build_empty_project_access_state(),
         "seed": {
             "attempted": False,
             "completed": False,
@@ -847,6 +1840,7 @@ def _ensure_startup_state(app: Flask) -> dict[str, Any]:
         ("models", {}),
         ("schema", {}),
         ("project_access", {}),
+        ("bootstrap", {}),
         ("routing", {}),
         ("runtime", {}),
     ):
@@ -866,6 +1860,8 @@ def _ensure_startup_state(app: Flask) -> dict[str, Any]:
         startup_state["checks"]["schema"] = {}
     if not isinstance(startup_state["checks"]["project_access"], dict):
         startup_state["checks"]["project_access"] = {}
+    if not isinstance(startup_state["checks"]["bootstrap"], dict):
+        startup_state["checks"]["bootstrap"] = {}
     if not isinstance(startup_state["checks"]["routing"], dict):
         startup_state["checks"]["routing"] = {}
     if not isinstance(startup_state["checks"]["runtime"], dict):
@@ -893,11 +1889,10 @@ def _ensure_startup_state(app: Flask) -> dict[str, Any]:
         startup_state["routing"] = _build_empty_routing_state()
 
     if not isinstance(startup_state["projectAccess"], dict):
-        startup_state["projectAccess"] = {}
-    startup_state["projectAccess"].setdefault("checked", False)
-    startup_state["projectAccess"].setdefault("ready", None)
-    startup_state["projectAccess"].setdefault("required", False)
-    startup_state["projectAccess"].setdefault("authzEnforced", False)
+        startup_state["projectAccess"] = _build_empty_project_access_state()
+    else:
+        for key, value in _build_empty_project_access_state().items():
+            startup_state["projectAccess"].setdefault(key, value)
 
     if not isinstance(startup_state["seed"], dict):
         startup_state["seed"] = {}
@@ -929,8 +1924,13 @@ def _ensure_startup_state(app: Flask) -> dict[str, Any]:
 
     startup_state["state_version"] = STARTUP_STATE_VERSION
     startup_state["contract_version"] = STARTUP_CONTRACT_VERSION
-    startup_state["metadata"]["authzEnforced"] = False
+    startup_state["metadata"]["authzEnforced"] = startup_state[
+        "projectAccess"
+    ].get("authzEnforced")
     startup_state["metadata"]["runtimeReadOnly"] = True
+    startup_state["metadata"]["privateIdentifiersExposed"] = bool(
+        startup_state["projectAccess"].get("identityExposed")
+    )
 
     return startup_state
 
@@ -1046,7 +2046,7 @@ def _get_extension_summary(app: Flask) -> dict[str, Any]:
 
     try:
         summary = get_extension_summary(app)
-        return _safe_dict(summary)
+        return _safe_dict(_sanitize_diagnostic_value(summary))
     except Exception:
         return {}
 
@@ -1060,7 +2060,7 @@ def _build_settings_summary(app: Flask) -> dict[str, Any]:
     if build_settings_summary is not None:
         try:
             summary = build_settings_summary(app)
-            return _safe_dict(summary)
+            return _safe_dict(_sanitize_diagnostic_value(summary))
         except Exception as exc:
             return {
                 "ok": False,
@@ -1068,14 +2068,18 @@ def _build_settings_summary(app: Flask) -> dict[str, Any]:
                 "source": "build_settings_summary",
             }
 
-    return {
-        "ok": True,
-        "runtime": {
-            "runStartupHooks": should_run_startup_hooks(app),
-            "autoCreateAllInRuntime": False,
-            "autoSeedDefaultsInRuntime": False,
-        },
-    }
+    return _safe_dict(
+        _sanitize_diagnostic_value(
+            {
+                "ok": True,
+                "runtime": {
+                    "runStartupHooks": should_run_startup_hooks(app),
+                    "autoCreateAllInRuntime": False,
+                    "autoSeedDefaultsInRuntime": False,
+                },
+            }
+        )
+    )
 
 
 def _build_bootstrap_settings(app: Flask) -> Any | None:
@@ -1152,7 +2156,7 @@ def _run_read_only_runtime_checks(app: Flask, settings: Any | None) -> Any:
 
 
 def _store_runtime_checks_result(app: Flask, result: Any) -> None:
-    """Store the complete read-only runtime result and derived readiness state."""
+    """Store read-only runtime, bootstrap and normalized access readiness."""
     state = _ensure_startup_state(app)
 
     if runtime_checks_result_to_dict is not None:
@@ -1174,7 +2178,35 @@ def _store_runtime_checks_result(app: Flask, result: Any) -> None:
         runtime_data = _safe_dict(result)
 
     runtime_data = _safe_dict(runtime_data)
-    state["runtimeChecks"] = runtime_data
+    raw_runtime_ok = _safe_optional_bool(runtime_data.get("ok"))
+
+    bootstrap_status = _build_bootstrap_readiness_snapshot(app)
+    raw_access = _safe_dict(
+        runtime_data.get("project_access")
+        or runtime_data.get("projectAccess")
+    )
+    normalized_access = _normalize_project_access_status(
+        app,
+        raw_access,
+        bootstrap_status,
+    )
+    effective_ok, bootstrap_failures = _runtime_effective_ok(
+        app,
+        runtime_data,
+        bootstrap_status,
+        normalized_access,
+    )
+
+    runtime_data["rawOk"] = raw_runtime_ok
+    runtime_data["startupEffectiveOk"] = effective_ok
+    runtime_data["bootstrapReadinessFailures"] = list(bootstrap_failures)
+    runtime_data["bootstrap_readiness"] = bootstrap_status
+    runtime_data["project_access"] = normalized_access
+
+    public_runtime_data = _safe_dict(
+        _sanitize_diagnostic_value(runtime_data)
+    )
+    state["runtimeChecks"] = public_runtime_data
 
     if build_runtime_checks_summary is not None:
         try:
@@ -1184,25 +2216,65 @@ def _store_runtime_checks_result(app: Flask, result: Any) -> None:
     else:
         summary = {}
 
-    state["runtimeChecksSummary"] = _safe_dict(summary)
+    summary = _safe_dict(summary)
+    summary.update(
+        {
+            "rawOk": raw_runtime_ok,
+            "startupEffectiveOk": effective_ok,
+            "bootstrapReadinessChecked": _safe_bool(
+                bootstrap_status.get("checked"),
+                False,
+            ),
+            "bootstrapReadinessReady": not bootstrap_failures
+            if _safe_bool(bootstrap_status.get("checked"), False)
+            else None,
+            "bootstrapReadinessFailureCount": len(bootstrap_failures),
+            "projectAccessReady": normalized_access.get("ready"),
+            "canonicalProjectAccessReady": normalized_access.get(
+                "canonicalReady"
+            ),
+            "legacyProjectAccessReady": normalized_access.get("legacyReady"),
+            "projectOwnerReady": normalized_access.get("ownerReady"),
+        }
+    )
+    state["runtimeChecksSummary"] = _safe_dict(
+        _sanitize_diagnostic_value(summary)
+    )
 
     routing_snapshot = _build_routing_snapshot(app)
     state["routing"] = routing_snapshot
     state["checks"]["routing"] = dict(routing_snapshot)
 
-    if runtime_data:
-        state["checks"]["paths"] = list(runtime_data.get("paths") or [])
-        state["checks"]["files"] = list(runtime_data.get("files") or [])
-        state["checks"]["routes"] = list(runtime_data.get("routes") or [])
-        state["checks"]["database"] = _safe_dict(runtime_data.get("database"))
-        state["checks"]["models"] = _safe_dict(runtime_data.get("models"))
-        state["checks"]["schema"] = _safe_dict(runtime_data.get("schema"))
-        state["checks"]["project_access"] = _safe_dict(
-            runtime_data.get("project_access")
+    if public_runtime_data:
+        state["checks"]["paths"] = list(
+            public_runtime_data.get("paths") or []
         )
-        state["checks"]["runtime"] = _safe_dict(summary)
+        state["checks"]["files"] = list(
+            public_runtime_data.get("files") or []
+        )
+        state["checks"]["routes"] = list(
+            public_runtime_data.get("routes") or []
+        )
+        state["checks"]["database"] = _safe_dict(
+            public_runtime_data.get("database")
+        )
+        state["checks"]["models"] = _safe_dict(
+            public_runtime_data.get("models")
+        )
+        state["checks"]["schema"] = _safe_dict(
+            public_runtime_data.get("schema")
+        )
+        state["checks"]["project_access"] = dict(normalized_access)
+        state["checks"]["bootstrap"] = _safe_dict(
+            _sanitize_diagnostic_value(bootstrap_status)
+        )
+        state["checks"]["runtime"] = dict(
+            state["runtimeChecksSummary"]
+        )
 
-        route_summary = _safe_dict(runtime_data.get("route_summary"))
+        route_summary = _safe_dict(
+            public_runtime_data.get("route_summary")
+        )
         required_missing = list(
             route_summary.get("requiredMissing")
             or route_summary.get("required_missing")
@@ -1215,56 +2287,119 @@ def _store_runtime_checks_result(app: Flask, result: Any) -> None:
         )
 
         state["route_summary"] = {
-            "count": _safe_int(route_summary.get("count", 0), 0, minimum=0),
+            "count": _safe_int(
+                route_summary.get("count", 0),
+                0,
+                minimum=0,
+            ),
             "required_missing": required_missing,
             "optional_missing": optional_missing,
             "rules": list(route_summary.get("rules") or []),
         }
 
-        database = _safe_dict(runtime_data.get("database"))
+        database = _safe_dict(public_runtime_data.get("database"))
         state["database"]["checked"] = bool(
-            database.get("connectionChecked", database.get("checked", False))
+            database.get(
+                "connectionChecked",
+                database.get("checked", False),
+            )
         )
         state["database"]["ok"] = database.get(
             "connectionOk",
             database.get("ok"),
         )
 
-    access = _safe_dict(runtime_data.get("project_access"))
-    state["projectAccess"] = {
-        "checked": _safe_bool(access.get("checked"), False),
-        "ready": _safe_optional_bool(
-            access.get("accessReady", access.get("ok"))
-        ),
-        "required": _safe_bool(access.get("required"), False),
-        "projectId": access.get("projectId"),
-        "ownerUserId": access.get("ownerUserId"),
-        "ownerReady": _safe_optional_bool(access.get("ownerReady")),
-        "rolesReady": _safe_optional_bool(access.get("rolesReady")),
-        "ownerAssignmentReady": _safe_optional_bool(
-            access.get("ownerAssignmentReady")
-        ),
-        "authzEnforced": False,
-        "status": access.get("status"),
-    }
+    state["projectAccess"] = dict(normalized_access)
+    state["readiness"] = _derive_readiness_state(
+        runtime_data,
+        routing_snapshot,
+    )
+    state["metadata"]["authzEnforced"] = normalized_access.get(
+        "authzEnforced"
+    )
+    state["metadata"]["privateIdentifiersExposed"] = bool(
+        normalized_access.get("identityExposed")
+    )
+    state["metadata"]["bootstrapReadinessChecked"] = _safe_bool(
+        bootstrap_status.get("checked"),
+        False,
+    )
+    state["metadata"]["bootstrapReadinessFailures"] = list(
+        bootstrap_failures
+    )
 
-    state["readiness"] = _derive_readiness_state(runtime_data, routing_snapshot)
-
-    warnings = list(runtime_data.get("warnings") or [])
+    warnings = _safe_list(runtime_data.get("warnings"))
     for warning in warnings:
         if isinstance(warning, Mapping):
-            state["warnings"].append(dict(warning))
+            state["warnings"].append(
+                _safe_dict(_sanitize_diagnostic_value(warning))
+            )
 
-    errors = list(runtime_data.get("errors") or [])
+    errors = _safe_list(runtime_data.get("errors"))
     for error in errors:
         if isinstance(error, Mapping):
-            state["errors"].append(dict(error))
+            state["errors"].append(
+                _safe_dict(_sanitize_diagnostic_value(error))
+            )
 
     _store_namespace_startup_projection(app, state)
 
 
+def _validate_effective_runtime_readiness(app: Flask) -> None:
+    """Fail startup when mandatory read-only readiness is not satisfied."""
+    state = _ensure_startup_state(app)
+    readiness = _safe_dict(state.get("readiness"))
+
+    if readiness.get("runtimeChecksReady") is not False:
+        return
+
+    failures = [
+        _safe_str(item, "")
+        for item in _safe_list(
+            readiness.get("bootstrapReadinessFailures")
+        )
+        if _safe_str(item, "")
+    ]
+    message = (
+        "Read-only runtime/bootstrap readiness is not satisfied."
+        + (
+            " Failed invariants: " + ", ".join(failures)
+            if failures
+            else ""
+        )
+    )
+
+    existing_codes = {
+        _safe_str(item.get("code"), "")
+        for item in _safe_list(state.get("errors"))
+        if isinstance(item, Mapping)
+    }
+    if "runtime_bootstrap_readiness_not_ready" not in existing_codes:
+        _append_error(
+            app,
+            message,
+            code="runtime_bootstrap_readiness_not_ready",
+            details={
+                "failures": failures,
+                "bootstrapReadinessChecked": readiness.get(
+                    "bootstrapReadinessChecked"
+                ),
+                "projectAccessReady": readiness.get(
+                    "defaultProjectAccessReady"
+                ),
+                "projectOwnerReady": readiness.get(
+                    "defaultProjectOwnerReady"
+                ),
+            },
+        )
+
+    state["readiness"]["startupReady"] = False
+    _store_namespace_startup_projection(app, state)
+    raise RuntimeError(message)
+
+
 def _validate_project_access_route_surface(app: Flask) -> None:
-    """Fail startup when an enabled, required Access route surface is incomplete."""
+    """Fail startup when the enabled, required Access route surface is incomplete."""
     state = _ensure_startup_state(app)
     routing = _safe_dict(state.get("routing"))
     access = _safe_dict(routing.get("projectAccess"))
@@ -1276,19 +2411,46 @@ def _validate_project_access_route_surface(app: Flask) -> None:
     if not enabled or not required or ready:
         return
 
-    missing = list(access.get("missingRouteRules") or [])
+    missing_groups = list(access.get("missingRouteGroups") or [])
+    missing_rules = list(access.get("missingRouteRules") or [])
+    owner_transfer_required = _safe_bool(
+        access.get("ownerTransferRouteRequired"),
+        False,
+    )
+    owner_transfer_ready = _safe_bool(
+        access.get("ownerTransferRouteReady"),
+        False,
+    )
+
+    details: list[str] = []
+    if missing_groups:
+        details.append("groups=" + ",".join(missing_groups))
+    elif missing_rules:
+        details.append("rules=" + ",".join(missing_rules))
+    if owner_transfer_required and not owner_transfer_ready:
+        details.append("owner-transfer")
+
     message = (
-        "Required project-access route surface is incomplete. Missing routes: "
-        + (", ".join(missing) if missing else "project_access Blueprint")
+        "Required project-access route surface is incomplete."
+        + (" Missing " + "; ".join(details) if details else "")
     )
     _append_error(
         app,
         message,
         code="project_access_route_surface_not_ready",
         details={
-            "missingRouteRules": missing,
+            "missingRouteGroups": missing_groups,
+            "missingRouteRules": missing_rules,
+            "missingCanonicalRouteRules": list(
+                access.get("missingCanonicalRouteRules") or []
+            ),
+            "missingLegacyRouteRules": list(
+                access.get("missingLegacyRouteRules") or []
+            ),
             "blueprintRegistered": access.get("blueprintRegistered"),
-            "authzEnforced": False,
+            "ownerTransferRouteRequired": owner_transfer_required,
+            "ownerTransferRouteReady": owner_transfer_ready,
+            "authzEnforced": access.get("authzEnforced"),
         },
     )
     state["readiness"]["startupReady"] = False
@@ -1299,6 +2461,7 @@ def _validate_project_access_route_surface(app: Flask) -> None:
 # -----------------------------------------------------------------------------
 # State transitions
 # -----------------------------------------------------------------------------
+
 
 def _start_run(app: Flask) -> dict[str, Any]:
     """Mark startup run as running."""
@@ -1317,12 +2480,8 @@ def _start_run(app: Flask) -> dict[str, Any]:
     state["runtimeChecksSummary"] = {}
     state["readiness"] = _build_empty_readiness_state()
     state["routing"] = _build_routing_snapshot(app)
-    state["projectAccess"] = {
-        "checked": False,
-        "ready": None,
-        "required": False,
-        "authzEnforced": False,
-    }
+    state["projectAccess"] = _build_empty_project_access_state()
+    state["projectAccess"]["required"] = _project_access_required(app)
     state["checks"] = {
         "paths": [],
         "files": [],
@@ -1331,6 +2490,7 @@ def _start_run(app: Flask) -> dict[str, Any]:
         "models": {},
         "schema": {},
         "project_access": {},
+        "bootstrap": {},
         "routing": dict(state["routing"]),
         "runtime": {},
     }
@@ -1355,8 +2515,9 @@ def _start_run(app: Flask) -> dict[str, Any]:
     state["state_version"] = STARTUP_STATE_VERSION
     state["contract_version"] = STARTUP_CONTRACT_VERSION
     state["metadata"] = {
-        "authzEnforced": False,
+        "authzEnforced": None,
         "runtimeReadOnly": True,
+        "privateIdentifiersExposed": False,
         "routingSnapshot": dict(state["routing"]),
     }
     _store_namespace_startup_projection(app, state)
@@ -1401,13 +2562,39 @@ def _skip_run(app: Flask, reason: str) -> dict[str, Any]:
     state["completed_at"] = now
     state["run_count"] = _safe_int(state.get("run_count"), default=0, minimum=0) + 1
     state["strict_mode"] = _is_strict_startup_enabled(app)
+    state["warnings"] = []
+    state["errors"] = []
+    state["runtimeChecks"] = {}
+    state["runtimeChecksSummary"] = {}
+    state["projectAccess"] = _build_empty_project_access_state()
+    state["projectAccess"]["required"] = _project_access_required(app)
 
     state["metadata"]["skipReason"] = reason
     state["metadata"]["settingsSummary"] = _build_settings_summary(app)
     state["routing"] = _build_routing_snapshot(app)
-    state["checks"]["routing"] = dict(state["routing"])
+    state["checks"] = {
+        "paths": [],
+        "files": [],
+        "routes": [],
+        "database": {},
+        "models": {},
+        "schema": {},
+        "project_access": {},
+        "bootstrap": {},
+        "routing": dict(state["routing"]),
+        "runtime": {},
+    }
+    state["route_summary"] = {
+        "count": 0,
+        "required_missing": [],
+        "optional_missing": [],
+        "rules": [],
+    }
     state["readiness"] = _derive_readiness_state({}, state["routing"])
     state["readiness"]["startupReady"] = None
+    state["metadata"]["authzEnforced"] = None
+    state["metadata"]["runtimeReadOnly"] = True
+    state["metadata"]["privateIdentifiersExposed"] = False
 
     state["database"]["checked"] = False
     state["database"]["ok"] = None
@@ -1554,15 +2741,25 @@ def run_startup(app: Flask) -> Flask:
             except Exception:
                 pass
 
-        # raise_if_runtime_checks_failed encodes the intended policy:
-        # errors fail startup, warnings do not.
-        if raise_if_runtime_checks_failed is not None:
+        # Preserve the native runtime-check policy for native failures, then
+        # enforce the merged bootstrap/access readiness added by this module.
+        readiness = _safe_dict(state.get("readiness"))
+        if (
+            readiness.get("runtimeChecksRawReady") is False
+            and raise_if_runtime_checks_failed is not None
+        ):
             raise_if_runtime_checks_failed(runtime_result)
-        else:
-            if state.get("errors"):
-                first_error = state["errors"][0]
-                message = first_error.get("message", "Runtime startup checks failed.")
-                raise RuntimeError(message)
+
+        _validate_effective_runtime_readiness(app)
+
+        if state.get("errors"):
+            first_error = state["errors"][0]
+            message = (
+                first_error.get("message", "Runtime startup checks failed.")
+                if isinstance(first_error, Mapping)
+                else _safe_str(first_error, "Runtime startup checks failed.")
+            )
+            raise RuntimeError(message)
 
         extension_summary = _get_extension_summary(app)
         state["metadata"]["extensionSummary"] = extension_summary
@@ -1586,7 +2783,15 @@ def run_startup(app: Flask) -> Flask:
                 "defaultProjectRolesReady": completed_state.get("readiness", {}).get("defaultProjectRolesReady"),
                 "defaultProjectOwnerAssignmentReady": completed_state.get("readiness", {}).get("defaultProjectOwnerAssignmentReady"),
                 "defaultProjectAccessReady": completed_state.get("readiness", {}).get("defaultProjectAccessReady"),
-                "projectAccessAuthzEnforced": False,
+                "canonicalProjectAccessReady": completed_state.get("readiness", {}).get("canonicalProjectAccessReady"),
+                "legacyProjectAccessReady": completed_state.get("readiness", {}).get("legacyProjectAccessReady"),
+                "projectOwnerIdentityCanonical": completed_state.get("readiness", {}).get("defaultProjectOwnerIdentityCanonical"),
+                "projectOwnerFingerprint": completed_state.get("readiness", {}).get("defaultProjectOwnerFingerprint"),
+                "projectAccessSourceOfTruthReady": completed_state.get("readiness", {}).get("projectAccessSourceOfTruthReady"),
+                "projectAccessViewerReadOnly": completed_state.get("readiness", {}).get("projectAccessViewerReadOnly"),
+                "bootstrapReadinessReady": completed_state.get("readiness", {}).get("bootstrapReadinessReady"),
+                "bootstrapReadinessFailures": completed_state.get("readiness", {}).get("bootstrapReadinessFailures"),
+                "projectAccessAuthzEnforced": completed_state.get("readiness", {}).get("projectAccessAuthzEnforced"),
                 "warningCount": len(completed_state.get("warnings", []) or []),
                 "errorCount": len(completed_state.get("errors", []) or []),
                 "seedAttempted": False,
@@ -1687,10 +2892,30 @@ def get_startup_summary(app: Flask) -> dict[str, Any]:
             "projectAccessRouteSurfaceReady": route_access.get(
                 "routeSurfaceReady"
             ),
+            "projectAccessCanonicalRouteSurfaceReady": route_access.get(
+                "canonicalRouteSurfaceReady"
+            ),
+            "projectAccessLegacyRouteSurfaceReady": route_access.get(
+                "legacyRouteSurfaceReady"
+            ),
+            "projectOwnerTransferRouteRequired": route_access.get(
+                "ownerTransferRouteRequired"
+            ),
+            "projectOwnerTransferRouteReady": route_access.get(
+                "ownerTransferRouteReady"
+            ),
+            "projectAccessMissingRouteGroups": list(
+                route_access.get("missingRouteGroups") or []
+            ),
             "projectAccessMissingRouteRules": list(
                 route_access.get("missingRouteRules") or []
             ),
-            "projectAccessAuthzEnforced": False,
+            "projectAccessMissingCanonicalRouteRules": list(
+                route_access.get("missingCanonicalRouteRules") or []
+            ),
+            "projectAccessAuthzEnforced": route_access.get(
+                "authzEnforced"
+            ),
         },
         "readiness": dict(readiness),
         "projectAccess": dict(project_access),
@@ -1709,8 +2934,11 @@ def get_startup_summary(app: Flask) -> dict[str, Any]:
         },
         "runtimeChecks": runtime_checks_summary,
         "settings": settings_summary,
-        "authzEnforced": False,
+        "authzEnforced": project_access.get("authzEnforced"),
         "runtimeReadOnly": True,
+        "privateIdentifiersExposed": bool(
+            project_access.get("identityExposed")
+        ),
     }
 
 
@@ -1843,6 +3071,10 @@ __all__ = [
     "STARTUP_CONTRACT_VERSION",
     "PROJECT_ACCESS_BLUEPRINT_NAME",
     "PROJECT_ACCESS_CORE_ROUTE_RULES",
+    "PROJECT_ACCESS_CANONICAL_ROUTE_RULES",
+    "PROJECT_ACCESS_LEGACY_ROUTE_RULES",
+    "PROJECT_ACCESS_REQUIRED_ROUTE_GROUPS",
+    "PROJECT_ACCESS_OWNER_TRANSFER_ROUTE_RULES",
     "PathCheckSpec",
     "FileCheckSpec",
     "RouteCheckSpec",

@@ -11,6 +11,8 @@ Responsibilities:
 - ensure schema bootstrap runs before seed bootstrap,
 - repair partial default seed invariants in explicit bootstrap mode,
 - ensure the concrete editable default world `world_spawn` exists,
+- repair the canonical `auth_dev_owner` project owner on local/dev bootstrap,
+- require canonical and legacy project-access projections for the dev project,
 - require the default runtime BlockRegistry,
 - require the reserved Air persistence invariant,
 - require the canonical `system_railing` BlockType mirror,
@@ -44,7 +46,10 @@ Seed invariant rule:
         Project.project_id      = dev-project
         Universe.universe_id    = dev-universe
         WorldInstance.world_id  = world_spawn
-        BlockRegistry              = debug-blocks@1
+        Project.owner_auth_user_id = auth_dev_owner (or persisted canonical owner)
+        ProjectAccessAssignment      = exactly one direct owner
+        ProjectRole keys             = owner/admin/editor/viewer
+        BlockRegistry                = debug-blocks@1
         Air cell state             = cellValue 0, without BlockType row
         BlockType.block_type_id    = system_railing
 
@@ -64,6 +69,10 @@ without changing normal runtime startup behavior.
 """
 
 from __future__ import annotations
+
+import hashlib
+import importlib
+import json
 
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
@@ -91,20 +100,29 @@ except Exception:  # pragma: no cover - fallback for direct import tests
     build_lock_diagnostics = None  # type: ignore[assignment]
     safe_session_cleanup = None  # type: ignore[assignment]
 
+_DEFAULT_SEED_IMPORT_ERROR: str | None = None
+
 try:
     from .default_seed import (
+        build_default_project_access_status,
         build_default_seed_status,
         build_default_seed_summary,
         build_default_system_blocks_status,
         default_seed_result_to_dict,
         run_default_seed,
+        seed_default_project_access,
     )
-except Exception:  # pragma: no cover - fallback for partial import tests
+except Exception as exc:  # pragma: no cover - fallback for partial import tests
+    _DEFAULT_SEED_IMPORT_ERROR = (
+        f"{exc.__class__.__name__}: {str(exc) or exc.__class__.__name__}"
+    )
+    build_default_project_access_status = None  # type: ignore[assignment]
     build_default_seed_status = None  # type: ignore[assignment]
     build_default_seed_summary = None  # type: ignore[assignment]
     build_default_system_blocks_status = None  # type: ignore[assignment]
     default_seed_result_to_dict = None  # type: ignore[assignment]
     run_default_seed = None  # type: ignore[assignment]
+    seed_default_project_access = None  # type: ignore[assignment]
 
 try:
     from .schema_bootstrap import (
@@ -124,6 +142,7 @@ try:
         BootstrapSettings,
         build_bootstrap_settings,
         get_bool_setting,
+        get_str_setting,
     )
 except Exception:  # pragma: no cover - fallback for direct import tests
     BootstrapSettings = Any  # type: ignore[misc, assignment]
@@ -153,12 +172,30 @@ except Exception:  # pragma: no cover - fallback for direct import tests
             return False
         return default
 
+    def get_str_setting(
+        app: Any,
+        key: str,
+        default: str = "",
+        aliases: Sequence[str] | None = None,
+        prefer_env: bool = True,
+    ) -> str:
+        keys = (key, *(aliases or ()))
+        for candidate in keys:
+            try:
+                value = getattr(app, "config", {}).get(candidate)
+            except Exception:
+                value = None
+            text_value = str(value).strip() if value is not None else ""
+            if text_value:
+                return text_value
+        return default
+
 
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
 
-DB_BOOTSTRAP_RESULT_VERSION: Final[str] = "db-bootstrap-result.v3"
+DB_BOOTSTRAP_RESULT_VERSION: Final[str] = "db-bootstrap-result.v5"
 
 STATUS_COMPLETED: Final[str] = "completed"
 STATUS_SKIPPED: Final[str] = "skipped"
@@ -197,6 +234,136 @@ BLOCK_REGISTRY_ALLOWED_SOURCES: Final[tuple[str, ...]] = (
 DEFAULT_SYSTEM_AIR_BLOCK_ID: Final[str] = "system_air"
 DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID: Final[str] = "system_railing"
 DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID: Final[str] = "vectoplan-system-block-bootstrap"
+
+DEFAULT_PROJECT_OWNER_AUTH_USER_ID: Final[str] = "auth_dev_owner"
+DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE: Final[str] = "vectoplan-app"
+DEFAULT_PROJECT_ACCESS_SERVICE_ID: Final[str] = "vectoplan-chunk-init"
+DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION: Final[str] = "app-project-access-v1"
+DEFAULT_PROJECT_ACCESS_ROLE: Final[str] = "owner"
+DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE: Final[str] = "direct"
+DEFAULT_PROJECT_ROLE_KEYS: Final[tuple[str, ...]] = (
+    "owner",
+    "admin",
+    "editor",
+    "viewer",
+)
+
+_DEFAULT_SEED_EXPORT_NAMES: Final[tuple[str, ...]] = (
+    "build_default_project_access_status",
+    "build_default_seed_status",
+    "build_default_seed_summary",
+    "build_default_system_blocks_status",
+    "default_seed_result_to_dict",
+    "run_default_seed",
+    "seed_default_project_access",
+)
+
+
+@lru_cache(maxsize=1)
+def _load_default_seed_api() -> Mapping[str, Any]:
+    """
+    Load available default-seed exports lazily.
+
+    The eager relative import above is retained for compatibility, but one
+    missing export or an import-order issue must not disable every seed helper.
+    Import failures are not cached by functools.lru_cache, so a later retry can
+    succeed after package initialization has completed.
+    """
+    candidates: list[tuple[str, str | None]] = []
+    package_name = _safe_str(globals().get("__package__"), "")
+    if package_name:
+        candidates.append((".default_seed", package_name))
+    candidates.extend(
+        (
+            ("src.bootstrap.default_seed", None),
+            ("bootstrap.default_seed", None),
+        )
+    )
+
+    import_errors: list[str] = []
+    seen: set[tuple[str, str | None]] = set()
+    for module_name, package in candidates:
+        key = (module_name, package)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            module = importlib.import_module(module_name, package=package)
+        except Exception as exc:
+            import_errors.append(
+                f"{module_name}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+            continue
+
+        exports: dict[str, Any] = {
+            "module": module,
+            "moduleName": _safe_str(getattr(module, "__name__", None), module_name),
+            "modulePath": _safe_str(getattr(module, "__file__", None), ""),
+        }
+        for export_name in _DEFAULT_SEED_EXPORT_NAMES:
+            value = getattr(module, export_name, None)
+            if callable(value):
+                exports[export_name] = value
+
+        if len(exports) > 3:
+            exports["missingExports"] = [
+                name for name in _DEFAULT_SEED_EXPORT_NAMES if name not in exports
+            ]
+            exports["eagerImportError"] = _DEFAULT_SEED_IMPORT_ERROR
+            return MappingProxyType(exports)
+
+        import_errors.append(
+            f"{module_name}: module imported but no supported seed exports exist"
+        )
+
+    details = " | ".join(import_errors)
+    if _DEFAULT_SEED_IMPORT_ERROR:
+        details = (
+            f"eager import: {_DEFAULT_SEED_IMPORT_ERROR}"
+            + (f" | {details}" if details else "")
+        )
+    raise RuntimeError(
+        "Could not import any usable default-seed API."
+        + (f" {details}" if details else "")
+    )
+
+
+def _get_default_seed_callable(name: str) -> Any | None:
+    """Resolve one seed callable without making all exports interdependent."""
+    current = globals().get(name)
+    if callable(current):
+        return current
+    try:
+        api = _load_default_seed_api()
+    except Exception:
+        return None
+    value = api.get(name)
+    return value if callable(value) else None
+
+
+def _default_seed_api_diagnostics() -> dict[str, Any]:
+    """Return bounded import diagnostics without exposing tracebacks."""
+    try:
+        api = _load_default_seed_api()
+        return {
+            "available": True,
+            "moduleName": api.get("moduleName"),
+            "modulePath": api.get("modulePath"),
+            "missingExports": list(api.get("missingExports") or []),
+            "eagerImportError": api.get("eagerImportError"),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "eagerImportError": _DEFAULT_SEED_IMPORT_ERROR,
+            "error": _safe_exception_message(exc),
+        }
+
+
+def clear_db_bootstrap_default_seed_caches() -> None:
+    """Clear immutable default-seed import caches only."""
+    _load_default_seed_api.cache_clear()
 
 
 # -----------------------------------------------------------------------------
@@ -259,8 +426,17 @@ class DbBootstrapResult:
     default_universe_ready: bool | None = None
     default_world_ready: bool | None = None
 
+    project_owner_ready: bool | None = None
+    project_access_ready: bool | None = None
+    canonical_project_access_ready: bool | None = None
+    legacy_project_access_ready: bool | None = None
+    project_owner_auth_user_id: str | None = None
+    project_access_assignment_count: int = 0
+    project_access_role_count: int = 0
+
     block_registry_ready: bool | None = None
     debug_blocks_ready: bool | None = None
+    debug_blocks_required: bool = False
 
     system_blocks_ready: bool | None = None
     system_railing_ready: bool | None = None
@@ -281,6 +457,7 @@ class DbBootstrapResult:
     schema: dict[str, Any] = field(default_factory=dict)
     seed: dict[str, Any] = field(default_factory=dict)
     seed_invariant: dict[str, Any] = field(default_factory=dict)
+    project_access: dict[str, Any] = field(default_factory=dict)
     system_blocks: dict[str, Any] = field(default_factory=dict)
     pre_status: dict[str, Any] = field(default_factory=dict)
     post_status: dict[str, Any] = field(default_factory=dict)
@@ -414,6 +591,279 @@ def _safe_dict(value: Any) -> dict[str, Any]:
 
     return {}
 
+
+
+def _looks_like_unsafe_auth_user_id(value: Any) -> bool:
+    """Return whether a value is a local/placeholder identity, not an auth id."""
+    text = _safe_str(value, "")
+    if not text:
+        return True
+
+    lowered = text.lower()
+    if text.isdigit() or lowered in {
+        "none",
+        "null",
+        "undefined",
+        "anonymous",
+        "guest",
+        "bootstrap",
+        "system",
+    }:
+        return True
+    if "@" in text or "://" in text:
+        return True
+    if any(character.isspace() or ord(character) < 32 for character in text):
+        return True
+
+    allowed = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+    )
+    return len(text) > 255 or any(character not in allowed for character in text)
+
+
+def _normalize_auth_user_id(
+    value: Any,
+    default: str = DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+) -> str:
+    """Normalize a canonical cross-service auth id and replace legacy ids."""
+    candidate = _safe_str(value, "")
+    if not _looks_like_unsafe_auth_user_id(candidate):
+        return candidate
+
+    fallback = _safe_str(default, "")
+    if fallback and not _looks_like_unsafe_auth_user_id(fallback):
+        return fallback
+    return ""
+
+
+def _configured_project_owner_auth_user_id(
+    app: Any,
+    settings: Any = None,
+) -> str:
+    """Resolve the canonical default-project owner from new and legacy settings."""
+    world_defaults = getattr(settings, "world_defaults", None) if settings else None
+    for attribute_name in (
+        "project_owner_auth_user_id",
+        "default_project_owner_auth_user_id",
+        "owner_auth_user_id",
+        "project_owner_user_id",
+        "default_project_owner_user_id",
+        "owner_user_id",
+    ):
+        try:
+            value = getattr(world_defaults, attribute_name, None)
+        except Exception:
+            value = None
+        normalized = _normalize_auth_user_id(value, "")
+        if normalized:
+            return normalized
+
+    raw_value = get_str_setting(
+        app,
+        "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+        DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+        aliases=(
+            "VECTOPLAN_CHUNK_DEFAULT_OWNER_AUTH_USER_ID",
+            "VECTOPLAN_CHUNK_PROJECT_OWNER_AUTH_USER_ID",
+            "VECTOPLAN_CHUNK_DEV_PROJECT_OWNER_AUTH_USER_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+            "VECTOPLAN_CHUNK_DEFAULT_OWNER_USER_ID",
+            "VECTOPLAN_CHUNK_PROJECT_OWNER_USER_ID",
+        ),
+        prefer_env=True,
+    )
+    return _normalize_auth_user_id(
+        raw_value,
+        DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+    )
+
+
+def _project_owner_from_model(project: Any, fallback: str) -> str:
+    """Return a canonical stored owner, ignoring numeric/placeholder values."""
+    for name in (
+        "owner_auth_user_id",
+        "owner_id",
+        "owner_user_id",
+        "created_by_auth_user_id",
+        "created_by_user_id",
+    ):
+        try:
+            value = getattr(project, name, None)
+        except Exception:
+            value = None
+        normalized = _normalize_auth_user_id(value, "")
+        if normalized:
+            return normalized
+    return _normalize_auth_user_id(fallback, DEFAULT_PROJECT_OWNER_AUTH_USER_ID)
+
+
+def _apply_project_owner_fields(project: Any, owner_auth_user_id: str) -> str:
+    """Repair compatible owner/actor fields to one canonical auth identity."""
+    owner = _normalize_auth_user_id(
+        owner_auth_user_id,
+        DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+    )
+    if not owner:
+        raise RuntimeError("A canonical project owner auth_user_id is required.")
+
+    setter = getattr(project, "set_owner_user", None)
+    if callable(setter):
+        try:
+            setter(owner, updated_by_user_id=owner)
+        except TypeError:
+            try:
+                setter(owner)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _set_attr_if_supported(project, "owner_type", "user")
+    for field_name in (
+        "owner_auth_user_id",
+        "owner_id",
+        "owner_user_id",
+        "created_by_auth_user_id",
+        "updated_by_auth_user_id",
+        "created_by_user_id",
+        "updated_by_user_id",
+    ):
+        _set_attr_if_supported(project, field_name, owner)
+    return owner
+
+
+def _project_owner_fields_ready(project: Any, owner_auth_user_id: str) -> bool:
+    """Return whether mapped project owner fields carry one canonical identity."""
+    owner = _normalize_auth_user_id(owner_auth_user_id, "")
+    if project is None or not owner:
+        return False
+
+    actual = _project_owner_from_model(project, "")
+    if actual != owner:
+        return False
+
+    owner_type = _safe_str(getattr(project, "owner_type", "user"), "user").lower()
+    if owner_type != "user":
+        return False
+
+    for name in ("owner_auth_user_id", "owner_id"):
+        if not hasattr(project, name) and not _model_has_column(project.__class__, name):
+            continue
+        value = _safe_str(getattr(project, name, None), "")
+        if value and _normalize_auth_user_id(value, "") != owner:
+            return False
+    return True
+
+
+def _project_access_required(app: Any, seed_settings: Any = None) -> bool:
+    """Return whether access is required for mutation or read-only readiness.
+
+    When seed settings are supplied, project seeding implies access seeding.
+    Read-only status checks deliberately ignore disabled mutation flags and follow
+    the runtime access-control requirement instead.
+    """
+    if seed_settings is not None:
+        try:
+            explicit = getattr(seed_settings, "seed_project_access", None)
+        except Exception:
+            explicit = None
+        try:
+            seed_project = getattr(seed_settings, "seed_dev_project", None)
+        except Exception:
+            seed_project = None
+        if explicit is not None or seed_project is not None:
+            return bool(
+                _safe_bool(explicit, False)
+                or _safe_bool(seed_project, False)
+            )
+
+    return get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_PROJECT_ACCESS_REQUIRED",
+        get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED",
+            True,
+            aliases=("CHUNK_ACCESS_CONTROL_ENABLED",),
+            prefer_env=True,
+        ),
+        aliases=("CHUNK_PROJECT_ACCESS_REQUIRED",),
+        prefer_env=True,
+    )
+
+
+def _debug_blocks_required(app: Any, seed_settings: Any = None) -> bool:
+    """Return whether debug block rows are an explicit seed requirement."""
+    try:
+        explicit = getattr(seed_settings, "seed_debug_blocks", None)
+    except Exception:
+        explicit = None
+    if explicit is not None:
+        return _safe_bool(explicit, False)
+
+    return get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",
+        get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
+            False,
+            aliases=("CHUNK_SEED_DEBUG_BLOCKS",),
+            prefer_env=True,
+        ),
+        aliases=("CHUNK_DB_BOOTSTRAP_SEED_DEBUG_BLOCKS",),
+        prefer_env=True,
+    )
+
+
+def _result_to_dict_with_variants(value: Any) -> dict[str, Any]:
+    """Serialize service results whose to_dict signatures differ by generation."""
+    data = _safe_dict(value)
+    if data:
+        return data
+
+    serializer = getattr(value, "to_dict", None)
+    if not callable(serializer):
+        return {}
+    for kwargs in (
+        {"include_internal": True, "include_metadata": False},
+        {"include_private": False},
+        {},
+    ):
+        try:
+            candidate = serializer(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return {}
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
+
+
+def _project_access_projection_fingerprint(
+    project_id: str,
+    owner_auth_user_id: str,
+) -> str:
+    """Build the deterministic one-owner bootstrap projection fingerprint."""
+    canonical = json.dumps(
+        {
+            "assignments": [
+                {
+                    "active": True,
+                    "assignment_type": DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                    "auth_user_id": owner_auth_user_id,
+                    "role": DEFAULT_PROJECT_ACCESS_ROLE,
+                }
+            ],
+            "chunk_project_id": project_id,
+            "projection_version": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+            "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 def _safe_log_info(app: Any, message: str, *args: Any) -> None:
     """Info-log defensively."""
@@ -647,7 +1097,7 @@ def _default_block_registry_version(app: Any) -> str:
 # -----------------------------------------------------------------------------
 
 def _import_model_class_map() -> dict[str, Any]:
-    """Import model class map robustly."""
+    """Import the complete model class map robustly."""
     try:
         from models import get_model_class_map
 
@@ -658,9 +1108,13 @@ def _import_model_class_map() -> dict[str, Any]:
         pass
 
     model_map: dict[str, Any] = {}
-
     for class_name in (
         "Project",
+        "ProjectAccessAssignment",
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
         "Universe",
         "WorldInstance",
         "BlockRegistry",
@@ -671,7 +1125,6 @@ def _import_model_class_map() -> dict[str, Any]:
             model_map[class_name] = getattr(module, class_name)
         except Exception:
             model_map[class_name] = None
-
     return model_map
 
 
@@ -836,6 +1289,1296 @@ def _row_public_id(row: Any, *names: str) -> str | None:
     return None
 
 
+
+# -----------------------------------------------------------------------------
+# Default project owner/access projection
+# -----------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_project_access_projection_api() -> Mapping[str, Any]:
+    """Load the canonical access projection service without touching the DB."""
+    errors: list[str] = []
+    for module_name in (
+        "src.services.project_access_service",
+        "services.project_access_service",
+        "project_access_service",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            initialize = getattr(module, "initialize_project_access", None)
+            if not callable(initialize):
+                raise RuntimeError("initialize_project_access export is unavailable")
+            return MappingProxyType(
+                {
+                    "module": module,
+                    "moduleName": module_name,
+                    "initialize": initialize,
+                }
+            )
+        except Exception as exc:
+            errors.append(
+                f"{module_name}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+    raise RuntimeError(
+        "Could not import the canonical project-access service. "
+        + " | ".join(errors)
+    )
+
+
+def clear_db_bootstrap_project_access_caches() -> None:
+    """Clear immutable access integration caches; never change database state."""
+    try:
+        api = _load_project_access_projection_api()
+        module = api.get("module")
+        clear_function = getattr(module, "clear_project_access_cache", None)
+        if callable(clear_function):
+            clear_function()
+    except Exception:
+        pass
+    _load_project_access_projection_api.cache_clear()
+
+
+def _initialize_canonical_project_access(
+    app: Any,
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """Initialize ProjectAccessAssignment without committing the outer transaction."""
+    models = _import_model_class_map()
+    assignment_model = models.get("ProjectAccessAssignment")
+    project_model = models.get("Project") or project.__class__
+    project_id = _safe_str(getattr(project, "project_id", None), _default_project_id(app))
+    owner = _normalize_auth_user_id(owner_auth_user_id)
+    fingerprint = _project_access_projection_fingerprint(project_id, owner)
+    request_id = f"bootstrap-{project_id}"
+    correlation_id = request_id
+    service_errors: list[str] = []
+
+    if assignment_model is None:
+        raise RuntimeError("ProjectAccessAssignment model is unavailable.")
+
+    try:
+        api = _load_project_access_projection_api()
+        initialize = api["initialize"]
+        payload = {
+            "owner_auth_user_id": owner,
+            "assignments": [
+                {
+                    "auth_user_id": owner,
+                    "role": DEFAULT_PROJECT_ACCESS_ROLE,
+                    "assignment_type": DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                    "active": True,
+                    "managed": True,
+                    "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                }
+            ],
+            "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+            "projection_version": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+        }
+        principal = {
+            "service_id": DEFAULT_PROJECT_ACCESS_SERVICE_ID,
+            "authenticated": True,
+            "exempt": False,
+            "request_id": request_id,
+            "correlation_id": correlation_id,
+        }
+        config = {
+            "VECTOPLAN_CHUNK_ACCESS_CONTROL_ENABLED": True,
+            "VECTOPLAN_CHUNK_ACCESS_DEFAULT_DENY": True,
+            "VECTOPLAN_CHUNK_ACCESS_SOURCE_SERVICE": (
+                DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE
+            ),
+            "VECTOPLAN_CHUNK_ACCESS_PROJECTION_VERSION": (
+                DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION
+            ),
+            "VECTOPLAN_CHUNK_ACCESS_PRUNE_STALE_DIRECT_ASSIGNMENTS": True,
+            "VECTOPLAN_CHUNK_ACCESS_PRESERVE_GROUP_ASSIGNMENTS": True,
+            "VECTOPLAN_CHUNK_ACCESS_VERIFY_AFTER_SYNC": True,
+            "VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED": True,
+            "VECTOPLAN_CHUNK_SERVICE_AUTH_REQUIRED": True,
+        }
+        raw_result = initialize(
+            project_id,
+            payload,
+            session=db_obj.session,
+            assignment_model=assignment_model,
+            project_model=project_model,
+            principal=principal,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=f"bootstrap:{project_id}:{fingerprint}",
+            commit=False,
+            dry_run=False,
+            force=True,
+            raise_on_error=True,
+            config=config,
+        )
+        data = _result_to_dict_with_variants(raw_result)
+        if data and not _safe_bool(data.get("ok"), False):
+            raise RuntimeError(
+                _safe_str(
+                    data.get("error"),
+                    data.get("code") or "canonical access synchronization failed",
+                )
+            )
+        db_obj.session.flush()
+        return {
+            "ok": True,
+            "backend": api.get("moduleName"),
+            "result": data,
+            "projectionFingerprint": fingerprint,
+            "ownerAuthUserId": owner,
+        }
+    except Exception as exc:
+        service_errors.append(
+            f"{exc.__class__.__name__}: {_safe_exception_message(exc)}"
+        )
+
+    # Direct ORM fallback. Group assignments and non-owner direct members remain.
+    try:
+        rows = (
+            db_obj.session.query(assignment_model)
+            .filter(getattr(assignment_model, "chunk_project_id") == project_id)
+            .all()
+        )
+    except Exception:
+        try:
+            rows = db_obj.session.query(assignment_model).all()
+        except Exception:
+            rows = []
+        rows = [
+            row
+            for row in rows
+            if _safe_str(getattr(row, "chunk_project_id", ""), "") == project_id
+        ]
+
+    owner_row = None
+    demoted_count = 0
+    duplicate_owner_rows: list[Any] = []
+    for row in rows:
+        assignment_type = _safe_str(
+            getattr(row, "assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+            DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+        ).lower()
+        if assignment_type == "group":
+            continue
+
+        row_owner = _normalize_auth_user_id(getattr(row, "auth_user_id", None), "")
+        row_role = _safe_str(getattr(row, "role", ""), "").lower()
+        row_active = _safe_bool(getattr(row, "active", True), True)
+
+        if row_owner == owner:
+            if owner_row is None:
+                owner_row = row
+            else:
+                duplicate_owner_rows.append(row)
+            continue
+
+        if row_role == DEFAULT_PROJECT_ACCESS_ROLE and row_active:
+            _set_attr_if_supported(row, "role", "admin")
+            _set_attr_if_supported(row, "updated_at", _utc_now())
+            db_obj.session.add(row)
+            demoted_count += 1
+
+    for duplicate in duplicate_owner_rows:
+        _set_attr_if_supported(duplicate, "role", "admin")
+        _set_attr_if_supported(duplicate, "updated_at", _utc_now())
+        db_obj.session.add(duplicate)
+        demoted_count += 1
+
+    created = False
+    if owner_row is None:
+        factory = getattr(assignment_model, "create_direct", None)
+        if callable(factory):
+            owner_row = factory(
+                chunk_project_id=project_id,
+                auth_user_id=owner,
+                role=DEFAULT_PROJECT_ACCESS_ROLE,
+                active=True,
+                managed=True,
+                source_service=DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                projection_version=DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+                projection_fingerprint=fingerprint,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                metadata_json={
+                    "seededBy": "db_bootstrap.default_world_invariant_repair",
+                    "bootstrapService": DEFAULT_PROJECT_ACCESS_SERVICE_ID,
+                },
+            )
+        else:
+            owner_row = _make_instance(
+                assignment_model,
+                {
+                    "chunk_project_id": project_id,
+                    "auth_user_id": owner,
+                    "group_id": None,
+                    "role": DEFAULT_PROJECT_ACCESS_ROLE,
+                    "assignment_type": DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+                    "active": True,
+                    "managed": True,
+                    "source_service": DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+                    "projection_version": DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION,
+                    "projection_fingerprint": fingerprint,
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "metadata_json": {
+                        "seededBy": "db_bootstrap.default_world_invariant_repair",
+                    },
+                },
+            )
+        db_obj.session.add(owner_row)
+        created = True
+    else:
+        for field_name, value in (
+            ("role", DEFAULT_PROJECT_ACCESS_ROLE),
+            ("assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+            ("active", True),
+            ("managed", True),
+            ("source_service", DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE),
+            ("projection_version", DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION),
+            ("projection_fingerprint", fingerprint),
+            ("request_id", request_id),
+            ("correlation_id", correlation_id),
+            ("deactivated_at", None),
+            ("updated_at", _utc_now()),
+        ):
+            _set_attr_if_supported(owner_row, field_name, value)
+        db_obj.session.add(owner_row)
+
+    db_obj.session.flush()
+    now = _utc_now()
+    for field_name, value in (
+        ("access_sync_status", "ready"),
+        ("access_projection_version", DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION),
+        ("access_projection_fingerprint", fingerprint),
+        ("access_sync_request_id", request_id),
+        ("access_sync_correlation_id", correlation_id),
+        ("access_sync_error_code", None),
+        ("access_sync_retryable", False),
+        ("access_sync_repair_required", False),
+        ("access_synced_at", now),
+        ("access_sync_updated_at", now),
+    ):
+        _set_attr_if_supported(project, field_name, value)
+    db_obj.session.add(project)
+    db_obj.session.flush()
+
+    return {
+        "ok": True,
+        "backend": "direct_project_access_assignment",
+        "created": created,
+        "demotedExtraOwners": demoted_count,
+        "projectionFingerprint": fingerprint,
+        "ownerAuthUserId": owner,
+        "serviceErrors": service_errors,
+    }
+
+
+
+def _legacy_role_permissions(role_key: str) -> dict[str, bool]:
+    """Return deterministic compatibility permissions for one standard role."""
+    role_key = _safe_str(role_key, "").lower()
+    permission_keys = (
+        "view",
+        "edit",
+        "manage",
+        "delete",
+        "transfer",
+        "embed",
+        "view_settings",
+        "manage_settings",
+        "view_team",
+        "manage_team",
+        "view_admin",
+    )
+    if role_key == "owner":
+        return {key: True for key in permission_keys}
+    if role_key == "admin":
+        enabled = {
+            "view",
+            "edit",
+            "manage",
+            "delete",
+            "embed",
+            "view_settings",
+            "manage_settings",
+            "view_team",
+            "manage_team",
+            "view_admin",
+        }
+        return {key: key in enabled for key in permission_keys}
+    if role_key == "editor":
+        enabled = {"view", "edit", "embed", "view_settings", "view_team"}
+        return {key: key in enabled for key in permission_keys}
+    return {key: key == "view" for key in permission_keys}
+
+
+def _legacy_assignment_is_active(row: Any, now: datetime | None = None) -> bool:
+    """Evaluate a legacy role assignment without loading relationships."""
+    now = now or _utc_now()
+    status_value = _safe_str(getattr(row, "status", "active"), "active").lower()
+    if status_value not in {"active", "ready", "enabled"}:
+        return False
+    if getattr(row, "deleted_at", None) is not None:
+        return False
+    if getattr(row, "revoked_at", None) is not None:
+        return False
+    starts_at = getattr(row, "starts_at", None)
+    expires_at = getattr(row, "expires_at", None)
+    try:
+        if isinstance(starts_at, datetime):
+            if starts_at.tzinfo is None:
+                starts_at = starts_at.replace(tzinfo=timezone.utc)
+            if now < starts_at.astimezone(timezone.utc):
+                return False
+        if isinstance(expires_at, datetime):
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if now >= expires_at.astimezone(timezone.utc):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _initialize_legacy_project_access_direct(
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """
+    Ensure standard legacy roles and one owner assignment using mapped columns.
+
+    This path is used only when compatibility adapters are missing or return an
+    incomplete result. It participates in the caller's transaction and never
+    commits independently.
+    """
+    models = _import_model_class_map()
+    ProjectRole = models.get("ProjectRole")
+    ProjectRoleAssignment = models.get("ProjectRoleAssignment")
+    if ProjectRole is None or ProjectRoleAssignment is None:
+        raise RuntimeError(
+            "Legacy ProjectRole or ProjectRoleAssignment model is unavailable."
+        )
+
+    project_db_id = _row_db_id(project)
+    project_id = _safe_str(
+        getattr(project, "project_id", None),
+        DEFAULT_PROJECT_ID,
+    )
+    owner = _normalize_auth_user_id(owner_auth_user_id)
+    if project_db_id is None:
+        raise RuntimeError(
+            "Cannot initialize legacy project access without project database id."
+        )
+
+    now = _utc_now()
+    roles: dict[str, Any] = {}
+    roles_created = 0
+    roles_updated = 0
+
+    try:
+        existing_roles = (
+            db_obj.session.query(ProjectRole)
+            .filter(getattr(ProjectRole, "project_db_id") == project_db_id)
+            .limit(64)
+            .all()
+        )
+    except Exception:
+        existing_roles = []
+
+    for role_key in DEFAULT_PROJECT_ROLE_KEYS:
+        candidates = [
+            row
+            for row in existing_roles
+            if _safe_str(getattr(row, "role_key", None), "").lower()
+            == role_key
+        ]
+        role = next(
+            (
+                row
+                for row in candidates
+                if _safe_str(
+                    getattr(row, "status", "active"),
+                    "active",
+                ).lower()
+                in {"active", "ready", "enabled"}
+                and getattr(row, "deleted_at", None) is None
+            ),
+            candidates[0] if candidates else None,
+        )
+
+        role_id = f"{project_id}:{role_key}"
+        created = role is None
+        if role is None:
+            role = _make_instance(
+                ProjectRole,
+                {
+                    "role_id": role_id,
+                    "project_db_id": project_db_id,
+                    "role_key": role_key,
+                    "name": role_key.title(),
+                    "description": (
+                        f"Bootstrap compatibility role '{role_key}' for "
+                        f"project '{project_id}'."
+                    ),
+                    "permissions_json": _legacy_role_permissions(role_key),
+                    "is_system": True,
+                    "status": "active",
+                    "schema_version": "project-role.schema.v1",
+                    "revision": 1,
+                    "created_by_user_id": owner,
+                    "updated_by_user_id": owner,
+                    "metadata_json": {
+                        "seededBy": (
+                            "db_bootstrap."
+                            "default_world_invariant_repair"
+                        ),
+                        "sourceService": (
+                            DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE
+                        ),
+                    },
+                    "created_at": now,
+                    "updated_at": now,
+                    "deleted_at": None,
+                },
+            )
+            db_obj.session.add(role)
+            roles_created += 1
+        else:
+            changed = False
+            for field_name, value in (
+                ("role_id", _safe_str(getattr(role, "role_id", None), role_id)),
+                ("project_db_id", project_db_id),
+                ("role_key", role_key),
+                ("name", role_key.title()),
+                ("permissions_json", _legacy_role_permissions(role_key)),
+                ("is_system", True),
+                ("status", "active"),
+                ("updated_by_user_id", owner),
+                ("updated_at", now),
+                ("deleted_at", None),
+            ):
+                changed = _set_attr_if_supported(role, field_name, value) or changed
+            if changed:
+                roles_updated += 1
+            db_obj.session.add(role)
+
+        roles[role_key] = role
+
+        # Fresh installs have no duplicates. On repaired databases, deactivate
+        # duplicate active rows so readiness remains deterministic.
+        for duplicate in candidates:
+            if duplicate is role:
+                continue
+            duplicate_changed = False
+            duplicate_changed = _set_attr_if_supported(
+                duplicate,
+                "status",
+                "inactive",
+            ) or duplicate_changed
+            duplicate_changed = _set_attr_if_supported(
+                duplicate,
+                "deleted_at",
+                now,
+            ) or duplicate_changed
+            duplicate_changed = _set_attr_if_supported(
+                duplicate,
+                "updated_by_user_id",
+                owner,
+            ) or duplicate_changed
+            duplicate_changed = _set_attr_if_supported(
+                duplicate,
+                "updated_at",
+                now,
+            ) or duplicate_changed
+            if duplicate_changed:
+                roles_updated += 1
+            db_obj.session.add(duplicate)
+
+    db_obj.session.flush()
+
+    owner_role = roles["owner"]
+    admin_role = roles["admin"]
+    owner_role_db_id = _row_db_id(owner_role)
+    admin_role_db_id = _row_db_id(admin_role)
+    owner_role_id = _safe_str(getattr(owner_role, "role_id", None), "")
+    admin_role_id = _safe_str(getattr(admin_role, "role_id", None), "")
+
+    try:
+        assignments = (
+            db_obj.session.query(ProjectRoleAssignment)
+            .filter(
+                getattr(ProjectRoleAssignment, "project_db_id")
+                == project_db_id
+            )
+            .limit(128)
+            .all()
+        )
+    except Exception:
+        assignments = []
+
+    owner_role_assignments = [
+        row
+        for row in assignments
+        if (
+            (
+                owner_role_db_id is not None
+                and getattr(row, "role_db_id", None) == owner_role_db_id
+            )
+            or (
+                owner_role_id
+                and _safe_str(getattr(row, "role_id", None), "")
+                == owner_role_id
+            )
+        )
+    ]
+    matching_candidates = [
+        row
+        for row in owner_role_assignments
+        if _safe_str(getattr(row, "subject_type", "user"), "user").lower()
+        == "user"
+        and _normalize_auth_user_id(
+            getattr(row, "user_id", None),
+            "",
+        )
+        == owner
+    ]
+
+    primary_owner_assignment = next(
+        (
+            row
+            for row in matching_candidates
+            if _legacy_assignment_is_active(row, now)
+        ),
+        matching_candidates[0] if matching_candidates else None,
+    )
+    assignments_created = 0
+    assignments_demoted = 0
+
+    if primary_owner_assignment is None:
+        assignment_fingerprint = hashlib.sha256(
+            f"{project_id}:{owner}:owner".encode("utf-8")
+        ).hexdigest()[:24]
+        primary_owner_assignment = _make_instance(
+            ProjectRoleAssignment,
+            {
+                "assignment_id": (
+                    f"bootstrap-owner-{assignment_fingerprint}"
+                ),
+                "project_db_id": project_db_id,
+                "role_db_id": owner_role_db_id,
+                "role_id": owner_role_id or None,
+                "subject_type": "user",
+                "user_id": owner,
+                "group_db_id": None,
+                "group_id": None,
+                "subject_key": f"user:{owner}",
+                "permission_overrides_json": {},
+                "status": "active",
+                "assigned_by_user_id": owner,
+                "revoked_by_user_id": None,
+                "starts_at": None,
+                "expires_at": None,
+                "revoked_at": None,
+                "revocation_reason": None,
+                "schema_version": "project-role-assignment.schema.v1",
+                "revision": 1,
+                "created_by_user_id": owner,
+                "updated_by_user_id": owner,
+                "metadata_json": {
+                    "seededBy": (
+                        "db_bootstrap.default_world_invariant_repair"
+                    ),
+                    "sourceService": (
+                        DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE
+                    ),
+                },
+                "created_at": now,
+                "updated_at": now,
+                "deleted_at": None,
+            },
+        )
+        db_obj.session.add(primary_owner_assignment)
+        assignments_created += 1
+    else:
+        for field_name, value in (
+            ("project_db_id", project_db_id),
+            ("role_db_id", owner_role_db_id),
+            ("role_id", owner_role_id or None),
+            ("subject_type", "user"),
+            ("user_id", owner),
+            ("status", "active"),
+            ("revoked_by_user_id", None),
+            ("revoked_at", None),
+            ("revocation_reason", None),
+            ("starts_at", None),
+            ("expires_at", None),
+            ("deleted_at", None),
+            ("updated_by_user_id", owner),
+            ("updated_at", now),
+        ):
+            _set_attr_if_supported(
+                primary_owner_assignment,
+                field_name,
+                value,
+            )
+        db_obj.session.add(primary_owner_assignment)
+
+    # Any other effective owner assignment is demoted to admin. Group
+    # assignments are preserved; only their role reference changes.
+    for assignment in owner_role_assignments:
+        if assignment is primary_owner_assignment:
+            continue
+        if not _legacy_assignment_is_active(assignment, now):
+            continue
+        _set_attr_if_supported(
+            assignment,
+            "role_db_id",
+            admin_role_db_id,
+        )
+        _set_attr_if_supported(
+            assignment,
+            "role_id",
+            admin_role_id or None,
+        )
+        _set_attr_if_supported(
+            assignment,
+            "updated_by_user_id",
+            owner,
+        )
+        _set_attr_if_supported(assignment, "updated_at", now)
+        db_obj.session.add(assignment)
+        assignments_demoted += 1
+
+    db_obj.session.flush()
+    status = _legacy_project_access_status(
+        project,
+        owner,
+        db_obj,
+    )
+    if not _safe_bool(status.get("ready"), False):
+        raise RuntimeError(
+            "Direct legacy project-access initialization remained incomplete: "
+            f"rolesReady={_safe_bool(status.get('rolesReady'), False)} "
+            f"ownerAssignmentReady="
+            f"{_safe_bool(status.get('ownerAssignmentReady'), False)} "
+            f"missingRoles={status.get('missingRoleKeys')}"
+        )
+
+    return {
+        "ok": True,
+        "backend": "direct_legacy_project_access_models",
+        "rolesCreated": roles_created,
+        "rolesUpdated": roles_updated,
+        "assignmentsCreated": assignments_created,
+        "assignmentsDemoted": assignments_demoted,
+        "status": status,
+    }
+
+def _initialize_legacy_project_access(
+    app: Any,
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """Maintain legacy roles/groups during canonical projection adoption."""
+    models = _import_model_class_map()
+    legacy_names = (
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+    models_present = all(models.get(name) is not None for name in legacy_names)
+    if not models_present:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "legacy access models are not installed",
+        }
+
+    errors: list[str] = []
+    for module_name in ("src.project_access", "project_access"):
+        try:
+            module = importlib.import_module(module_name)
+            initialize = getattr(module, "ensure_project_access_initialized", None)
+            if not callable(initialize):
+                raise RuntimeError(
+                    "ensure_project_access_initialized export is unavailable"
+                )
+            raw_result = initialize(
+                project=project,
+                owner_user_id=owner_auth_user_id,
+                actor_user_id=owner_auth_user_id,
+                session=db_obj.session,
+                synchronize_default_roles=True,
+                restore_deleted_roles=True,
+                replace_existing_owner=True,
+                allow_missing_owner=False,
+                lock_project=True,
+                flush=True,
+            )
+            data = _result_to_dict_with_variants(raw_result)
+            if not _safe_bool(
+                data.get("accessInitialized", data.get("ok", True)),
+                True,
+            ):
+                raise RuntimeError(
+                    "Legacy project access initialization returned not ready."
+                )
+            db_obj.session.flush()
+            status = _legacy_project_access_status(
+                project,
+                owner_auth_user_id,
+                db_obj,
+            )
+            if _safe_bool(status.get("ready"), False):
+                return {
+                    "ok": True,
+                    "backend": module_name,
+                    "result": data,
+                    "status": status,
+                }
+            errors.append(
+                f"{module_name}: adapter returned an incomplete access state "
+                f"(rolesReady={_safe_bool(status.get('rolesReady'), False)}, "
+                f"ownerAssignmentReady="
+                f"{_safe_bool(status.get('ownerAssignmentReady'), False)})"
+            )
+        except Exception as exc:
+            errors.append(
+                f"{module_name}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
+            )
+
+    # Compatibility fallback for installations that expose the adapter only
+    # through default_seed.py. It still writes inside this outer transaction.
+    seed_access = _get_default_seed_callable("seed_default_project_access")
+    seed_access_status = _get_default_seed_callable(
+        "build_default_project_access_status"
+    )
+    if callable(seed_access):
+        try:
+            operations = seed_access(
+                app,
+                project,
+                owner_auth_user_id,
+                db_extension=db_obj,
+            )
+            db_obj.session.flush()
+            helper_status = (
+                _safe_dict(
+                    seed_access_status(
+                        project,
+                        owner_auth_user_id,
+                        db_extension=db_obj,
+                    )
+                )
+                if callable(seed_access_status)
+                else {}
+            )
+            status = _legacy_project_access_status(
+                project,
+                owner_auth_user_id,
+                db_obj,
+            )
+            if _safe_bool(status.get("ready"), False):
+                return {
+                    "ok": True,
+                    "backend": (
+                        "src.bootstrap.default_seed."
+                        "seed_default_project_access"
+                    ),
+                    "operations": operations,
+                    "status": status,
+                    "helperStatus": helper_status,
+                    "importErrors": errors,
+                    "defaultSeedApi": _default_seed_api_diagnostics(),
+                }
+            errors.append(
+                "default_seed.seed_default_project_access: incomplete state "
+                f"(rolesReady={_safe_bool(status.get('rolesReady'), False)}, "
+                f"ownerAssignmentReady="
+                f"{_safe_bool(status.get('ownerAssignmentReady'), False)})"
+            )
+        except Exception as exc:
+            errors.append(
+                "default_seed.seed_default_project_access: "
+                f"{exc.__class__.__name__}: {_safe_exception_message(exc)}"
+            )
+
+    try:
+        direct = _initialize_legacy_project_access_direct(
+            project,
+            owner_auth_user_id,
+            db_obj,
+        )
+        direct["adapterErrors"] = errors
+        direct["defaultSeedApi"] = _default_seed_api_diagnostics()
+        return direct
+    except Exception as exc:
+        errors.append(
+            "direct_legacy_project_access_models: "
+            f"{exc.__class__.__name__}: {_safe_exception_message(exc)}"
+        )
+        raise RuntimeError(
+            "Legacy project-access compatibility initialization failed: "
+            + " | ".join(errors)
+        ) from exc
+
+
+def _canonical_project_access_status(
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """Build read-only status for ProjectAccessAssignment."""
+    models = _import_model_class_map()
+    assignment_model = models.get("ProjectAccessAssignment")
+    project_id = _safe_str(getattr(project, "project_id", None), "")
+    owner = _normalize_auth_user_id(owner_auth_user_id, "")
+    if assignment_model is None:
+        return {
+            "ready": False,
+            "available": False,
+            "assignmentCount": 0,
+            "ownerAssignmentCount": 0,
+            "ownerTotal": 0,
+            "error": "ProjectAccessAssignment model is unavailable.",
+        }
+
+    try:
+        rows = (
+            db_obj.session.query(assignment_model)
+            .filter(getattr(assignment_model, "chunk_project_id") == project_id)
+            .all()
+        )
+    except Exception:
+        try:
+            rows = db_obj.session.query(assignment_model).all()
+        except Exception:
+            rows = []
+        rows = [
+            row
+            for row in rows
+            if _safe_str(getattr(row, "chunk_project_id", ""), "") == project_id
+        ]
+
+    assignment_count = 0
+    direct_owner_total = 0
+    matching_owner_count = 0
+    group_assignment_count = 0
+    roles: set[str] = set()
+    for row in rows:
+        if not _safe_bool(getattr(row, "active", True), True):
+            continue
+        assignment_count += 1
+        assignment_type = _safe_str(
+            getattr(row, "assignment_type", DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE),
+            DEFAULT_PROJECT_ACCESS_ASSIGNMENT_TYPE,
+        ).lower()
+        role = _safe_str(getattr(row, "role", ""), "").lower()
+        if role:
+            roles.add(role)
+        if assignment_type == "group":
+            group_assignment_count += 1
+            continue
+        if role != DEFAULT_PROJECT_ACCESS_ROLE:
+            continue
+        direct_owner_total += 1
+        if _normalize_auth_user_id(getattr(row, "auth_user_id", None), "") == owner:
+            matching_owner_count += 1
+
+    ready = bool(
+        owner
+        and _project_owner_fields_ready(project, owner)
+        and direct_owner_total == 1
+        and matching_owner_count == 1
+    )
+    return {
+        "ready": ready,
+        "available": True,
+        "assignmentCount": assignment_count,
+        "groupAssignmentCount": group_assignment_count,
+        "ownerAssignmentCount": matching_owner_count,
+        "ownerTotal": direct_owner_total,
+        "roles": sorted(roles),
+        "ownerAuthUserId": owner,
+    }
+
+
+def _legacy_project_access_status(
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """
+    Build read-only compatibility status directly from the current session.
+
+    The default-seed status helper is optional. During import-order failures the
+    bootstrap must still be able to validate rows it just flushed in the same
+    outer transaction; otherwise a valid repair is rolled back as "not ready".
+    """
+    models = _import_model_class_map()
+    legacy_names = (
+        "ProjectRole",
+        "ProjectGroup",
+        "ProjectGroupMember",
+        "ProjectRoleAssignment",
+    )
+    models_present = all(models.get(name) is not None for name in legacy_names)
+    if not models_present:
+        return {
+            "ready": True,
+            "available": False,
+            "skipped": True,
+            "roleCount": 0,
+            "assignmentCount": 0,
+            "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "activeRoleKeys": [],
+            "missingRoleKeys": [],
+            "duplicateActiveRoleKeys": [],
+            "ownerAssignmentCount": 0,
+            "matchingOwnerAssignmentCount": 0,
+        }
+
+    ProjectRole = models["ProjectRole"]
+    ProjectRoleAssignment = models["ProjectRoleAssignment"]
+    project_db_id = _row_db_id(project)
+    owner = _normalize_auth_user_id(owner_auth_user_id, "")
+    if project_db_id is None:
+        return {
+            "ready": False,
+            "available": True,
+            "roleCount": 0,
+            "assignmentCount": 0,
+            "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "activeRoleKeys": [],
+            "missingRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "duplicateActiveRoleKeys": [],
+            "ownerAssignmentCount": 0,
+            "matchingOwnerAssignmentCount": 0,
+            "error": "Project database id is unavailable.",
+        }
+
+    helper_status: dict[str, Any] = {}
+    helper_error: str | None = None
+    status_factory = _get_default_seed_callable(
+        "build_default_project_access_status"
+    )
+    if callable(status_factory):
+        try:
+            helper_status = _safe_dict(
+                status_factory(
+                    project,
+                    owner,
+                    db_extension=db_obj,
+                )
+            )
+        except Exception as exc:
+            helper_error = (
+                f"{exc.__class__.__name__}: {_safe_exception_message(exc)}"
+            )
+
+    try:
+        role_rows = (
+            db_obj.session.query(ProjectRole)
+            .filter(getattr(ProjectRole, "project_db_id") == project_db_id)
+            .limit(max(16, len(DEFAULT_PROJECT_ROLE_KEYS) * 4))
+            .all()
+        )
+    except Exception as exc:
+        return {
+            "ready": False,
+            "available": True,
+            "roleCount": 0,
+            "assignmentCount": 0,
+            "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "activeRoleKeys": [],
+            "missingRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+            "duplicateActiveRoleKeys": [],
+            "ownerAssignmentCount": 0,
+            "matchingOwnerAssignmentCount": 0,
+            "helperStatus": helper_status,
+            "helperError": helper_error,
+            "error": (
+                "Could not query legacy project roles: "
+                f"{_safe_exception_message(exc)}"
+            ),
+        }
+
+    active_roles: dict[str, Any] = {}
+    duplicate_role_keys: set[str] = set()
+    for role_row in role_rows:
+        role_key = _safe_str(getattr(role_row, "role_key", None), "").lower()
+        if role_key not in DEFAULT_PROJECT_ROLE_KEYS:
+            continue
+        status_value = _safe_str(
+            getattr(role_row, "status", "active"),
+            "active",
+        ).lower()
+        if status_value not in {"active", "ready", "enabled"}:
+            continue
+        if getattr(role_row, "deleted_at", None) is not None:
+            continue
+        if role_key in active_roles:
+            duplicate_role_keys.add(role_key)
+        else:
+            active_roles[role_key] = role_row
+
+    active_role_keys = set(active_roles)
+    missing_role_keys = sorted(
+        set(DEFAULT_PROJECT_ROLE_KEYS) - active_role_keys
+    )
+    roles_ready = bool(not missing_role_keys and not duplicate_role_keys)
+    owner_role = active_roles.get(DEFAULT_PROJECT_ACCESS_ROLE)
+    owner_role_db_id = _row_db_id(owner_role)
+    owner_role_public_id = _safe_str(
+        getattr(owner_role, "role_id", None),
+        "",
+    )
+
+    assignment_rows: list[Any] = []
+    assignment_query_error: str | None = None
+    try:
+        assignment_query = db_obj.session.query(ProjectRoleAssignment).filter(
+            getattr(ProjectRoleAssignment, "project_db_id") == project_db_id
+        )
+        if (
+            owner_role_db_id is not None
+            and _model_has_column(ProjectRoleAssignment, "role_db_id")
+        ):
+            assignment_query = assignment_query.filter(
+                getattr(ProjectRoleAssignment, "role_db_id")
+                == owner_role_db_id
+            )
+        elif (
+            owner_role_public_id
+            and _model_has_column(ProjectRoleAssignment, "role_id")
+        ):
+            assignment_query = assignment_query.filter(
+                getattr(ProjectRoleAssignment, "role_id")
+                == owner_role_public_id
+            )
+        assignment_rows = assignment_query.limit(64).all()
+    except Exception as exc:
+        assignment_query_error = _safe_exception_message(exc)
+        assignment_rows = []
+
+    now = _utc_now()
+    effective_owner_assignments: list[Any] = []
+    matching_owner_assignments: list[Any] = []
+    for assignment in assignment_rows:
+        status_value = _safe_str(
+            getattr(assignment, "status", "active"),
+            "active",
+        ).lower()
+        if status_value not in {"active", "ready", "enabled"}:
+            continue
+        if getattr(assignment, "deleted_at", None) is not None:
+            continue
+        if getattr(assignment, "revoked_at", None) is not None:
+            continue
+
+        starts_at = getattr(assignment, "starts_at", None)
+        expires_at = getattr(assignment, "expires_at", None)
+        try:
+            if isinstance(starts_at, datetime):
+                if starts_at.tzinfo is None:
+                    starts_at = starts_at.replace(tzinfo=timezone.utc)
+                if now < starts_at.astimezone(timezone.utc):
+                    continue
+            if isinstance(expires_at, datetime):
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if now >= expires_at.astimezone(timezone.utc):
+                    continue
+        except Exception:
+            continue
+
+        subject_type = _safe_str(
+            getattr(assignment, "subject_type", "user"),
+            "user",
+        ).lower()
+        if subject_type != "user":
+            continue
+        effective_owner_assignments.append(assignment)
+        assignment_owner = _normalize_auth_user_id(
+            getattr(assignment, "user_id", None),
+            "",
+        )
+        if assignment_owner == owner:
+            matching_owner_assignments.append(assignment)
+
+    owner_assignment_ready = bool(
+        owner
+        and owner_role is not None
+        and assignment_query_error is None
+        and len(effective_owner_assignments) == 1
+        and len(matching_owner_assignments) == 1
+    )
+    direct_ready = bool(roles_ready and owner_assignment_ready)
+
+    return {
+        "ready": direct_ready,
+        "available": True,
+        "roleCount": len(active_roles),
+        "assignmentCount": len(effective_owner_assignments),
+        "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
+        "activeRoleKeys": sorted(active_role_keys),
+        "missingRoleKeys": missing_role_keys,
+        "duplicateActiveRoleKeys": sorted(duplicate_role_keys),
+        "rolesReady": roles_ready,
+        "ownerRoleDbId": owner_role_db_id,
+        "ownerRoleId": owner_role_public_id or None,
+        "ownerAssignmentReady": owner_assignment_ready,
+        "ownerAssignmentCount": len(effective_owner_assignments),
+        "matchingOwnerAssignmentCount": len(matching_owner_assignments),
+        "ownerAuthUserId": owner,
+        "assignmentQueryError": assignment_query_error,
+        "helperStatus": helper_status,
+        "helperReady": (
+            _safe_bool(helper_status.get("ready"), False)
+            if helper_status
+            else None
+        ),
+        "helperError": helper_error,
+        "statusSource": "current_session_direct_query",
+    }
+
+
+def build_default_project_access_projection_status(
+    app: Flask,
+    *,
+    project: Any = None,
+    owner_auth_user_id: str | None = None,
+    db_extension: Any = None,
+) -> dict[str, Any]:
+    """Build combined canonical and legacy default-project access readiness."""
+    with _app_context(app):
+        db_obj = _get_db_extension(db_extension)
+        project_id = _default_project_id(app)
+        Project = _model_class("Project")
+
+        if db_obj is None:
+            return {
+                "ready": False,
+                "projectExists": project is not None,
+                "projectId": project_id,
+                "ownerReady": False,
+                "canonicalReady": False,
+                "legacyReady": False,
+                "error": "SQLAlchemy db extension is unavailable.",
+            }
+
+        if project is None and Project is not None:
+            project = _query_first_by_fields(
+                db_obj.session,
+                Project,
+                project_id=project_id,
+            )
+        if project is None:
+            return {
+                "ready": False,
+                "projectExists": False,
+                "projectId": project_id,
+                "ownerReady": False,
+                "canonicalReady": False,
+                "legacyReady": False,
+                "error": "Default project does not exist.",
+            }
+
+        configured_owner = _normalize_auth_user_id(
+            owner_auth_user_id or _configured_project_owner_auth_user_id(app)
+        )
+        owner = _project_owner_from_model(project, configured_owner)
+        owner_ready = _project_owner_fields_ready(project, owner)
+        canonical = _canonical_project_access_status(project, owner, db_obj)
+        legacy = _legacy_project_access_status(project, owner, db_obj)
+        canonical_ready = _safe_bool(canonical.get("ready"), False)
+        legacy_ready = _safe_bool(legacy.get("ready"), False)
+        ready = bool(owner_ready and canonical_ready and legacy_ready)
+
+        return {
+            "ready": ready,
+            "required": _project_access_required(app),
+            "projectExists": True,
+            "projectId": _safe_str(getattr(project, "project_id", None), project_id),
+            "projectDbId": _row_db_id(project),
+            "ownerAuthUserId": owner,
+            "ownerReady": owner_ready,
+            "canonicalReady": canonical_ready,
+            "legacyReady": legacy_ready,
+            "canonical": canonical,
+            "legacy": legacy,
+            "counts": {
+                "canonicalAssignments": _safe_int(
+                    canonical.get("assignmentCount"), 0
+                ),
+                "canonicalOwnerAssignments": _safe_int(
+                    canonical.get("ownerAssignmentCount"), 0
+                ),
+                "legacyRoles": _safe_int(legacy.get("roleCount"), 0),
+                "legacyAssignments": _safe_int(
+                    legacy.get("assignmentCount"), 0
+                ),
+            },
+        }
+
+
+def _ensure_default_project_access(
+    app: Any,
+    project: Any,
+    owner_auth_user_id: str,
+    db_obj: Any,
+) -> dict[str, Any]:
+    """Initialize canonical and legacy access in the surrounding transaction."""
+    canonical = _initialize_canonical_project_access(
+        app,
+        project,
+        owner_auth_user_id,
+        db_obj,
+    )
+    legacy = _initialize_legacy_project_access(
+        app,
+        project,
+        owner_auth_user_id,
+        db_obj,
+    )
+    status = build_default_project_access_projection_status(
+        app,
+        project=project,
+        owner_auth_user_id=owner_auth_user_id,
+        db_extension=db_obj,
+    )
+    if not _safe_bool(status.get("ready"), False):
+        canonical_status = _safe_dict(status.get("canonical"))
+        legacy_status = _safe_dict(status.get("legacy"))
+        raise RuntimeError(
+            "Project access is not ready after canonical and legacy "
+            "initialization. "
+            f"ownerReady={_safe_bool(status.get('ownerReady'), False)} "
+            f"canonicalReady={_safe_bool(status.get('canonicalReady'), False)} "
+            f"legacyReady={_safe_bool(status.get('legacyReady'), False)} "
+            f"canonicalOwnerTotal={_safe_int(canonical_status.get('ownerTotal'), 0)} "
+            f"canonicalMatchingOwner={_safe_int(canonical_status.get('ownerAssignmentCount'), 0)} "
+            f"legacyRolesReady={_safe_bool(legacy_status.get('rolesReady'), False)} "
+            f"legacyOwnerAssignmentReady="
+            f"{_safe_bool(legacy_status.get('ownerAssignmentReady'), False)} "
+            f"legacyError={_safe_str(legacy_status.get('error'), '') or None}"
+        )
+    return {
+        "ok": True,
+        "canonical": canonical,
+        "legacy": legacy,
+        "status": status,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Built-in system-block bootstrap adapter
 # -----------------------------------------------------------------------------
@@ -983,9 +2726,12 @@ def build_system_block_invariant_status(
             exception_type="RegistryMissing",
         )
 
-    if callable(build_default_system_blocks_status):
+    default_system_status = _get_default_seed_callable(
+        "build_default_system_blocks_status"
+    )
+    if callable(default_system_status):
         try:
-            payload = build_default_system_blocks_status(registry)
+            payload = default_system_status(registry)
             normalized = _safe_dict(payload)
             if normalized:
                 return normalized
@@ -1184,25 +2930,11 @@ def build_default_world_invariant_status(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """
-    Build read-only readiness for the mandatory default runtime graph.
-
-    Ready means all of the following are true:
-
-    - Project ``dev-project`` exists,
-    - Universe ``dev-universe`` exists,
-    - concrete WorldInstance ``world_spawn`` exists,
-    - the configured BlockRegistry exists,
-    - Air is reserved at cell value 0 and has no BlockType row,
-    - ``system_railing`` exists, is active and matches its code definition.
-
-    This function does not create or mutate anything.
-    """
+    """Build read-only readiness for world, system blocks and project access."""
     started_at = _utc_now_iso()
 
     with _app_context(app):
         db_obj = _get_db_extension(db_extension)
-
         if db_obj is None:
             completed_at = _utc_now_iso()
             return {
@@ -1229,10 +2961,12 @@ def build_default_world_invariant_status(
         provider_world_id = _default_provider_world_id(app)
         registry_id = _default_block_registry_id(app)
         registry_version = _default_block_registry_version(app)
+        configured_owner = _configured_project_owner_auth_user_id(app)
+        access_required = _project_access_required(app)
+        debug_required = _debug_blocks_required(app)
 
         errors: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
-
         project = None
         universe = None
         world = None
@@ -1247,12 +2981,9 @@ def build_default_world_invariant_status(
             )
             project_db_id = _row_db_id(project)
 
-            universe_fields: dict[str, Any] = {
-                "universe_id": universe_id,
-            }
+            universe_fields: dict[str, Any] = {"universe_id": universe_id}
             if project_db_id is not None:
                 universe_fields["project_db_id"] = project_db_id
-
             universe = _query_first_by_fields(
                 db_obj.session,
                 Universe,
@@ -1260,14 +2991,11 @@ def build_default_world_invariant_status(
             )
             universe_db_id = _row_db_id(universe)
 
-            world_fields: dict[str, Any] = {
-                "world_id": world_id,
-            }
+            world_fields: dict[str, Any] = {"world_id": world_id}
             if project_db_id is not None:
                 world_fields["project_db_id"] = project_db_id
             if universe_db_id is not None:
                 world_fields["universe_db_id"] = universe_db_id
-
             world = _query_first_by_fields(
                 db_obj.session,
                 WorldInstance,
@@ -1301,9 +3029,7 @@ def build_default_world_invariant_status(
                         )
                     else:
                         if _model_has_column(BlockType, "registry_id"):
-                            query = query.filter(
-                                BlockType.registry_id == registry_id
-                            )
+                            query = query.filter(BlockType.registry_id == registry_id)
                         if _model_has_column(BlockType, "registry_version"):
                             query = query.filter(
                                 BlockType.registry_version == registry_version
@@ -1311,7 +3037,6 @@ def build_default_world_invariant_status(
                     block_type_count = int(query.count())
                 except Exception:
                     block_type_count = None
-
         except Exception as exc:
             errors.append(
                 _make_message(
@@ -1323,18 +3048,30 @@ def build_default_world_invariant_status(
 
         system_blocks = build_system_block_invariant_status(block_registry)
         system_counts = _system_block_status_counts(system_blocks)
-
         project_ready = project is not None
         universe_ready = universe is not None
         world_ready = world is not None
-        registry_ready = (
-            block_registry is not None
-            if BlockRegistry is not None
-            else False
-        )
+        registry_ready = block_registry is not None if BlockRegistry is not None else False
         air_ready = _air_invariant_ready(system_blocks)
         railing_ready = _system_railing_ready(system_blocks)
         system_ready = _system_blocks_ready(system_blocks)
+        debug_complete = (
+            None if block_type_count is None else block_type_count > 0
+        )
+
+        owner = (
+            _project_owner_from_model(project, configured_owner)
+            if project is not None
+            else configured_owner
+        )
+        owner_ready = _project_owner_fields_ready(project, owner)
+        project_access = build_default_project_access_projection_status(
+            app,
+            project=project,
+            owner_auth_user_id=owner,
+            db_extension=db_obj,
+        )
+        project_access_ready = _safe_bool(project_access.get("ready"), False)
 
         ok = bool(
             project_ready
@@ -1344,9 +3081,11 @@ def build_default_world_invariant_status(
             and system_ready
             and air_ready
             and railing_ready
+            and owner_ready
+            and (not access_required or project_access_ready)
+            and (not debug_required or debug_complete is True)
             and not errors
         )
-
         completed_at = _utc_now_iso()
 
         return {
@@ -1357,6 +3096,8 @@ def build_default_world_invariant_status(
             "durationMs": _duration_ms(started_at, completed_at),
             "defaults": {
                 "projectId": project_id,
+                "projectOwnerAuthUserId": configured_owner,
+                "ownerUserId": configured_owner,
                 "universeId": universe_id,
                 "worldId": world_id,
                 "templateId": template_id,
@@ -1365,16 +3106,20 @@ def build_default_world_invariant_status(
                 "blockRegistryId": registry_id,
                 "blockRegistryVersion": registry_version,
                 "airSystemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
-                "systemRailingBlockTypeId": (
-                    DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID
-                ),
+                "systemRailingBlockTypeId": DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID,
+                "projectAccessRequired": access_required,
+                "debugBlocksRequired": debug_required,
             },
             "project": {
                 "exists": project_ready,
                 "projectId": project_id,
                 "dbId": _row_db_id(project),
                 "actualProjectId": _row_public_id(project, "project_id"),
+                "ownerAuthUserId": owner,
+                "ownerReady": owner_ready,
+                "ownerType": getattr(project, "owner_type", None) if project else None,
             },
+            "projectAccess": project_access,
             "universe": {
                 "exists": universe_ready,
                 "universeId": universe_id,
@@ -1396,12 +3141,9 @@ def build_default_world_invariant_status(
             },
             "debugBlocks": {
                 "checked": BlockType is not None,
+                "required": debug_required,
                 "count": block_type_count,
-                "complete": (
-                    None
-                    if block_type_count is None
-                    else block_type_count > 0
-                ),
+                "complete": debug_complete,
             },
             "systemBlocks": {
                 **system_blocks,
@@ -1417,9 +3159,20 @@ def build_default_world_invariant_status(
             },
             "ready": {
                 "project": project_ready,
+                "projectOwner": owner_ready,
+                "projectAccess": project_access_ready,
+                "canonicalProjectAccess": _safe_bool(
+                    project_access.get("canonicalReady"), False
+                ),
+                "legacyProjectAccess": _safe_bool(
+                    project_access.get("legacyReady"), False
+                ),
                 "universe": universe_ready,
                 "world": world_ready,
                 "blockRegistry": registry_ready,
+                "debugBlocks": (
+                    debug_complete if debug_required else True
+                ),
                 "systemBlocks": system_ready,
                 "airInvariant": air_ready,
                 "systemRailing": railing_ready,
@@ -1481,7 +3234,7 @@ def _create_or_update_block_registry(
                     status="active",
                     source=DEFAULT_BLOCK_REGISTRY_SOURCE,
                     is_default=True,
-                    created_by_user_id="bootstrap",
+                    created_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
                     metadata_json={
                         "seededBy": (
                             "db_bootstrap.default_world_invariant_repair"
@@ -1508,8 +3261,8 @@ def _create_or_update_block_registry(
                     "revision": 1,
                     "source": DEFAULT_BLOCK_REGISTRY_SOURCE,
                     "is_default": True,
-                    "created_by_user_id": "bootstrap",
-                    "updated_by_user_id": "bootstrap",
+                    "created_by_user_id": DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
+                    "updated_by_user_id": DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
                     "metadata_json": {
                         "seededBy": (
                             "db_bootstrap.default_world_invariant_repair"
@@ -1537,7 +3290,7 @@ def _create_or_update_block_registry(
             restore = getattr(registry, "restore", None)
             if callable(restore):
                 try:
-                    restore(updated_by_user_id="bootstrap")
+                    restore(updated_by_user_id=DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID)
                     changed = True
                 except Exception:
                     pass
@@ -1574,7 +3327,7 @@ def _create_or_update_block_registry(
         changed = _set_attr_if_supported(
             registry,
             "updated_by_user_id",
-            "bootstrap",
+            DEFAULT_SYSTEM_BLOCK_BOOTSTRAP_USER_ID,
         ) or changed
         _merge_metadata_json(
             registry,
@@ -1618,7 +3371,7 @@ def _create_or_update_project(
     *,
     operations: list[dict[str, Any]],
 ) -> Any:
-    """Ensure default Project exists."""
+    """Ensure the default Project and its canonical owner fields exist."""
     Project = _model_class("Project")
     if Project is None:
         raise RuntimeError("Project model is unavailable.")
@@ -1626,40 +3379,50 @@ def _create_or_update_project(
     project_id = _default_project_id(app)
     universe_id = _default_universe_id(app)
     world_id = _default_world_id(app)
-
+    configured_owner = _configured_project_owner_auth_user_id(app)
     project = _query_first_by_fields(
         db_obj.session,
         Project,
         project_id=project_id,
     )
 
+    created = False
     if project is None:
         factory = getattr(Project, "create_dev_project", None)
         if callable(factory):
-            try:
-                project = factory(
-                    project_id=project_id,
-                    default_universe_id=universe_id,
-                    default_world_id=world_id,
-                    spawn_world_id=world_id,
-                    created_by_user_id="bootstrap",
-                )
-            except TypeError:
+            attempts = (
+                {
+                    "project_id": project_id,
+                    "default_universe_id": universe_id,
+                    "default_world_id": world_id,
+                    "spawn_world_id": world_id,
+                    "owner_user_id": configured_owner,
+                    "created_by_user_id": configured_owner,
+                },
+                {
+                    "project_id": project_id,
+                    "default_universe_id": universe_id,
+                    "default_world_id": world_id,
+                    "owner_user_id": configured_owner,
+                    "created_by_user_id": configured_owner,
+                },
+                {
+                    "project_id": project_id,
+                    "default_universe_id": universe_id,
+                    "owner_user_id": configured_owner,
+                    "created_by_user_id": configured_owner,
+                },
+            )
+            for kwargs in attempts:
                 try:
-                    project = factory(
-                        project_id=project_id,
-                        default_universe_id=universe_id,
-                        default_world_id=world_id,
-                        created_by_user_id="bootstrap",
-                    )
+                    project = factory(**kwargs)
+                    break
                 except TypeError:
-                    project = factory(
-                        project_id=project_id,
-                        default_universe_id=universe_id,
-                        created_by_user_id="bootstrap",
-                    )
-
-            db_obj.session.add(project)
+                    continue
+            if project is None:
+                raise RuntimeError(
+                    "Project.create_dev_project did not accept a canonical owner contract."
+                )
         else:
             project = _make_instance(
                 Project,
@@ -1669,60 +3432,61 @@ def _create_or_update_project(
                     "name": "Dev Project",
                     "description": "Default development chunk project.",
                     "status": "active",
-                    "schema_version": "project.schema.v2",
+                    "schema_version": "project.schema.v3",
                     "revision": 1,
                     "default_universe_id": universe_id,
                     "default_world_id": world_id,
                     "spawn_world_id": world_id,
-                    "owner_type": "system",
-                    "owner_id": "bootstrap",
-                    "created_by_user_id": "bootstrap",
-                    "updated_by_user_id": "bootstrap",
+                    "owner_auth_user_id": configured_owner,
+                    "owner_type": "user",
+                    "owner_id": configured_owner,
+                    "created_by_auth_user_id": configured_owner,
+                    "updated_by_auth_user_id": configured_owner,
+                    "created_by_user_id": configured_owner,
+                    "updated_by_user_id": configured_owner,
                     "metadata_json": {
                         "seededBy": "db_bootstrap.default_world_invariant_repair",
+                        "ownerAuthUserId": configured_owner,
                         "createdAt": _utc_now_iso(),
                     },
                 },
             )
-            db_obj.session.add(project)
-
+        db_obj.session.add(project)
         db_obj.session.flush()
-        operations.append(
-            {
-                "kind": "project",
-                "status": "created",
-                "projectId": project_id,
-                "dbId": _row_db_id(project),
-            }
-        )
-    else:
-        operations.append(
-            {
-                "kind": "project",
-                "status": "existing",
-                "projectId": project_id,
-                "dbId": _row_db_id(project),
-            }
-        )
+        created = True
 
+    owner = _project_owner_from_model(project, configured_owner)
+    owner = _apply_project_owner_fields(project, owner)
     _set_attr_if_empty(project, "slug", project_id)
     _set_attr_if_empty(project, "name", "Dev Project")
     _set_attr_if_empty(project, "status", "active")
     _set_attr_force(project, "default_universe_id", universe_id)
     _set_attr_force(project, "default_world_id", world_id)
     _set_attr_force(project, "spawn_world_id", world_id)
-    _set_attr_if_supported(project, "updated_by_user_id", "bootstrap")
     _merge_metadata_json(
         project,
         {
             "seededBy": "db_bootstrap.default_world_invariant_repair",
+            "ownerAuthUserId": owner,
             "defaultUniverseId": universe_id,
             "defaultWorldId": world_id,
             "spawnWorldId": world_id,
             "updatedAt": _utc_now_iso(),
         },
     )
+    db_obj.session.add(project)
+    db_obj.session.flush()
 
+    operations.append(
+        {
+            "kind": "project",
+            "status": "created" if created else "existing",
+            "projectId": project_id,
+            "ownerAuthUserId": owner,
+            "ownerReady": _project_owner_fields_ready(project, owner),
+            "dbId": _row_db_id(project),
+        }
+    )
     return project
 
 
@@ -1733,7 +3497,7 @@ def _create_or_update_universe(
     *,
     operations: list[dict[str, Any]],
 ) -> Any:
-    """Ensure default Universe exists."""
+    """Ensure the default Universe exists under the canonical project owner."""
     Universe = _model_class("Universe")
     if Universe is None:
         raise RuntimeError("Universe model is unavailable.")
@@ -1741,19 +3505,20 @@ def _create_or_update_universe(
     universe_id = _default_universe_id(app)
     world_id = _default_world_id(app)
     project_db_id = _row_db_id(project)
-
-    query_fields = {
-        "universe_id": universe_id,
-    }
+    actor = _project_owner_from_model(
+        project,
+        _configured_project_owner_auth_user_id(app),
+    )
+    query_fields = {"universe_id": universe_id}
     if project_db_id is not None:
         query_fields["project_db_id"] = project_db_id
-
     universe = _query_first_by_fields(
         db_obj.session,
         Universe,
         **query_fields,
     )
 
+    created = False
     if universe is None:
         factory = getattr(Universe, "create_for_project", None)
         if callable(factory):
@@ -1765,37 +3530,15 @@ def _create_or_update_universe(
                     name="Dev Universe",
                     default_world_id=world_id,
                     spawn_world_id=world_id,
-                    created_by_user_id="bootstrap",
+                    created_by_user_id=actor,
                     metadata_json={
                         "seededBy": "db_bootstrap.default_world_invariant_repair",
                         "createdAt": _utc_now_iso(),
                     },
                 )
             except TypeError:
-                universe = _make_instance(
-                    Universe,
-                    {
-                        "project_db_id": project_db_id,
-                        "universe_id": universe_id,
-                        "slug": universe_id,
-                        "name": "Dev Universe",
-                        "description": "Default development chunk universe.",
-                        "status": "active",
-                        "schema_version": "universe.schema.v2",
-                        "revision": 1,
-                        "universe_role": "default",
-                        "universe_scope": "project",
-                        "default_world_id": world_id,
-                        "spawn_world_id": world_id,
-                        "created_by_user_id": "bootstrap",
-                        "updated_by_user_id": "bootstrap",
-                        "metadata_json": {
-                            "seededBy": "db_bootstrap.default_world_invariant_repair",
-                            "createdAt": _utc_now_iso(),
-                        },
-                    },
-                )
-        else:
+                universe = None
+        if universe is None:
             universe = _make_instance(
                 Universe,
                 {
@@ -1811,34 +3554,17 @@ def _create_or_update_universe(
                     "universe_scope": "project",
                     "default_world_id": world_id,
                     "spawn_world_id": world_id,
-                    "created_by_user_id": "bootstrap",
-                    "updated_by_user_id": "bootstrap",
+                    "created_by_user_id": actor,
+                    "updated_by_user_id": actor,
                     "metadata_json": {
                         "seededBy": "db_bootstrap.default_world_invariant_repair",
                         "createdAt": _utc_now_iso(),
                     },
                 },
             )
-
         db_obj.session.add(universe)
         db_obj.session.flush()
-        operations.append(
-            {
-                "kind": "universe",
-                "status": "created",
-                "universeId": universe_id,
-                "dbId": _row_db_id(universe),
-            }
-        )
-    else:
-        operations.append(
-            {
-                "kind": "universe",
-                "status": "existing",
-                "universeId": universe_id,
-                "dbId": _row_db_id(universe),
-            }
-        )
+        created = True
 
     _set_attr_force(universe, "project_db_id", project_db_id)
     _set_attr_if_empty(universe, "slug", universe_id)
@@ -1846,7 +3572,8 @@ def _create_or_update_universe(
     _set_attr_if_empty(universe, "status", "active")
     _set_attr_force(universe, "default_world_id", world_id)
     _set_attr_force(universe, "spawn_world_id", world_id)
-    _set_attr_if_supported(universe, "updated_by_user_id", "bootstrap")
+    _set_attr_if_supported(universe, "created_by_user_id", actor)
+    _set_attr_if_supported(universe, "updated_by_user_id", actor)
     _merge_metadata_json(
         universe,
         {
@@ -1856,7 +3583,16 @@ def _create_or_update_universe(
             "updatedAt": _utc_now_iso(),
         },
     )
-
+    db_obj.session.add(universe)
+    db_obj.session.flush()
+    operations.append(
+        {
+            "kind": "universe",
+            "status": "created" if created else "existing",
+            "universeId": universe_id,
+            "dbId": _row_db_id(universe),
+        }
+    )
     return universe
 
 
@@ -1866,7 +3602,7 @@ def _create_world_with_factory_or_direct(
     project: Any,
     universe: Any,
 ) -> Any:
-    """Create WorldInstance using model factory when possible, else direct constructor."""
+    """Create WorldInstance with canonical owner actor metadata."""
     WorldInstance = _model_class("WorldInstance")
     if WorldInstance is None:
         raise RuntimeError("WorldInstance model is unavailable.")
@@ -1877,9 +3613,12 @@ def _create_world_with_factory_or_direct(
     template_id = _default_template_id(app)
     provider_id = _default_provider_id(app)
     provider_world_id = _default_provider_world_id(app)
-
     project_db_id = _row_db_id(project)
     universe_db_id = _row_db_id(universe)
+    actor = _project_owner_from_model(
+        project,
+        _configured_project_owner_auth_user_id(app),
+    )
 
     factory = getattr(WorldInstance, "create_flat_spawn", None)
     if callable(factory):
@@ -1890,7 +3629,7 @@ def _create_world_with_factory_or_direct(
                 "world_id": world_id,
                 "slug": "spawn",
                 "name": "Flat Spawn World",
-                "created_by_user_id": "bootstrap",
+                "created_by_user_id": actor,
                 "metadata_json": {
                     "seededBy": "db_bootstrap.default_world_invariant_repair",
                     "createdAt": _utc_now_iso(),
@@ -1902,7 +3641,7 @@ def _create_world_with_factory_or_direct(
                 "world_id": world_id,
                 "slug": "spawn",
                 "name": "Flat Spawn World",
-                "created_by_user_id": "bootstrap",
+                "created_by_user_id": actor,
                 "metadata_json": {
                     "seededBy": "db_bootstrap.default_world_invariant_repair",
                     "createdAt": _utc_now_iso(),
@@ -1914,7 +3653,6 @@ def _create_world_with_factory_or_direct(
                 "universe_db_id": universe_db_id,
             },
         ]
-
         for kwargs in attempts:
             try:
                 world = factory(**kwargs)
@@ -1943,28 +3681,60 @@ def _create_world_with_factory_or_direct(
             "template_id": template_id,
             "provider_id": provider_id,
             "provider_world_id": provider_world_id,
-            "generator_type": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_TYPE", "flat-world"),
-            "generator_version": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_VERSION", "1"),
-            "projection_type": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_PROJECTION_TYPE", "flat-local-v1"),
-            "topology_type": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_TOPOLOGY_TYPE", "flat-unbounded-v1"),
-            "coordinate_system": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_COORDINATE_SYSTEM", "vectoplan-world-y-up-v1"),
-            "chunk_size": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_CHUNK_SIZE", 16), 16),
-            "cell_size": _safe_float(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_CELL_SIZE", 1.0), 1.0),
-            "surface_y": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SURFACE_Y", 0), 0),
-            "min_y": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_MIN_Y", -8), -8),
-            "max_y": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_MAX_Y", 64), 64),
+            "generator_type": _config_str(
+                app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_TYPE", "flat-world"
+            ),
+            "generator_version": _config_str(
+                app, "VECTOPLAN_CHUNK_DEFAULT_GENERATOR_VERSION", "1"
+            ),
+            "projection_type": _config_str(
+                app, "VECTOPLAN_CHUNK_DEFAULT_PROJECTION_TYPE", "flat-local-v1"
+            ),
+            "topology_type": _config_str(
+                app, "VECTOPLAN_CHUNK_DEFAULT_TOPOLOGY_TYPE", "flat-unbounded-v1"
+            ),
+            "coordinate_system": _config_str(
+                app,
+                "VECTOPLAN_CHUNK_DEFAULT_COORDINATE_SYSTEM",
+                "vectoplan-world-y-up-v1",
+            ),
+            "chunk_size": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_CHUNK_SIZE", 16), 16
+            ),
+            "cell_size": _safe_float(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_CELL_SIZE", 1.0), 1.0
+            ),
+            "surface_y": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SURFACE_Y", 0), 0
+            ),
+            "min_y": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_MIN_Y", -8), -8
+            ),
+            "max_y": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_MAX_Y", 64), 64
+            ),
             "seed": _config_str(app, "VECTOPLAN_CHUNK_DEFAULT_SEED", "dev-seed"),
             "block_registry_id": registry_id,
             "block_registry_version": registry_version,
-            "spawn_x": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", 0), 0),
-            "spawn_y": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", 2), 2),
-            "spawn_z": _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", 0), 0),
-            "spawn_yaw": _safe_float(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", 0.0), 0.0),
-            "spawn_pitch": _safe_float(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", 0.0), 0.0),
+            "spawn_x": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", 0), 0
+            ),
+            "spawn_y": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", 2), 2
+            ),
+            "spawn_z": _safe_int(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", 0), 0
+            ),
+            "spawn_yaw": _safe_float(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", 0.0), 0.0
+            ),
+            "spawn_pitch": _safe_float(
+                _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", 0.0), 0.0
+            ),
             "source_service": "vectoplan-chunk-bootstrap",
             "external_ref": world_id,
-            "created_by_user_id": "bootstrap",
-            "updated_by_user_id": "bootstrap",
+            "created_by_user_id": actor,
+            "updated_by_user_id": actor,
             "metadata_json": {
                 "seededBy": "db_bootstrap.default_world_invariant_repair",
                 "createdAt": _utc_now_iso(),
@@ -1992,71 +3762,115 @@ def _create_or_update_world(
     world_id = _default_world_id(app)
     project_db_id = _row_db_id(project)
     universe_db_id = _row_db_id(universe)
-
-    query_fields = {
-        "world_id": world_id,
-    }
+    actor = _project_owner_from_model(
+        project,
+        _configured_project_owner_auth_user_id(app),
+    )
+    query_fields = {"world_id": world_id}
     if project_db_id is not None:
         query_fields["project_db_id"] = project_db_id
     if universe_db_id is not None:
         query_fields["universe_db_id"] = universe_db_id
-
     world = _query_first_by_fields(
         db_obj.session,
         WorldInstance,
         **query_fields,
     )
 
+    created = False
     if world is None:
-        world = _create_world_with_factory_or_direct(app, db_obj, project, universe)
+        world = _create_world_with_factory_or_direct(
+            app,
+            db_obj,
+            project,
+            universe,
+        )
         db_obj.session.add(world)
         db_obj.session.flush()
-        operations.append(
-            {
-                "kind": "world",
-                "status": "created",
-                "worldId": world_id,
-                "dbId": _row_db_id(world),
-            }
-        )
-    else:
-        operations.append(
-            {
-                "kind": "world",
-                "status": "existing",
-                "worldId": world_id,
-                "dbId": _row_db_id(world),
-            }
-        )
+        created = True
 
     _set_attr_force(world, "project_db_id", project_db_id)
     _set_attr_force(world, "universe_db_id", universe_db_id)
     _set_attr_if_empty(world, "slug", "spawn")
     _set_attr_if_empty(world, "name", "Flat Spawn World")
     _set_attr_if_empty(world, "status", "active")
-    _set_attr_force(world, "template_id", _default_template_id(app))
-    _set_attr_force(world, "provider_id", _default_provider_id(app))
-    _set_attr_force(world, "provider_world_id", _default_provider_world_id(app))
-    _set_attr_if_empty(world, "block_registry_id", _default_block_registry_id(app))
-    _set_attr_if_empty(world, "block_registry_version", _default_block_registry_version(app))
-    _set_attr_if_supported(world, "spawn_x", _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", 0), 0))
-    _set_attr_if_supported(world, "spawn_y", _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", 2), 2))
-    _set_attr_if_supported(world, "spawn_z", _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", 0), 0))
-    _set_attr_if_supported(world, "spawn_yaw", _safe_float(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", 0.0), 0.0))
-    _set_attr_if_supported(world, "spawn_pitch", _safe_float(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", 0.0), 0.0))
-    _set_attr_if_supported(world, "updated_by_user_id", "bootstrap")
+
+    # Existing world type/template is immutable during a normal bootstrap retry.
+    if created:
+        _set_attr_force(world, "template_id", _default_template_id(app))
+        _set_attr_force(world, "provider_id", _default_provider_id(app))
+        _set_attr_force(
+            world,
+            "provider_world_id",
+            _default_provider_world_id(app),
+        )
+    _set_attr_if_empty(
+        world,
+        "block_registry_id",
+        _default_block_registry_id(app),
+    )
+    _set_attr_if_empty(
+        world,
+        "block_registry_version",
+        _default_block_registry_version(app),
+    )
+    _set_attr_if_supported(
+        world,
+        "spawn_x",
+        _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_X", 0), 0),
+    )
+    _set_attr_if_supported(
+        world,
+        "spawn_y",
+        _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Y", 2), 2),
+    )
+    _set_attr_if_supported(
+        world,
+        "spawn_z",
+        _safe_int(_config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_Z", 0), 0),
+    )
+    _set_attr_if_supported(
+        world,
+        "spawn_yaw",
+        _safe_float(
+            _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_YAW", 0.0),
+            0.0,
+        ),
+    )
+    _set_attr_if_supported(
+        world,
+        "spawn_pitch",
+        _safe_float(
+            _config_value(app, "VECTOPLAN_CHUNK_DEFAULT_SPAWN_PITCH", 0.0),
+            0.0,
+        ),
+    )
+    _set_attr_if_supported(world, "created_by_user_id", actor)
+    _set_attr_if_supported(world, "updated_by_user_id", actor)
     _merge_metadata_json(
         world,
         {
             "seededBy": "db_bootstrap.default_world_invariant_repair",
             "worldId": world_id,
-            "templateId": _default_template_id(app),
-            "providerId": _default_provider_id(app),
-            "providerWorldId": _default_provider_world_id(app),
+            "templateId": _safe_str(getattr(world, "template_id", None), ""),
+            "providerId": _safe_str(getattr(world, "provider_id", None), ""),
+            "providerWorldId": _safe_str(
+                getattr(world, "provider_world_id", None), ""
+            ),
             "updatedAt": _utc_now_iso(),
         },
     )
-
+    db_obj.session.add(world)
+    db_obj.session.flush()
+    operations.append(
+        {
+            "kind": "world",
+            "status": "created" if created else "existing",
+            "worldId": world_id,
+            "templateId": getattr(world, "template_id", None),
+            "dbId": _row_db_id(world),
+        }
+    )
     return world
 
 
@@ -2066,17 +3880,11 @@ def repair_default_world_invariant(
     db_extension: Any = None,
     commit: bool = True,
 ) -> dict[str, Any]:
-    """
-    Ensure the complete default runtime graph and built-in blocks are ready.
-
-    This explicit bootstrap-only helper is idempotent. The outer function owns
-    commit/rollback. The system-block layer only flushes and never commits.
-    """
+    """Repair the complete default graph including owner and access projection."""
     started_at = _utc_now_iso()
 
     with _app_context(app):
         db_obj = _get_db_extension(db_extension)
-
         result: dict[str, Any] = {
             "ok": False,
             "status": STATUS_FAILED,
@@ -2089,9 +3897,9 @@ def repair_default_world_invariant(
             "errors": [],
             "before": {},
             "after": {},
+            "projectAccess": {},
             "systemBlocks": {},
         }
-
         if db_obj is None:
             result["errors"].append(
                 _make_message(
@@ -2109,7 +3917,6 @@ def repair_default_world_invariant(
                 app,
                 db_extension=db_obj,
             )
-
             registry = _create_or_update_block_registry(
                 app,
                 db_obj,
@@ -2119,7 +3926,6 @@ def repair_default_world_invariant(
                 raise RuntimeError(
                     "Default BlockRegistry could not be created or loaded."
                 )
-
             result["systemBlocks"] = _reconcile_system_blocks_for_registry(
                 registry,
                 db_obj,
@@ -2131,6 +3937,28 @@ def repair_default_world_invariant(
                 db_obj,
                 operations=result["operations"],
             )
+            owner = _project_owner_from_model(
+                project,
+                _configured_project_owner_auth_user_id(app),
+            )
+            owner = _apply_project_owner_fields(project, owner)
+            if _project_access_required(app):
+                result["projectAccess"] = _ensure_default_project_access(
+                    app,
+                    project,
+                    owner,
+                    db_obj,
+                )
+                result["operations"].append(
+                    {
+                        "kind": "project_access",
+                        "status": "ready",
+                        "ownerAuthUserId": owner,
+                        "canonicalReady": True,
+                        "legacyReady": True,
+                    }
+                )
+
             universe = _create_or_update_universe(
                 app,
                 db_obj,
@@ -2144,9 +3972,7 @@ def repair_default_world_invariant(
                 universe,
                 operations=result["operations"],
             )
-
             db_obj.session.flush()
-
             if commit:
                 db_obj.session.commit()
 
@@ -2155,28 +3981,23 @@ def repair_default_world_invariant(
                 db_extension=db_obj,
             )
             result["ok"] = bool((result["after"] or {}).get("ok"))
-            result["status"] = (
-                STATUS_COMPLETED if result["ok"] else STATUS_PARTIAL
-            )
-
+            result["status"] = STATUS_COMPLETED if result["ok"] else STATUS_PARTIAL
             if not result["ok"]:
                 result["errors"].append(
                     _make_message(
                         code="default_world_invariant_repair_incomplete",
                         message=(
-                            "Default world/system-block invariant repair did "
-                            "not produce a ready state."
+                            "Default world, owner, project-access or system-block "
+                            "repair did not produce a ready state."
                         ),
                         details={"after": result["after"]},
                     )
                 )
-
         except Exception as exc:
             try:
                 db_obj.session.rollback()
             except Exception:
                 pass
-
             result["ok"] = False
             result["status"] = STATUS_FAILED
             result["errors"].append(
@@ -2198,7 +4019,7 @@ def _seed_status_needs_invariant_repair(
     seed_status: Mapping[str, Any] | None,
     invariant_status: Mapping[str, Any] | None,
 ) -> bool:
-    """Return whether default world or built-in system invariants need repair."""
+    """Return whether world, system blocks, owner or access need repair."""
     seed_data = seed_data or {}
     seed_status = seed_status or {}
     invariant_status = invariant_status or {}
@@ -2209,6 +4030,10 @@ def _seed_status_needs_invariant_repair(
     invariant_ready = _safe_dict(invariant_status.get("ready"))
     for key in (
         "project",
+        "projectOwner",
+        "projectAccess",
+        "canonicalProjectAccess",
+        "legacyProjectAccess",
         "universe",
         "world",
         "blockRegistry",
@@ -2225,17 +4050,17 @@ def _seed_status_needs_invariant_repair(
     for payload in (seed_data, seed_status):
         if not payload:
             continue
-
         if payload.get("ok") is False:
             return True
-
         if _safe_str(payload.get("status"), "").lower() in {
             STATUS_PARTIAL,
             STATUS_FAILED,
         }:
             return True
-
         for key in (
+            "projectAccessReady",
+            "defaultProjectAccessReady",
+            "projectOwnerReady",
             "systemBlocksReady",
             "systemRailingReady",
             "airInvariantReady",
@@ -2246,31 +4071,31 @@ def _seed_status_needs_invariant_repair(
         world = payload.get("world")
         if isinstance(world, Mapping) and world.get("exists") is False:
             return True
-
         default_world = payload.get("defaultWorld")
         if isinstance(default_world, Mapping) and default_world.get("exists") is False:
             return True
-
-        system_blocks = payload.get("systemBlocks")
-        if isinstance(system_blocks, Mapping) and not _system_blocks_ready(
-            system_blocks
-        ):
+        project_access = payload.get("projectAccess")
+        if isinstance(project_access, Mapping) and project_access.get("ready") is False:
             return True
-
+        system_blocks = payload.get("systemBlocks")
+        if isinstance(system_blocks, Mapping) and not _system_blocks_ready(system_blocks):
+            return True
         ready = payload.get("ready")
         if isinstance(ready, Mapping):
             for key in (
+                "projectOwner",
+                "projectAccess",
+                "canonicalProjectAccess",
+                "legacyProjectAccess",
                 "systemBlocks",
                 "airInvariant",
                 "systemRailing",
             ):
                 if key in ready and not _safe_bool(ready.get(key), False):
                     return True
-
         invariant = payload.get("defaultWorldInvariant")
         if isinstance(invariant, Mapping) and invariant.get("ok") is False:
             return True
-
     return False
 
 
@@ -2295,44 +4120,88 @@ def _build_seed_status_with_invariant(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """Build seed status with mandatory world and system-block invariants."""
-    seed_status: dict[str, Any] = {}
+    """
+    Build seed readiness with mandatory owner/access/world/system invariants.
 
-    if build_default_seed_status is not None:
-        try:
-            seed_status = build_default_seed_status(
-                app,
-                db_extension=db_extension,
-            )
-        except Exception as exc:
-            seed_status = {
-                "ok": False,
-                "status": STATUS_FAILED,
-                "error": _safe_exception_message(exc),
-                "exceptionType": exc.__class__.__name__,
-            }
-    else:
-        seed_status = {
-            "ok": False,
-            "status": STATUS_FAILED,
-            "error": "build_default_seed_status is unavailable.",
-        }
-
+    If default_seed.py is temporarily unavailable, the explicit orchestrator's
+    own invariant status is the authoritative fallback. A missing optional
+    adapter must not force an otherwise complete direct repair to roll back.
+    """
     invariant_status = build_default_world_invariant_status(
         app,
         db_extension=db_extension,
     )
 
+    seed_status_factory = _get_default_seed_callable(
+        "build_default_seed_status"
+    )
+    seed_status: dict[str, Any] = {}
+    factory_used = False
+    factory_error: str | None = None
+
+    if callable(seed_status_factory):
+        try:
+            seed_status = _safe_dict(
+                seed_status_factory(
+                    app,
+                    db_extension=db_extension,
+                )
+            )
+            factory_used = bool(seed_status)
+            if not factory_used:
+                factory_error = (
+                    "build_default_seed_status returned an empty payload."
+                )
+        except Exception as exc:
+            factory_error = (
+                f"{exc.__class__.__name__}: {_safe_exception_message(exc)}"
+            )
+    else:
+        factory_error = "build_default_seed_status is unavailable."
+
+    if not factory_used:
+        invariant_ok = _safe_bool(invariant_status.get("ok"), False)
+        seed_status = {
+            "ok": invariant_ok,
+            "status": STATUS_READY if invariant_ok else STATUS_PARTIAL,
+            "source": "db_bootstrap.invariant_status_fallback",
+            "degradedStatusSource": True,
+            "defaultSeedStatusAvailable": False,
+            "defaultSeedStatusError": factory_error,
+            "defaultSeedApi": _default_seed_api_diagnostics(),
+            "warnings": (
+                [
+                    _make_message(
+                        code="default_seed_status_adapter_unavailable",
+                        message=(
+                            "Default-seed status adapter is unavailable; "
+                            "using the direct bootstrap invariant status."
+                        ),
+                        details={
+                            "error": factory_error,
+                            "fallbackSource": (
+                                "build_default_world_invariant_status"
+                            ),
+                        },
+                    )
+                ]
+                if factory_error
+                else []
+            ),
+        }
+    else:
+        seed_status.setdefault("source", "src.bootstrap.default_seed")
+        seed_status.setdefault("degradedStatusSource", False)
+        seed_status.setdefault("defaultSeedStatusAvailable", True)
+        seed_status.setdefault("defaultSeedApi", _default_seed_api_diagnostics())
+
     seed_status = _safe_dict(seed_status)
     seed_status["defaultWorldInvariant"] = invariant_status
-
-    invariant_system_blocks = _safe_dict(
-        invariant_status.get("systemBlocks")
+    seed_status["projectAccess"] = _safe_dict(
+        invariant_status.get("projectAccess")
     )
+    invariant_system_blocks = _safe_dict(invariant_status.get("systemBlocks"))
     seed_status.setdefault("systemBlocks", invariant_system_blocks)
-
-    if seed_status.get("ok") is not True:
-        return seed_status
 
     if invariant_status.get("ok") is not True:
         seed_status["ok"] = False
@@ -2341,15 +4210,27 @@ def _build_seed_status_with_invariant(
         if isinstance(seed_status["errors"], list):
             seed_status["errors"].append(
                 _make_message(
-                    code="default_world_or_system_invariant_not_ready",
+                    code=(
+                        "default_owner_access_world_or_system_"
+                        "invariant_not_ready"
+                    ),
                     message=(
-                        "Default world or built-in system-block invariant "
-                        "is not ready."
+                        "Default owner, project access, world or built-in "
+                        "system-block invariant is not ready."
                     ),
                     details=invariant_status,
                 )
             )
+        return seed_status
 
+    # A successfully imported default-seed status remains authoritative for its
+    # own optional seed contract. The fallback status is already derived from
+    # the complete invariant and can become ready here.
+    if factory_used and seed_status.get("ok") is not True:
+        return seed_status
+
+    seed_status["ok"] = True
+    seed_status["status"] = STATUS_READY
     return seed_status
 
 
@@ -2361,10 +4242,9 @@ def resolve_bootstrap_settings(
     app: Any = None,
     settings: BootstrapSettings | None = None,
 ) -> Any:
-    """Resolve aggregate bootstrap settings with a safe fallback object."""
+    """Resolve aggregate bootstrap settings with a safe compatible fallback."""
     if settings is not None:
         return settings
-
     try:
         resolved = build_bootstrap_settings(app)
         if resolved is not None:
@@ -2378,7 +4258,6 @@ def resolve_bootstrap_settings(
         False,
         aliases=("DB_BOOTSTRAP_ENABLED",),
     )
-
     schema = SimpleNamespace(
         bootstrap_enabled=schema_enabled,
         create_all=get_bool_setting(
@@ -2397,7 +4276,6 @@ def resolve_bootstrap_settings(
             aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
         ),
     )
-
     seed_defaults = get_bool_setting(
         app,
         "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEFAULTS",
@@ -2407,7 +4285,15 @@ def resolve_bootstrap_settings(
             "VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS",
         ),
     )
-
+    seed_dev_project = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
+        seed_defaults,
+        aliases=(
+            "DB_BOOTSTRAP_SEED_DEV_PROJECT",
+            "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
+        ),
+    )
     seed = SimpleNamespace(
         seed_defaults=seed_defaults,
         seed_debug_blocks=get_bool_setting(
@@ -2419,14 +4305,18 @@ def resolve_bootstrap_settings(
                 "VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS",
             ),
         ),
-        seed_dev_project=get_bool_setting(
-            app,
-            "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_DEV_PROJECT",
-            seed_defaults,
-            aliases=(
-                "DB_BOOTSTRAP_SEED_DEV_PROJECT",
-                "VECTOPLAN_CHUNK_SEED_DEV_PROJECT",
-            ),
+        seed_dev_project=seed_dev_project,
+        seed_project_access=bool(
+            seed_dev_project
+            or get_bool_setting(
+                app,
+                "VECTOPLAN_CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS",
+                seed_dev_project,
+                aliases=(
+                    "VECTOPLAN_CHUNK_SEED_PROJECT_ACCESS",
+                    "CHUNK_DB_BOOTSTRAP_SEED_PROJECT_ACCESS",
+                ),
+            )
         ),
         seed_on_empty_only=get_bool_setting(
             app,
@@ -2447,11 +4337,19 @@ def resolve_bootstrap_settings(
             aliases=("DB_BOOTSTRAP_FAIL_ON_ERROR",),
         ),
     )
-
+    owner = _configured_project_owner_auth_user_id(app)
+    world_defaults = SimpleNamespace(
+        project_owner_auth_user_id=owner,
+        default_project_owner_auth_user_id=owner,
+        owner_auth_user_id=owner,
+        project_owner_user_id=owner,
+        default_project_owner_user_id=owner,
+        owner_user_id=owner,
+    )
     return SimpleNamespace(
         schema=schema,
         seed=seed,
-        world_defaults=None,
+        world_defaults=world_defaults,
         block_defaults=None,
         identity=None,
     )
@@ -2465,43 +4363,30 @@ def get_effective_db_bootstrap_flags(
     run_seed: bool | None = None,
     fail_on_error: bool | None = None,
 ) -> dict[str, bool]:
-    """Resolve effective DB bootstrap flags."""
+    """Resolve effective schema, seed and project-access bootstrap flags."""
     resolved = resolve_bootstrap_settings(app, settings)
-
     schema_settings = getattr(resolved, "schema", None)
     seed_settings = getattr(resolved, "seed", None)
-
     schema_enabled = _safe_bool(
-        getattr(schema_settings, "bootstrap_enabled", False),
-        False,
+        getattr(schema_settings, "bootstrap_enabled", False), False
     )
     schema_create_all = _safe_bool(
-        getattr(schema_settings, "create_all", False),
-        False,
+        getattr(schema_settings, "create_all", False), False
     )
     seed_defaults = _safe_bool(
-        getattr(seed_settings, "seed_defaults", False),
-        False,
+        getattr(seed_settings, "seed_defaults", False), False
     )
-
-    resolved_enabled = bool(
-        enabled
-        if enabled is not None
-        else schema_enabled
-    )
-
+    resolved_enabled = bool(enabled if enabled is not None else schema_enabled)
     resolved_run_schema = bool(
         run_schema
         if run_schema is not None
         else (resolved_enabled and schema_create_all)
     )
-
     resolved_run_seed = bool(
         run_seed
         if run_seed is not None
         else (resolved_enabled and seed_defaults)
     )
-
     resolved_fail_on_error = bool(
         fail_on_error
         if fail_on_error is not None
@@ -2510,11 +4395,13 @@ def get_effective_db_bootstrap_flags(
             and _safe_bool(getattr(seed_settings, "fail_on_error", True), True)
         )
     )
-
     return {
         "enabled": resolved_enabled,
         "runSchema": resolved_run_schema,
         "runSeed": resolved_run_seed,
+        "runProjectAccess": bool(
+            resolved_run_seed and _project_access_required(app, seed_settings)
+        ),
         "failOnError": resolved_fail_on_error,
     }
 
@@ -2528,13 +4415,11 @@ def build_db_bootstrap_status(
     *,
     db_extension: Any = None,
 ) -> dict[str, Any]:
-    """Build read-only schema, seed, world and system-block readiness."""
+    """Build read-only schema, seed, access, world and system readiness."""
     started_at = _utc_now_iso()
-
     with _app_context(app):
         schema_status: dict[str, Any] = {}
         seed_status: dict[str, Any] = {}
-
         schema_ok = False
         seed_ok = False
 
@@ -2575,34 +4460,43 @@ def build_db_bootstrap_status(
 
         invariant = _safe_dict(seed_status.get("defaultWorldInvariant"))
         ready = _safe_dict(invariant.get("ready"))
+        project_access = _safe_dict(invariant.get("projectAccess"))
         system_blocks = _safe_dict(invariant.get("systemBlocks"))
         counts = _system_block_status_counts(system_blocks)
-
+        access_counts = _safe_dict(project_access.get("counts"))
         system_ready = _system_blocks_ready(system_blocks)
         air_ready = _air_invariant_ready(system_blocks)
         railing_ready = _system_railing_ready(system_blocks)
-
+        project_access_ready = _safe_bool(
+            project_access.get("ready"), False
+        )
         completed_at = _utc_now_iso()
 
         return {
             "ok": bool(schema_ok and seed_ok),
-            "status": (
-                STATUS_COMPLETED
-                if schema_ok and seed_ok
-                else STATUS_PARTIAL
-            ),
+            "status": STATUS_COMPLETED if schema_ok and seed_ok else STATUS_PARTIAL,
             "startedAt": started_at,
             "completedAt": completed_at,
             "durationMs": _duration_ms(started_at, completed_at),
             "schemaReady": schema_ok,
             "seedReady": seed_ok,
             "defaultProjectReady": ready.get("project"),
+            "projectOwnerReady": ready.get("projectOwner"),
+            "projectAccessReady": project_access_ready,
+            "canonicalProjectAccessReady": project_access.get("canonicalReady"),
+            "legacyProjectAccessReady": project_access.get("legacyReady"),
+            "projectOwnerAuthUserId": project_access.get("ownerAuthUserId"),
+            "projectAccessAssignmentCount": _safe_int(
+                access_counts.get("canonicalAssignments"), 0
+            ),
+            "projectAccessRoleCount": _safe_int(
+                access_counts.get("legacyRoles"), 0
+            ),
             "defaultUniverseReady": ready.get("universe"),
             "defaultWorldReady": ready.get("world"),
             "blockRegistryReady": ready.get("blockRegistry"),
-            "debugBlocksReady": _safe_dict(
-                seed_status.get("debugBlocks")
-            ).get("complete"),
+            "debugBlocksReady": ready.get("debugBlocks"),
+            "debugBlocksRequired": _debug_blocks_required(app),
             "systemBlocksReady": system_ready,
             "systemRailingReady": railing_ready,
             "airInvariantReady": air_ready,
@@ -2611,6 +4505,7 @@ def build_db_bootstrap_status(
             "systemBlocksDrifted": counts["drifted"],
             "schema": schema_status,
             "seed": seed_status,
+            "projectAccess": project_access,
             "systemBlocks": system_blocks,
         }
 
@@ -2678,6 +4573,7 @@ def run_db_bootstrap(
         try:
             result.metadata["settingsAvailable"] = resolved_settings is not None
             result.metadata["flags"] = flags
+            result.metadata["defaultSeedApi"] = _default_seed_api_diagnostics()
             result.metadata["defaultIds"] = {
                 "projectId": _default_project_id(app),
                 "universeId": _default_universe_id(app),
@@ -2687,6 +4583,12 @@ def run_db_bootstrap(
                 "providerWorldId": _default_provider_world_id(app),
                 "blockRegistryId": _default_block_registry_id(app),
                 "blockRegistryVersion": _default_block_registry_version(app),
+                "projectOwnerAuthUserId": _configured_project_owner_auth_user_id(
+                    app, resolved_settings
+                ),
+                "projectAccessRequired": _project_access_required(
+                    app, getattr(resolved_settings, "seed", None)
+                ),
                 "airSystemBlockId": DEFAULT_SYSTEM_AIR_BLOCK_ID,
                 "systemRailingBlockTypeId": DEFAULT_SYSTEM_RAILING_BLOCK_TYPE_ID,
             }
@@ -2704,6 +4606,7 @@ def run_db_bootstrap(
                 "seedDefaults": _safe_bool(getattr(seed_settings, "seed_defaults", False), False),
                 "seedDebugBlocks": _safe_bool(getattr(seed_settings, "seed_debug_blocks", False), False),
                 "seedDevProject": _safe_bool(getattr(seed_settings, "seed_dev_project", False), False),
+                "seedProjectAccess": _project_access_required(app, seed_settings),
                 "seedOnEmptyOnly": _safe_bool(getattr(seed_settings, "seed_on_empty_only", True), True),
                 "repairSeedInvariants": _seed_invariant_repair_enabled(app, seed_settings),
                 "failOnError": _safe_bool(getattr(seed_settings, "fail_on_error", True), True),
@@ -2861,6 +4764,9 @@ def _run_pre_status_step(
                     "schemaReady": bool(status.get("schemaReady")),
                     "seedReady": bool(status.get("seedReady")),
                     "defaultProjectReady": status.get("defaultProjectReady"),
+                    "projectOwnerReady": status.get("projectOwnerReady"),
+                    "projectAccessReady": status.get("projectAccessReady"),
+                    "projectOwnerAuthUserId": status.get("projectOwnerAuthUserId"),
                     "defaultUniverseReady": status.get("defaultUniverseReady"),
                     "defaultWorldReady": status.get("defaultWorldReady"),
                     "blockRegistryReady": status.get("blockRegistryReady"),
@@ -3011,29 +4917,36 @@ def _run_seed_step(
     resolved_settings: Any,
     db_extension: Any = None,
 ) -> None:
-    """Run default seed and repair world/system-block invariants."""
+    """Run default seed and repair owner/access/world/system invariants."""
     started_at = _utc_now_iso()
-
     seed_settings = getattr(resolved_settings, "seed", None)
     world_defaults = getattr(resolved_settings, "world_defaults", None)
     block_defaults = getattr(resolved_settings, "block_defaults", None)
-
     seed_data: dict[str, Any] = {}
     seed_summary: dict[str, Any] = {}
     seed_run_error: dict[str, Any] | None = None
 
-    if run_default_seed is None:
+    seed_runner = _get_default_seed_callable("run_default_seed")
+    seed_serializer = _get_default_seed_callable(
+        "default_seed_result_to_dict"
+    )
+    seed_summary_builder = _get_default_seed_callable(
+        "build_default_seed_summary"
+    )
+
+    if not callable(seed_runner):
         seed_run_error = _make_message(
             code="default_seed_unavailable",
             message=(
                 "run_default_seed is unavailable. Falling back to direct "
-                "world/system-block invariant repair."
+                "owner/access/world/system invariant repair."
             ),
+            details={"defaultSeedApi": _default_seed_api_diagnostics()},
         )
         result.warnings.append(seed_run_error)
     else:
         try:
-            seed_result = run_default_seed(
+            seed_result = seed_runner(
                 app,
                 seed_settings=seed_settings,
                 world_defaults=world_defaults,
@@ -3041,23 +4954,24 @@ def _run_seed_step(
                 db_extension=db_extension,
                 fail_on_error=False,
             )
-
-            if default_seed_result_to_dict is not None:
-                seed_data = default_seed_result_to_dict(seed_result)
-            else:
-                seed_data = _safe_dict(seed_result)
-
-            if build_default_seed_summary is not None:
+            seed_data = (
+                seed_serializer(seed_result)
+                if callable(seed_serializer)
+                else _safe_dict(seed_result)
+            )
+            if callable(seed_summary_builder):
                 try:
-                    seed_summary = build_default_seed_summary(seed_result)
+                    seed_summary = seed_summary_builder(seed_result)
                 except Exception:
                     seed_summary = {}
-
         except Exception as exc:
             seed_run_error = _make_message(
                 code="default_seed_exception",
                 message=_safe_exception_message(exc),
-                details={"exceptionType": exc.__class__.__name__},
+                details={
+                    "exceptionType": exc.__class__.__name__,
+                    "defaultSeedApi": _default_seed_api_diagnostics(),
+                },
             )
             seed_data = {
                 "ok": False,
@@ -3067,7 +4981,6 @@ def _run_seed_step(
             result.warnings.append(seed_run_error)
 
     result.seed_bootstrap_executed = True
-
     invariant_before = build_default_world_invariant_status(
         app,
         db_extension=db_extension,
@@ -3076,13 +4989,11 @@ def _run_seed_step(
         app,
         db_extension=db_extension,
     )
-
     needs_repair = _seed_status_needs_invariant_repair(
         seed_data,
         seed_status_before,
         invariant_before,
     )
-
     repair_allowed = _seed_invariant_repair_enabled(app, seed_settings)
     repair_result: dict[str, Any] = {
         "ok": True,
@@ -3099,7 +5010,6 @@ def _run_seed_step(
         )
         result.seed_invariant_repair_executed = True
         result.seed_invariant_repair_ok = bool(repair_result.get("ok"))
-
         result.steps.append(
             _make_step(
                 name=STEP_DEFAULT_SEED_INVARIANT_REPAIR,
@@ -3110,15 +5020,14 @@ def _run_seed_step(
                     else STEP_STATUS_FAILED
                 ),
                 message=(
-                    "Default world/system-block invariant repair completed."
+                    "Default owner/access/world/system invariant repair completed."
                     if repair_result.get("ok")
-                    else "Default world/system-block invariant repair failed."
+                    else "Default owner/access/world/system invariant repair failed."
                 ),
                 started_at=repair_started_at,
                 data={"repair": repair_result},
             )
         )
-
     elif needs_repair and not repair_allowed:
         result.seed_invariant_repair_executed = False
         result.seed_invariant_repair_ok = False
@@ -3144,10 +5053,10 @@ def _run_seed_step(
         app,
         db_extension=db_extension,
     )
-
     final_seed_ok = bool(seed_status_after.get("ok"))
     final_invariant_ok = bool(invariant_after.get("ok"))
-
+    project_access = _safe_dict(invariant_after.get("projectAccess"))
+    project_access_counts = _safe_dict(project_access.get("counts"))
     system_blocks = _safe_dict(invariant_after.get("systemBlocks"))
     system_counts = _system_block_status_counts(system_blocks)
 
@@ -3166,49 +5075,60 @@ def _run_seed_step(
         "invariantBeforeRepair": invariant_before,
         "invariantAfterRepair": invariant_after,
         "repair": repair_result,
+        "projectAccess": project_access,
         "systemBlocks": system_blocks,
     }
     result.seed_invariant = invariant_after
+    result.project_access = project_access
     result.system_blocks = system_blocks
     result.seed_bootstrap_ok = bool(final_seed_ok and final_invariant_ok)
     result.seed_ready = result.seed_bootstrap_ok
 
     ready = _safe_dict(invariant_after.get("ready"))
     result.default_project_ready = _safe_bool(ready.get("project"), False)
+    result.project_owner_ready = _safe_bool(ready.get("projectOwner"), False)
+    result.project_access_ready = _safe_bool(ready.get("projectAccess"), False)
+    result.canonical_project_access_ready = _safe_bool(
+        ready.get("canonicalProjectAccess"), False
+    )
+    result.legacy_project_access_ready = _safe_bool(
+        ready.get("legacyProjectAccess"), False
+    )
+    result.project_owner_auth_user_id = _safe_str(
+        project_access.get("ownerAuthUserId"), ""
+    ) or None
+    result.project_access_assignment_count = _safe_int(
+        project_access_counts.get("canonicalAssignments"), 0
+    )
+    result.project_access_role_count = _safe_int(
+        project_access_counts.get("legacyRoles"), 0
+    )
     result.default_universe_ready = _safe_bool(ready.get("universe"), False)
     result.default_world_ready = _safe_bool(ready.get("world"), False)
     result.block_registry_ready = _safe_bool(ready.get("blockRegistry"), False)
+    result.debug_blocks_required = _debug_blocks_required(app, seed_settings)
+    result.debug_blocks_ready = _safe_bool(ready.get("debugBlocks"), True)
     result.system_blocks_ready = _system_blocks_ready(system_blocks)
     result.air_invariant_ready = _air_invariant_ready(system_blocks)
     result.system_railing_ready = _system_railing_ready(system_blocks)
-
     result.system_block_count = system_counts["mirrors"]
     result.system_blocks_created = system_counts["created"]
     result.system_blocks_updated = system_counts["updated"]
     result.system_blocks_missing = system_counts["missing"]
     result.system_blocks_drifted = system_counts["drifted"]
 
-    debug_blocks = _safe_dict(seed_status_after.get("debugBlocks"))
-    result.debug_blocks_ready = (
-        _safe_bool(debug_blocks.get("complete"), False)
-        if debug_blocks
-        else None
-    )
-
     result.steps.append(
         _make_step(
             name=STEP_DEFAULT_SEED,
             ok=bool(result.seed_bootstrap_ok),
             status=(
-                STEP_STATUS_OK
-                if result.seed_bootstrap_ok
-                else STEP_STATUS_FAILED
+                STEP_STATUS_OK if result.seed_bootstrap_ok else STEP_STATUS_FAILED
             ),
             message=(
-                "Default seed bootstrap completed and all runtime invariants "
-                "are ready."
+                "Default seed bootstrap completed and owner/access/world/system "
+                "invariants are ready."
                 if result.seed_bootstrap_ok
-                else "Default seed bootstrap or system-block invariant is incomplete."
+                else "Default seed bootstrap or an owner/access/world/system invariant is incomplete."
             ),
             started_at=started_at,
             data={
@@ -3221,9 +5141,18 @@ def _run_seed_step(
                     "repairExecuted": bool(repair_result.get("executed")),
                     "repairOk": repair_result.get("ok"),
                     "defaultProjectReady": result.default_project_ready,
+                    "projectOwnerReady": result.project_owner_ready,
+                    "projectAccessReady": result.project_access_ready,
+                    "canonicalProjectAccessReady": (
+                        result.canonical_project_access_ready
+                    ),
+                    "legacyProjectAccessReady": result.legacy_project_access_ready,
+                    "projectOwnerAuthUserId": result.project_owner_auth_user_id,
                     "defaultUniverseReady": result.default_universe_ready,
                     "defaultWorldReady": result.default_world_ready,
                     "blockRegistryReady": result.block_registry_ready,
+                    "debugBlocksRequired": result.debug_blocks_required,
+                    "debugBlocksReady": result.debug_blocks_ready,
                     "systemBlocksReady": result.system_blocks_ready,
                     "airInvariantReady": result.air_invariant_ready,
                     "systemRailingReady": result.system_railing_ready,
@@ -3241,12 +5170,13 @@ def _run_seed_step(
             _make_message(
                 code="default_seed_failed",
                 message=(
-                    "Default seed bootstrap failed or the world/system-block "
-                    "invariant remained partial."
+                    "Default seed bootstrap failed or the owner/access/world/"
+                    "system-block invariant remained partial."
                 ),
                 details={
                     "seedStatusAfterRepair": seed_status_after,
                     "invariantAfterRepair": invariant_after,
+                    "projectAccess": project_access,
                     "systemBlocks": system_blocks,
                     "repair": repair_result,
                 },
@@ -3278,6 +5208,9 @@ def _run_post_status_step(
                     "schemaReady": bool(status.get("schemaReady")),
                     "seedReady": bool(status.get("seedReady")),
                     "defaultProjectReady": status.get("defaultProjectReady"),
+                    "projectOwnerReady": status.get("projectOwnerReady"),
+                    "projectAccessReady": status.get("projectAccessReady"),
+                    "projectOwnerAuthUserId": status.get("projectOwnerAuthUserId"),
                     "defaultUniverseReady": status.get("defaultUniverseReady"),
                     "defaultWorldReady": status.get("defaultWorldReady"),
                     "blockRegistryReady": status.get("blockRegistryReady"),
@@ -3309,7 +5242,7 @@ def _run_post_status_step(
 
 
 def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
-    """Apply post-status readiness and enforce system-block invariants."""
+    """Apply post-status readiness and enforce access/system invariants."""
     post_status = result.post_status or {}
     if not isinstance(post_status, Mapping):
         return
@@ -3317,20 +5250,41 @@ def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
     result.schema_ready = _safe_bool(post_status.get("schemaReady"), False)
     result.seed_ready = _safe_bool(post_status.get("seedReady"), False)
     result.default_project_ready = _safe_bool(
-        post_status.get("defaultProjectReady"),
-        False,
+        post_status.get("defaultProjectReady"), False
     )
+    result.project_owner_ready = _safe_bool(
+        post_status.get("projectOwnerReady"), False
+    )
+    result.project_access_ready = _safe_bool(
+        post_status.get("projectAccessReady"), False
+    )
+    result.canonical_project_access_ready = _safe_bool(
+        post_status.get("canonicalProjectAccessReady"), False
+    )
+    result.legacy_project_access_ready = _safe_bool(
+        post_status.get("legacyProjectAccessReady"), False
+    )
+    result.project_owner_auth_user_id = _safe_str(
+        post_status.get("projectOwnerAuthUserId"), ""
+    ) or None
+    result.project_access_assignment_count = max(
+        0, _safe_int(post_status.get("projectAccessAssignmentCount"), 0)
+    )
+    result.project_access_role_count = max(
+        0, _safe_int(post_status.get("projectAccessRoleCount"), 0)
+    )
+    result.project_access = _safe_dict(post_status.get("projectAccess"))
     result.default_universe_ready = _safe_bool(
-        post_status.get("defaultUniverseReady"),
-        False,
+        post_status.get("defaultUniverseReady"), False
     )
     result.default_world_ready = _safe_bool(
-        post_status.get("defaultWorldReady"),
-        False,
+        post_status.get("defaultWorldReady"), False
     )
     result.block_registry_ready = _safe_bool(
-        post_status.get("blockRegistryReady"),
-        False,
+        post_status.get("blockRegistryReady"), False
+    )
+    result.debug_blocks_required = _safe_bool(
+        post_status.get("debugBlocksRequired"), False
     )
     result.debug_blocks_ready = (
         _safe_bool(post_status.get("debugBlocksReady"), False)
@@ -3338,29 +5292,22 @@ def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
         else None
     )
     result.system_blocks_ready = _safe_bool(
-        post_status.get("systemBlocksReady"),
-        False,
+        post_status.get("systemBlocksReady"), False
     )
     result.system_railing_ready = _safe_bool(
-        post_status.get("systemRailingReady"),
-        False,
+        post_status.get("systemRailingReady"), False
     )
     result.air_invariant_ready = _safe_bool(
-        post_status.get("airInvariantReady"),
-        False,
+        post_status.get("airInvariantReady"), False
     )
-
     result.system_block_count = max(
-        0,
-        _safe_int(post_status.get("systemBlockCount"), 0),
+        0, _safe_int(post_status.get("systemBlockCount"), 0)
     )
     result.system_blocks_missing = max(
-        0,
-        _safe_int(post_status.get("systemBlocksMissing"), 0),
+        0, _safe_int(post_status.get("systemBlocksMissing"), 0)
     )
     result.system_blocks_drifted = max(
-        0,
-        _safe_int(post_status.get("systemBlocksDrifted"), 0),
+        0, _safe_int(post_status.get("systemBlocksDrifted"), 0)
     )
     result.system_blocks = _safe_dict(post_status.get("systemBlocks"))
 
@@ -3376,12 +5323,46 @@ def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
 
     if result.seed_bootstrap_requested:
         invariant_failures: list[tuple[str, str]] = []
-
+        if not result.project_owner_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_project_owner_not_ready",
+                    "Default project canonical owner is not ready after bootstrap.",
+                )
+            )
+        if not result.project_access_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_project_access_not_ready",
+                    "Default project access projection is not ready after bootstrap.",
+                )
+            )
+        if not result.canonical_project_access_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_canonical_access_not_ready",
+                    "Canonical ProjectAccessAssignment projection is not ready.",
+                )
+            )
+        if not result.legacy_project_access_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_legacy_access_not_ready",
+                    "Legacy role compatibility projection is not ready.",
+                )
+            )
         if not result.block_registry_ready:
             invariant_failures.append(
                 (
                     "post_bootstrap_block_registry_not_ready",
                     "Default BlockRegistry is not ready after bootstrap.",
+                )
+            )
+        if result.debug_blocks_required and not result.debug_blocks_ready:
+            invariant_failures.append(
+                (
+                    "post_bootstrap_debug_blocks_not_ready",
+                    "Debug blocks were requested but are not ready after bootstrap.",
                 )
             )
         if not result.system_blocks_ready:
@@ -3413,19 +5394,19 @@ def _apply_post_status_readiness(result: DbBootstrapResult) -> None:
                     message=message,
                     details={
                         "postStatus": dict(post_status),
+                        "projectAccess": result.project_access,
                         "systemBlocks": result.system_blocks,
                     },
                 )
             )
-
         if not result.seed_ready or invariant_failures:
             result.seed_bootstrap_ok = False
             result.errors.append(
                 _make_message(
                     code="post_bootstrap_seed_not_ready",
                     message=(
-                        "Seed/default world/system-block invariant is not "
-                        "ready after bootstrap."
+                        "Seed owner/access/world/system invariant is not ready "
+                        "after bootstrap."
                     ),
                     details={"postStatus": dict(post_status)},
                 )
@@ -3518,7 +5499,6 @@ def build_db_bootstrap_summary(
     """Build compact DB-bootstrap summary."""
     data = db_bootstrap_result_to_dict(result)
     steps = data.get("steps") or []
-
     try:
         failed_steps = [step for step in steps if not bool(step.get("ok"))]
         skipped_steps = [step for step in steps if bool(step.get("skipped"))]
@@ -3533,10 +5513,22 @@ def build_db_bootstrap_summary(
         "schemaReady": data.get("schema_ready"),
         "seedReady": data.get("seed_ready"),
         "defaultProjectReady": data.get("default_project_ready"),
+        "projectOwnerReady": data.get("project_owner_ready"),
+        "projectAccessReady": data.get("project_access_ready"),
+        "canonicalProjectAccessReady": data.get(
+            "canonical_project_access_ready"
+        ),
+        "legacyProjectAccessReady": data.get("legacy_project_access_ready"),
+        "projectOwnerAuthUserId": data.get("project_owner_auth_user_id"),
+        "projectAccessAssignmentCount": data.get(
+            "project_access_assignment_count"
+        ),
+        "projectAccessRoleCount": data.get("project_access_role_count"),
         "defaultUniverseReady": data.get("default_universe_ready"),
         "defaultWorldReady": data.get("default_world_ready"),
         "blockRegistryReady": data.get("block_registry_ready"),
         "debugBlocksReady": data.get("debug_blocks_ready"),
+        "debugBlocksRequired": data.get("debug_blocks_required"),
         "systemBlocksReady": data.get("system_blocks_ready"),
         "systemRailingReady": data.get("system_railing_ready"),
         "airInvariantReady": data.get("air_invariant_ready"),
@@ -3608,8 +5600,11 @@ __all__ = [
     "build_db_bootstrap_exit_code",
     "build_db_bootstrap_status",
     "build_db_bootstrap_summary",
+    "build_default_project_access_projection_status",
     "build_default_world_invariant_status",
     "build_system_block_invariant_status",
+    "clear_db_bootstrap_default_seed_caches",
+    "clear_db_bootstrap_project_access_caches",
     "clear_db_bootstrap_system_block_caches",
     "db_bootstrap_result_to_dict",
     "get_effective_db_bootstrap_flags",

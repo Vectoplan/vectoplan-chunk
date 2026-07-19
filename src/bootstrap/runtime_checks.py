@@ -40,7 +40,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
+import hashlib
 import importlib
+import re
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
@@ -117,19 +119,24 @@ except Exception:  # pragma: no cover - fallback for direct script-style imports
 # Constants
 # -----------------------------------------------------------------------------
 
-RUNTIME_CHECKS_RESULT_VERSION: Final[str] = "runtime-checks-result.v2"
+RUNTIME_CHECKS_RESULT_VERSION: Final[str] = "runtime-checks-result.v3"
 
 DEFAULT_SERVICE_NAME: Final[str] = "vectoplan-chunk"
 DEFAULT_DISPLAY_NAME: Final[str] = "VECTOPLAN Chunk Service"
 DEFAULT_PROJECT_ID: Final[str] = "dev-project"
-DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = "1"
+DEFAULT_PROJECT_OWNER_AUTH_USER_ID: Final[str] = "auth_dev_owner"
+# Compatibility export. The value is now a canonical cross-service auth identity.
+DEFAULT_PROJECT_OWNER_USER_ID: Final[str] = DEFAULT_PROJECT_OWNER_AUTH_USER_ID
+DEFAULT_CANONICAL_USER_ID_FIELD: Final[str] = "auth_user_id"
+DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE: Final[str] = "vectoplan-app"
+DEFAULT_PROJECT_ACCESS_PROJECTION_VERSION: Final[str] = "project-access-projection.v1"
 DEFAULT_PROJECT_ROLE_KEYS: Final[tuple[str, ...]] = (
     "owner",
     "admin",
     "editor",
     "viewer",
 )
-PROJECT_ACCESS_QUERY_ROW_LIMIT: Final[int] = 32
+PROJECT_ACCESS_QUERY_ROW_LIMIT: Final[int] = 64
 
 CHECK_STATUS_OK: Final[str] = "ok"
 CHECK_STATUS_MISSING: Final[str] = "missing"
@@ -148,7 +155,6 @@ PROJECT_ACCESS_CHECK_UNAVAILABLE_CODE: Final[str] = (
     "project_access_check_unavailable"
 )
 PROJECT_ACCESS_CHECK_FAILED_CODE: Final[str] = "project_access_not_ready"
-
 
 # -----------------------------------------------------------------------------
 # Dataclasses
@@ -183,6 +189,7 @@ class RouteCheckSpec:
     rule: str
     required: bool
     description: str
+    alternatives: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +337,200 @@ def _safe_dict(value: Any) -> dict[str, Any]:
             return {}
 
     return {}
+
+
+def _safe_list(value: Any) -> list[Any]:
+    """Return a bounded sequence as a new list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        try:
+            return sorted(value, key=lambda item: _safe_str(item, ""))
+        except Exception:
+            return list(value)
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        return []
+    try:
+        return list(value)
+    except Exception:
+        return []
+
+
+def _identity_fingerprint(value: Any) -> str | None:
+    """Return a stable non-reversible identity fingerprint."""
+    text_value = _safe_str(value, "")
+    if not text_value:
+        return None
+    try:
+        return hashlib.sha256(text_value.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def _is_canonical_auth_user_id(value: Any) -> bool:
+    """Reject local ids, email addresses and client-controlled identity forms."""
+    text_value = _safe_str(value, "")
+    if not text_value or len(text_value) > 255:
+        return False
+    lowered = text_value.lower()
+    if text_value.isdecimal() or "@" in text_value or "://" in text_value:
+        return False
+    if any(character.isspace() or ord(character) < 32 for character in text_value):
+        return False
+    if lowered in {
+        "0",
+        "1",
+        "anonymous",
+        "guest",
+        "bootstrap",
+        "system",
+        "none",
+        "null",
+        "undefined",
+    }:
+        return False
+    if lowered.startswith(("local_", "appuser_", "dbuser_", "email:")):
+        return False
+    return True
+
+
+def _normalize_owner_auth_user_id(value: Any) -> str:
+    """Normalize unsafe legacy bootstrap values to the canonical dev owner."""
+    candidate = _safe_str(value, "")
+    if _is_canonical_auth_user_id(candidate):
+        return candidate
+    return DEFAULT_PROJECT_OWNER_AUTH_USER_ID
+
+
+def _private_identifiers_enabled(app: Any) -> bool:
+    """Return whether diagnostics may include raw auth identities."""
+    try:
+        return get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_RUNTIME_CHECKS_INCLUDE_PRIVATE_IDENTIFIERS",
+            False,
+            aliases=(
+                "VECTOPLAN_CHUNK_STARTUP_INCLUDE_PRIVATE_IDENTIFIERS",
+                "CHUNK_RUNTIME_CHECKS_INCLUDE_PRIVATE_IDENTIFIERS",
+            ),
+            prefer_env=True,
+        )
+    except Exception:
+        return False
+
+
+def _public_identity_fields(app: Any, value: Any) -> dict[str, Any]:
+    """Build identity diagnostics without exposing the raw value by default."""
+    normalized = _safe_str(value, "")
+    expose = bool(normalized and _private_identifiers_enabled(app))
+    return {
+        "ownerAuthUserId": normalized if expose else None,
+        "ownerUserId": normalized if expose else None,
+        "ownerIdFingerprint": _identity_fingerprint(normalized),
+        "ownerIdentityCanonical": (
+            _is_canonical_auth_user_id(normalized) if normalized else False
+        ),
+        "identityExposed": expose,
+        "canonicalUserIdField": DEFAULT_CANONICAL_USER_ID_FIELD,
+    }
+
+
+def _first_row_value(row: Any, names: Sequence[str], default: Any = None) -> Any:
+    """Read the first non-empty compatible mapped value from a row."""
+    if row is None:
+        return default
+    for name in names:
+        try:
+            value = getattr(row, name, None)
+        except Exception:
+            value = None
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _first_model_attribute(model: Any, names: Sequence[str]) -> Any | None:
+    """Return the first queryable SQLAlchemy model attribute."""
+    if model is None:
+        return None
+    for name in names:
+        try:
+            value = getattr(model, name)
+        except Exception:
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _row_is_active(row: Any, now: datetime | None = None) -> bool:
+    """Evaluate common active/deleted/effective-window fields read-only."""
+    if row is None:
+        return False
+    now = now or _utc_now()
+    for name in ("active", "is_active", "enabled"):
+        try:
+            value = getattr(row, name, None)
+        except Exception:
+            value = None
+        if value is not None and not _safe_bool(value, False):
+            return False
+    try:
+        if getattr(row, "deleted_at", None) is not None:
+            return False
+    except Exception:
+        return False
+    status_value = _safe_str(_first_row_value(row, ("status",), ""), "").lower()
+    if status_value and status_value not in {"active", "ready", "enabled"}:
+        return False
+    return _effective_window_ready(row, now)
+
+
+def _expected_access_source_service(app: Any) -> str:
+    """Return the App-owned access-projection source service."""
+    try:
+        value = get_str_setting(
+            app,
+            "VECTOPLAN_CHUNK_PROJECT_ACCESS_SOURCE_SERVICE",
+            DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE,
+            aliases=("CHUNK_PROJECT_ACCESS_SOURCE_SERVICE",),
+            prefer_env=True,
+        )
+    except Exception:
+        value = DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE
+    return _safe_str(value, DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE).lower()
+
+
+def _project_access_authz_enforced(app: Any) -> bool:
+    """Return the explicitly configured route-authorization rollout state."""
+    try:
+        return get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_PROJECT_ACCESS_AUTHZ_ENFORCED",
+            False,
+            aliases=("CHUNK_PROJECT_ACCESS_AUTHZ_ENFORCED",),
+            prefer_env=True,
+        )
+    except Exception:
+        return False
+
+
+def _viewer_read_only_expected(app: Any) -> bool:
+    """Return whether Viewer must remain strictly read-only."""
+    try:
+        return get_bool_setting(
+            app,
+            "VECTOPLAN_CHUNK_VIEWER_READ_ONLY",
+            True,
+            aliases=("CHUNK_VIEWER_READ_ONLY",),
+            prefer_env=True,
+        )
+    except Exception:
+        return True
 
 
 def _safe_path_to_string(path: Path | None) -> str:
@@ -512,44 +713,62 @@ def _resolve_default_project_id(app: Any, settings: Any = None) -> str:
         )
 
 
-def _resolve_default_project_owner_user_id(
+def _resolve_default_project_owner_auth_user_id(
     app: Any,
     settings: Any = None,
 ) -> str:
-    """Resolve the opaque external owner user id used by the dev bootstrap."""
+    """Resolve the canonical opaque owner auth identity used by dev bootstrap."""
     if settings is not None:
         try:
             world_defaults = getattr(settings, "world_defaults", None)
             for name in (
+                "project_owner_auth_user_id",
+                "default_project_owner_auth_user_id",
+                "owner_auth_user_id",
                 "project_owner_user_id",
                 "default_project_owner_user_id",
                 "owner_user_id",
             ):
                 normalized = _safe_str(getattr(world_defaults, name, None), "")
                 if normalized:
-                    return normalized
+                    return _normalize_owner_auth_user_id(normalized)
         except Exception:
             pass
 
     try:
-        owner_user_id = get_str_setting(
+        owner_auth_user_id = get_str_setting(
             app,
-            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
-            DEFAULT_PROJECT_OWNER_USER_ID,
-            aliases=("DEFAULT_PROJECT_OWNER_USER_ID",),
+            "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+            DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
+            aliases=(
+                "VECTOPLAN_CHUNK_PROJECT_OWNER_AUTH_USER_ID",
+                "VECTOPLAN_CHUNK_DEFAULT_OWNER_AUTH_USER_ID",
+                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
+                "VECTOPLAN_CHUNK_DEFAULT_OWNER_USER_ID",
+                "DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+                "DEFAULT_PROJECT_OWNER_USER_ID",
+            ),
             prefer_env=True,
         )
     except Exception:
-        owner_user_id = _safe_str(
+        owner_auth_user_id = _safe_str(
             _config_value(
                 app,
-                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID",
-                DEFAULT_PROJECT_OWNER_USER_ID,
+                "VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
+                DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
             ),
-            DEFAULT_PROJECT_OWNER_USER_ID,
+            DEFAULT_PROJECT_OWNER_AUTH_USER_ID,
         )
 
-    return owner_user_id or DEFAULT_PROJECT_OWNER_USER_ID
+    return _normalize_owner_auth_user_id(owner_auth_user_id)
+
+
+def _resolve_default_project_owner_user_id(
+    app: Any,
+    settings: Any = None,
+) -> str:
+    """Compatibility alias returning the canonical auth identity."""
+    return _resolve_default_project_owner_auth_user_id(app, settings)
 
 
 # -----------------------------------------------------------------------------
@@ -699,11 +918,18 @@ def get_default_path_check_specs() -> tuple[PathCheckSpec, ...]:
             description="Startup/bootstrap source directory.",
         ),
         PathCheckSpec(
+            name="services_src_root",
+            config_key="SERVICES_SRC_ROOT",
+            fallback_relative_path="src/services",
+            required=True,
+            description="Canonical Chunk service modules.",
+        ),
+        PathCheckSpec(
             name="project_access_src_root",
             config_key="PROJECT_ACCESS_SRC_ROOT",
             fallback_relative_path="src/project_access",
-            required=True,
-            description="Project-scoped access service package.",
+            required=False,
+            description="Optional legacy project-access facade package.",
         ),
         PathCheckSpec(
             name="migrations_root",
@@ -790,10 +1016,16 @@ def get_default_file_check_specs() -> tuple[FileCheckSpec, ...]:
             description="Project model.",
         ),
         FileCheckSpec(
+            name="project_access_assignment_model",
+            fallback_relative_path="models/project_access_assignment.py",
+            required=True,
+            description="Canonical App-to-Chunk access projection model.",
+        ),
+        FileCheckSpec(
             name="project_access_model",
             fallback_relative_path="models/project_access.py",
             required=True,
-            description="Project roles, groups, memberships and assignments models.",
+            description="Legacy-compatible project roles, groups and assignments models.",
         ),
         FileCheckSpec(
             name="universe_model",
@@ -862,16 +1094,34 @@ def get_default_file_check_specs() -> tuple[FileCheckSpec, ...]:
             description="Explicit database bootstrap orchestrator.",
         ),
         FileCheckSpec(
-            name="project_access_package",
-            fallback_relative_path="src/project_access/__init__.py",
+            name="service_auth_service",
+            fallback_relative_path="src/services/service_auth_service.py",
             required=True,
-            description="Stable project-access import facade.",
+            description="Trusted internal service-authentication service.",
         ),
         FileCheckSpec(
             name="project_access_service",
-            fallback_relative_path="src/project_access/service.py",
+            fallback_relative_path="src/services/project_access_service.py",
             required=True,
-            description="Transaction-neutral project-access service.",
+            description="Canonical App-owned project-access projection service.",
+        ),
+        FileCheckSpec(
+            name="project_provisioning_service",
+            fallback_relative_path="src/services/project_provisioning_service.py",
+            required=True,
+            description="Idempotent project/universe/world provisioning service.",
+        ),
+        FileCheckSpec(
+            name="project_access_package_legacy",
+            fallback_relative_path="src/project_access/__init__.py",
+            required=False,
+            description="Optional legacy project-access import facade.",
+        ),
+        FileCheckSpec(
+            name="project_access_service_legacy",
+            fallback_relative_path="src/project_access/service.py",
+            required=False,
+            description="Optional legacy project-access service facade.",
         ),
         FileCheckSpec(
             name="flat_world_config",
@@ -996,6 +1246,25 @@ def get_default_route_check_specs() -> tuple[RouteCheckSpec, ...]:
                 "Prepared project-group route; optional while authorization "
                 "enforcement remains disabled."
             ),
+        ),
+        RouteCheckSpec(
+            name="project_access_initialize",
+            rule="/projects/<project_id>/access/initialize",
+            required=False,
+            description="Trusted App/init access-projection initialization route.",
+        ),
+        RouteCheckSpec(
+            name="project_access_assignments",
+            rule="/projects/<project_id>/access/assignments",
+            required=False,
+            description="Canonical access-assignment management route.",
+            alternatives=("/projects/<project_id>/assignments",),
+        ),
+        RouteCheckSpec(
+            name="project_owner_transfer",
+            rule="/projects/<project_id>/access/transfer-owner",
+            required=False,
+            description="Dedicated owner-transfer route.",
         ),
         RouteCheckSpec(
             name="project_world_metadata",
@@ -1138,10 +1407,13 @@ def collect_app_metadata(app: Flask, settings: BootstrapSettings | None = None) 
                     "providerWorldId": settings.world_defaults.provider_world_id,
                     "blockRegistryId": settings.world_defaults.block_registry_id,
                     "blockRegistryVersion": settings.world_defaults.block_registry_version,
-                    "projectOwnerUserId": (
-                        _resolve_default_project_owner_user_id(app, settings)
+                    **_public_identity_fields(
+                        app,
+                        _resolve_default_project_owner_auth_user_id(app, settings),
                     ),
-                    "projectAccessAuthzEnforced": False,
+                    "projectAccessSourceOfTruth": _expected_access_source_service(app),
+                    "projectAccessViewerReadOnly": _viewer_read_only_expected(app),
+                    "projectAccessAuthzEnforced": _project_access_authz_enforced(app),
                 }
             )
         except Exception:
@@ -1153,10 +1425,13 @@ def collect_app_metadata(app: Flask, settings: BootstrapSettings | None = None) 
                 "displayName": get_str_setting(app, "APP_DISPLAY_NAME", DEFAULT_DISPLAY_NAME),
                 "configName": get_str_setting(app, "VECTOPLAN_CHUNK_CONFIG", "development"),
                 "projectId": _resolve_default_project_id(app, settings),
-                "projectOwnerUserId": (
-                    _resolve_default_project_owner_user_id(app, settings)
+                **_public_identity_fields(
+                    app,
+                    _resolve_default_project_owner_auth_user_id(app, settings),
                 ),
-                "projectAccessAuthzEnforced": False,
+                "projectAccessSourceOfTruth": _expected_access_source_service(app),
+                "projectAccessViewerReadOnly": _viewer_read_only_expected(app),
+                "projectAccessAuthzEnforced": _project_access_authz_enforced(app),
             }
         )
 
@@ -1343,12 +1618,79 @@ def run_file_checks(
 # Route checks
 # -----------------------------------------------------------------------------
 
+def _normalize_route_rule(rule: Any) -> str:
+    """Normalize Flask converter syntax and trailing slashes."""
+    text_value = _safe_str(rule, "")
+    if not text_value:
+        return ""
+    if not text_value.startswith("/"):
+        text_value = "/" + text_value
+    text_value = re.sub(r"<[^:<>]+:([^<>]+)>", r"<\1>", text_value)
+    text_value = re.sub(r"/{2,}", "/", text_value)
+    if len(text_value) > 1:
+        text_value = text_value.rstrip("/")
+    return text_value
+
+
+def _configured_api_prefix(app: Any) -> str:
+    """Return the normalized optional API prefix."""
+    for key in (
+        "VECTOPLAN_CHUNK_API_PREFIX",
+        "APPLICATION_ROOT",
+        "SCRIPT_NAME",
+    ):
+        try:
+            value = get_str_setting(app, key, "", prefer_env=True)
+        except Exception:
+            value = _safe_str(_config_value(app, key, ""), "")
+        normalized = _normalize_route_rule(value)
+        if normalized and normalized != "/":
+            return normalized
+    return ""
+
+
+def _accepted_route_variants(app: Any, rule: str) -> tuple[str, ...]:
+    """Return exact normalized variants including the configured API prefix."""
+    normalized = _normalize_route_rule(rule)
+    prefix = _configured_api_prefix(app)
+    variants = [normalized]
+    if prefix and normalized:
+        variants.append(prefix + normalized)
+    return tuple(dict.fromkeys(value for value in variants if value))
+
+
 def collect_route_rules(app: Flask) -> list[str]:
-    """Collect all Flask route rules."""
+    """Collect all raw Flask route rules."""
     try:
-        return sorted(str(rule.rule) for rule in app.url_map.iter_rules())
+        return sorted({str(rule.rule) for rule in app.url_map.iter_rules()})
     except Exception:
         return []
+
+
+def _find_matching_route(
+    app: Any,
+    raw_rules: Sequence[str],
+    expected_rules: Sequence[str],
+) -> tuple[str | None, str | None]:
+    """Find an exact normalized route, allowing configured path prefixes."""
+    normalized_actual = {
+        _normalize_route_rule(raw): raw
+        for raw in raw_rules
+        if _normalize_route_rule(raw)
+    }
+    for expected in expected_rules:
+        for candidate in _accepted_route_variants(app, expected):
+            raw = normalized_actual.get(candidate)
+            if raw is not None:
+                return raw, candidate
+        normalized_expected = _normalize_route_rule(expected)
+        if normalized_expected:
+            for normalized, raw in normalized_actual.items():
+                if normalized.endswith(normalized_expected):
+                    prefix = normalized[: -len(normalized_expected)]
+                    if prefix and prefix.startswith("/"):
+                        return raw, normalized
+    return None, None
 
 
 def run_route_checks(
@@ -1361,14 +1703,11 @@ def run_route_checks(
     list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
-    """
-    Run route checks.
-
-    Returns:
-        (results, route_summary, warnings, errors)
-    """
+    """Run converter- and prefix-aware registered-route checks."""
     route_rules = collect_route_rules(app)
-    route_rule_set = set(route_rules)
+    normalized_rules = sorted(
+        {_normalize_route_rule(rule) for rule in route_rules if rule}
+    )
 
     results: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -1377,7 +1716,13 @@ def run_route_checks(
     optional_missing: list[str] = []
 
     for spec in specs or get_default_route_check_specs():
-        exists = spec.rule in route_rule_set
+        accepted = (spec.rule, *tuple(spec.alternatives or ()))
+        matched_raw, matched_normalized = _find_matching_route(
+            app,
+            route_rules,
+            accepted,
+        )
+        exists = matched_raw is not None
         ok = exists or not spec.required
         status = CHECK_STATUS_OK if exists else CHECK_STATUS_MISSING
 
@@ -1389,6 +1734,14 @@ def run_route_checks(
             description=spec.description,
             details={
                 "rule": spec.rule,
+                "alternatives": list(spec.alternatives or ()),
+                "acceptedVariants": [
+                    variant
+                    for item in accepted
+                    for variant in _accepted_route_variants(app, item)
+                ],
+                "matchedRule": matched_raw,
+                "matchedNormalizedRule": matched_normalized,
                 "exists": exists,
             },
         )
@@ -1402,12 +1755,12 @@ def run_route_checks(
                 details={
                     "name": spec.name,
                     "rule": spec.rule,
+                    "alternatives": list(spec.alternatives or ()),
                 },
             )
             errors.append(error)
             if strict:
                 break
-
         elif not spec.required and not exists:
             optional_missing.append(spec.rule)
             warnings.append(
@@ -1417,6 +1770,7 @@ def run_route_checks(
                     details={
                         "name": spec.name,
                         "rule": spec.rule,
+                        "alternatives": list(spec.alternatives or ()),
                     },
                 )
             )
@@ -1426,6 +1780,8 @@ def run_route_checks(
         "requiredMissing": required_missing,
         "optionalMissing": optional_missing,
         "rules": route_rules,
+        "normalizedRules": normalized_rules,
+        "apiPrefix": _configured_api_prefix(app),
     }
 
     return results, route_summary, warnings, errors
@@ -1435,29 +1791,48 @@ def run_route_checks(
 # Model checks
 # -----------------------------------------------------------------------------
 
-def _load_project_access_package_status() -> dict[str, Any]:
-    """Load project-access package diagnostics without querying the database."""
+def _load_project_access_service_status(app: Any = None) -> dict[str, Any]:
+    """Load canonical service contract diagnostics without querying the DB."""
     import_errors: list[str] = []
+    candidates = (
+        "src.services.project_access_service",
+        "services.project_access_service",
+        "src.project_access",
+        "project_access",
+    )
 
-    for import_path in ("src.project_access", "project_access"):
+    for import_path in candidates:
         try:
             module = importlib.import_module(import_path)
-            status_factory = getattr(
-                module,
-                "get_project_access_package_status",
-                None,
+        except Exception as exc:
+            import_errors.append(
+                f"{import_path}: {exc.__class__.__name__}: "
+                f"{_safe_exception_message(exc)}"
             )
-            if not callable(status_factory):
-                import_errors.append(
-                    f"{import_path}: get_project_access_package_status unavailable"
-                )
-                continue
+            continue
 
-            status = status_factory()
+        status_factory = getattr(module, "get_project_access_service_status", None)
+        legacy_factory = getattr(module, "get_project_access_package_status", None)
+        factory = status_factory if callable(status_factory) else legacy_factory
+        if not callable(factory):
+            import_errors.append(f"{import_path}: status factory unavailable")
+            continue
+
+        try:
+            try:
+                status = factory(config=getattr(app, "config", None))
+            except TypeError:
+                status = factory()
             serializer = getattr(status, "to_dict", None)
             if callable(serializer):
-                status = serializer(include_traceback=False)
-            return _safe_dict(status)
+                try:
+                    status = serializer(include_traceback=False)
+                except TypeError:
+                    status = serializer()
+            result = _safe_dict(status)
+            result.setdefault("module", import_path)
+            result.setdefault("ready", result.get("ok"))
+            return result
         except Exception as exc:
             import_errors.append(
                 f"{import_path}: {exc.__class__.__name__}: "
@@ -1465,9 +1840,60 @@ def _load_project_access_package_status() -> dict[str, Any]:
             )
 
     return {
+        "ok": False,
         "ready": False,
         "error": " | ".join(import_errors),
-        "importCandidates": ["src.project_access", "project_access"],
+        "importCandidates": list(candidates),
+    }
+
+
+def _project_access_service_contract_ready(
+    app: Any,
+    status: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Validate immutable access-service safety properties."""
+    data = _safe_dict(status)
+    allowed_roles = {
+        _safe_str(role, "").lower()
+        for role in _safe_list(data.get("allowed_roles") or data.get("allowedRoles"))
+        if _safe_str(role, "")
+    }
+    expected_roles = set(DEFAULT_PROJECT_ROLE_KEYS)
+    source = _safe_str(
+        data.get("source_service", data.get("sourceService")),
+        "",
+    ).lower()
+    canonical_field = _safe_str(
+        data.get("canonical_user_id_field", data.get("canonicalUserIdField")),
+        "",
+    ).lower()
+    viewer_read_only = _safe_bool(
+        data.get("viewer_read_only", data.get("viewerReadOnly")),
+        False,
+    )
+    checks = {
+        "serviceReady": _safe_bool(data.get("ok", data.get("ready")), False),
+        "enabled": _safe_bool(data.get("enabled"), False),
+        "defaultDeny": _safe_bool(data.get("default_deny", data.get("defaultDeny")), False),
+        "canonicalUserIdFieldReady": canonical_field == DEFAULT_CANONICAL_USER_ID_FIELD,
+        "rolesReady": allowed_roles == expected_roles,
+        "viewerReadOnly": viewer_read_only,
+        "publicMutationsDisabled": not _safe_bool(
+            data.get("allow_public_mutations", data.get("allowPublicMutations")),
+            False,
+        ),
+        "identityOverrideDisabled": not _safe_bool(
+            data.get("allow_identity_override", data.get("allowIdentityOverride")),
+            False,
+        ),
+        "sourceOfTruthReady": source == _expected_access_source_service(app),
+    }
+    return all(checks.values()), {
+        **checks,
+        "sourceOfTruth": source,
+        "expectedSourceOfTruth": _expected_access_source_service(app),
+        "canonicalUserIdField": canonical_field,
+        "allowedRoles": sorted(allowed_roles),
     }
 
 
@@ -1475,37 +1901,30 @@ def run_model_registry_check(
     app: Flask,
     strict: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Check model registry and project-access code contracts.
-
-    This function performs imports and SQLAlchemy metadata inspection only. It
-    does not inspect database tables or query application rows.
-    """
-    del app, strict  # kept for API compatibility and future policy use
-
+    """Check model registry plus canonical and legacy access contracts."""
+    del strict
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
     try:
-        from models import (
-            get_model_debug_summary,
-            get_project_access_model_contract,
-            is_app_integration_model_shape_ready,
-            is_project_access_model_shape_ready,
-            require_expected_model_columns,
-            require_models_ready,
+        models_module = importlib.import_module("models")
+        require_models_ready = getattr(models_module, "require_models_ready")
+        require_expected_model_columns = getattr(
+            models_module,
+            "require_expected_model_columns",
         )
     except Exception as exc:
         message = (
             "Could not import model registry helpers: "
             f"{_safe_exception_message(exc)}"
         )
-        error = _make_message(
-            code=MODEL_CHECK_IMPORT_ERROR_CODE,
-            message=message,
-            details={"exceptionType": exc.__class__.__name__},
+        errors.append(
+            _make_message(
+                code=MODEL_CHECK_IMPORT_ERROR_CODE,
+                message=message,
+                details={"exceptionType": exc.__class__.__name__},
+            )
         )
-        errors.append(error)
         return {
             "ok": False,
             "status": CHECK_STATUS_FAILED,
@@ -1537,12 +1956,12 @@ def run_model_registry_check(
 
     critical_classes = (
         "Project",
+        "ProjectAccessAssignment",
         "ProjectRole",
         "ProjectGroup",
         "ProjectGroupMember",
         "ProjectRoleAssignment",
     )
-
     column_contract_ready = True
     column_contract_error: str | None = None
     try:
@@ -1564,89 +1983,88 @@ def run_model_registry_check(
             )
         )
 
-    summary: dict[str, Any] = {}
-    try:
-        summary = _safe_dict(get_model_debug_summary())
-    except Exception as exc:
-        warnings.append(
-            _make_message(
-                code="model_summary_unavailable",
-                message=(
-                    "Model registry is ready, but summary could not be built: "
-                    f"{_safe_exception_message(exc)}"
-                ),
-                details={"exceptionType": exc.__class__.__name__},
-            )
-        )
+    def optional_call(name: str, default: Any) -> Any:
+        function = getattr(models_module, name, None)
+        if not callable(function):
+            return default
+        try:
+            return function()
+        except Exception:
+            return default
 
-    project_access_model_contract: dict[str, Any] = {}
-    try:
-        project_access_model_contract = _safe_dict(
-            get_project_access_model_contract()
+    summary = _safe_dict(optional_call("get_model_debug_summary", {}))
+    model_contract = _safe_dict(
+        optional_call("get_project_access_model_contract", {})
+    )
+    canonical_shape_ready = bool(
+        optional_call(
+            "is_project_access_projection_model_shape_ready",
+            optional_call("is_project_access_model_shape_ready", False),
         )
-    except Exception as exc:
-        warnings.append(
-            _make_message(
-                code="project_access_model_contract_unavailable",
-                message=_safe_exception_message(exc),
-                details={"exceptionType": exc.__class__.__name__},
-            )
+    )
+    legacy_shape_ready = bool(
+        optional_call(
+            "is_legacy_project_access_model_shape_ready",
+            optional_call("is_project_access_model_shape_ready", False),
         )
+    )
+    combined_shape_ready = bool(
+        optional_call(
+            "is_project_access_model_shape_ready",
+            canonical_shape_ready and legacy_shape_ready,
+        )
+    )
+    app_integration_shape_ready = bool(
+        optional_call("is_app_integration_model_shape_ready", False)
+    )
 
-    project_access_shape_ready = False
-    app_integration_shape_ready = False
-    try:
-        project_access_shape_ready = bool(
-            is_project_access_model_shape_ready()
-        )
-    except Exception:
-        project_access_shape_ready = False
+    service_status = _load_project_access_service_status(app)
+    service_contract_ready, service_contract = (
+        _project_access_service_contract_ready(app, service_status)
+    )
 
-    try:
-        app_integration_shape_ready = bool(
-            is_app_integration_model_shape_ready()
-        )
-    except Exception:
-        app_integration_shape_ready = False
-
-    package_status = _load_project_access_package_status()
-    package_ready = _safe_bool(package_status.get("ready"), False)
-
-    if not project_access_shape_ready:
-        errors.append(
-            _make_message(
-                code="project_access_model_shape_not_ready",
-                message="Project-access model shape is not ready.",
-                details={"contract": project_access_model_contract},
-            )
-        )
-
-    if not app_integration_shape_ready:
-        errors.append(
-            _make_message(
-                code="project_app_integration_shape_not_ready",
-                message=(
-                    "Project model does not expose all required app/owner "
-                    "integration columns."
-                ),
-                details={"summary": summary},
-            )
-        )
-
-    if not package_ready:
-        errors.append(
-            _make_message(
-                code="project_access_package_not_ready",
-                message="Project-access service package is not ready.",
-                details={"packageStatus": package_status},
-            )
-        )
+    for ready, code, message, details in (
+        (
+            canonical_shape_ready,
+            "project_access_projection_model_shape_not_ready",
+            "Canonical project-access projection model shape is not ready.",
+            {"contract": model_contract},
+        ),
+        (
+            legacy_shape_ready,
+            "legacy_project_access_model_shape_not_ready",
+            "Legacy project-role/group compatibility model shape is not ready.",
+            {"contract": model_contract},
+        ),
+        (
+            combined_shape_ready,
+            "project_access_model_shape_not_ready",
+            "Combined project-access model shape is not ready.",
+            {"contract": model_contract},
+        ),
+        (
+            app_integration_shape_ready,
+            "project_app_integration_shape_not_ready",
+            "Project model does not expose the required provisioning/access columns.",
+            {"summary": summary},
+        ),
+        (
+            service_contract_ready,
+            "project_access_service_contract_not_ready",
+            "Project-access service safety contract is not ready.",
+            {"serviceContract": service_contract},
+        ),
+    ):
+        if not ready:
+            errors.append(_make_message(code=code, message=message, details=details))
 
     ok = bool(
         column_contract_ready
-        and project_access_shape_ready
+        and canonical_shape_ready
+        and legacy_shape_ready
+        and combined_shape_ready
         and app_integration_shape_ready
-        and package_ready
+        and service_contract_ready
         and not errors
     )
 
@@ -1655,14 +2073,19 @@ def run_model_registry_check(
         "status": CHECK_STATUS_OK if ok else CHECK_STATUS_FAILED,
         "summary": summary,
         "appIntegrationShapeReady": app_integration_shape_ready,
-        "projectAccessShapeReady": project_access_shape_ready,
+        "projectAccessShapeReady": combined_shape_ready,
+        "canonicalProjectAccessShapeReady": canonical_shape_ready,
+        "legacyProjectAccessShapeReady": legacy_shape_ready,
         "criticalColumnContractReady": column_contract_ready,
         "criticalColumnContractError": column_contract_error,
         "projectAccess": {
-            "packageReady": package_ready,
-            "packageStatus": package_status,
-            "modelContract": project_access_model_contract,
-            "authzEnforced": False,
+            "serviceReady": service_contract_ready,
+            "serviceStatus": service_status,
+            "serviceContract": service_contract,
+            "modelContract": model_contract,
+            "sourceOfTruth": _expected_access_source_service(app),
+            "viewerReadOnly": service_contract.get("viewerReadOnly"),
+            "authzEnforced": _project_access_authz_enforced(app),
         },
     }, warnings, errors
 
@@ -2007,6 +2430,20 @@ def run_schema_readiness_check(
             snapshot.get("projectAccessSchemaReady"),
             False,
         ),
+        "canonicalProjectAccessSchemaReady": _safe_bool(
+            snapshot.get(
+                "canonicalProjectAccessSchemaReady",
+                snapshot.get("projectAccessSchemaReady"),
+            ),
+            False,
+        ),
+        "legacyProjectAccessSchemaReady": _safe_bool(
+            snapshot.get(
+                "legacyProjectAccessSchemaReady",
+                snapshot.get("projectAccessSchemaReady"),
+            ),
+            False,
+        ),
         "mutated": False,
     }
 
@@ -2072,12 +2509,14 @@ def _effective_window_ready(row: Any, now: datetime) -> bool:
 
 def _empty_project_access_runtime_status(
     *,
+    app: Any,
     project_id: str,
-    owner_user_id: str,
+    owner_auth_user_id: str,
     required: bool,
     error: str | None = None,
     checked: bool = False,
 ) -> dict[str, Any]:
+    identity = _public_identity_fields(app, owner_auth_user_id)
     return {
         "ok": False,
         "status": CHECK_STATUS_FAILED,
@@ -2086,20 +2525,316 @@ def _empty_project_access_runtime_status(
         "projectId": project_id,
         "projectDbId": None,
         "projectExists": False,
-        "ownerUserId": owner_user_id,
+        **identity,
+        "projectOwnerReady": False,
         "ownerReady": False,
+        "canonicalProjectAccessReady": False,
+        "canonicalReady": False,
+        "legacyProjectAccessReady": False,
+        "legacyReady": False,
         "rolesReady": False,
         "ownerAssignmentReady": False,
         "accessReady": False,
         "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
         "activeRoleKeys": [],
         "missingRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
-        "activeOwnerAssignmentCount": 0,
+        "canonicalOwnerAssignmentCount": 0,
+        "legacyOwnerAssignmentCount": 0,
         "matchingOwnerAssignmentCount": 0,
+        "projectAccessAssignmentCount": 0,
+        "projectAccessRoleCount": 0,
         "assignmentScanTruncated": False,
-        "authzEnforced": False,
+        "sourceOfTruth": _expected_access_source_service(app),
+        "sourceOfTruthReady": False,
+        "viewerReadOnly": _viewer_read_only_expected(app),
+        "authzEnforced": _project_access_authz_enforced(app),
+        "effectivePermissionsCalculated": False,
         "mutated": False,
         "error": error,
+    }
+
+
+def _project_scoped_query(
+    session: Any,
+    model: Any,
+    *,
+    project_public_id: str,
+    project_db_id: Any,
+) -> Any | None:
+    """Build a project-scoped query using public-id aliases before DB ids."""
+    if session is None or model is None:
+        return None
+    public_field = _first_model_attribute(
+        model,
+        ("chunk_project_id", "project_public_id", "project_id"),
+    )
+    db_field = _first_model_attribute(model, ("project_db_id",))
+    field = public_field if public_field is not None else db_field
+    value = project_public_id if public_field is not None else project_db_id
+    if field is None or value is None:
+        return None
+    return session.query(model).filter(field == value)
+
+
+def _query_project_scoped_rows(
+    session: Any,
+    model: Any,
+    *,
+    project_public_id: str,
+    project_db_id: Any,
+    limit: int,
+) -> tuple[list[Any], int, bool]:
+    """Run one bounded project-scoped query using compatible field aliases."""
+    query = _project_scoped_query(
+        session,
+        model,
+        project_public_id=project_public_id,
+        project_db_id=project_db_id,
+    )
+    if query is None:
+        return [], 0, False
+    try:
+        count = int(query.count())
+    except Exception:
+        count = 0
+    rows = query.limit(limit + 1).all()
+    truncated = len(rows) > limit or count > limit
+    return list(rows[:limit]), count, truncated
+
+
+def _query_canonical_owner_rows(
+    session: Any,
+    model: Any,
+    *,
+    project_public_id: str,
+    project_db_id: Any,
+    limit: int,
+) -> tuple[list[Any], int, bool, int]:
+    """Query only canonical direct-owner rows while separately counting all assignments."""
+    base_query = _project_scoped_query(
+        session,
+        model,
+        project_public_id=project_public_id,
+        project_db_id=project_db_id,
+    )
+    if base_query is None:
+        return [], 0, False, 0
+    try:
+        total_assignment_count = int(base_query.count())
+    except Exception:
+        total_assignment_count = 0
+
+    query = base_query
+    role_field = _first_model_attribute(model, ("role", "project_role", "access_role"))
+    assignment_type_field = _first_model_attribute(
+        model,
+        ("assignment_type", "subject_type", "principal_type"),
+    )
+    active_field = _first_model_attribute(model, ("active", "is_active", "enabled"))
+    deleted_field = _first_model_attribute(model, ("deleted_at",))
+    if role_field is not None:
+        query = query.filter(role_field == "owner")
+    if assignment_type_field is not None:
+        query = query.filter(assignment_type_field.in_(("direct", "user")))
+    if active_field is not None:
+        query = query.filter(active_field.is_(True))
+    if deleted_field is not None:
+        query = query.filter(deleted_field.is_(None))
+
+    try:
+        owner_count = int(query.count())
+    except Exception:
+        owner_count = 0
+    rows = query.limit(limit + 1).all()
+    truncated = len(rows) > limit or owner_count > limit
+    return list(rows[:limit]), owner_count, truncated, total_assignment_count
+
+
+def _canonical_assignment_status(
+    app: Any,
+    rows: Sequence[Any],
+    *,
+    owner_auth_user_id: str,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Evaluate canonical direct-owner projection from bounded rows."""
+    now = _utc_now()
+    active_rows = [row for row in rows if _row_is_active(row, now)]
+    direct_rows = [
+        row
+        for row in active_rows
+        if _safe_str(
+            _first_row_value(row, ("assignment_type", "subject_type", "principal_type"), "direct"),
+            "direct",
+        ).lower() in {"direct", "user"}
+    ]
+    owner_rows = [
+        row
+        for row in direct_rows
+        if _safe_str(
+            _first_row_value(row, ("role", "project_role", "access_role"), ""),
+            "",
+        ).lower() == "owner"
+    ]
+    matching_rows = [
+        row
+        for row in owner_rows
+        if _safe_str(
+            _first_row_value(
+                row,
+                ("auth_user_id", "subject_auth_user_id", "principal_id", "subject_id"),
+                "",
+            ),
+            "",
+        ) == owner_auth_user_id
+    ]
+    expected_source = _expected_access_source_service(app)
+    owner_sources = {
+        _safe_str(
+            _first_row_value(row, ("source_service", "managed_by", "source"), ""),
+            "",
+        ).lower()
+        for row in matching_rows
+    }
+    source_ready = bool(matching_rows and owner_sources == {expected_source})
+    ready = bool(
+        not truncated
+        and len(owner_rows) == 1
+        and len(matching_rows) == 1
+        and source_ready
+        and _is_canonical_auth_user_id(owner_auth_user_id)
+    )
+    return {
+        "ready": ready,
+        "activeAssignmentCount": len(active_rows),
+        "directAssignmentCount": len(direct_rows),
+        "ownerAssignmentCount": len(owner_rows),
+        "matchingOwnerAssignmentCount": len(matching_rows),
+        "sourceOfTruth": next(iter(owner_sources), expected_source),
+        "sourceOfTruthReady": source_ready,
+        "scanTruncated": truncated,
+    }
+
+
+def _legacy_access_status(
+    session: Any,
+    ProjectRole: Any,
+    ProjectRoleAssignment: Any,
+    *,
+    project_db_id: Any,
+    owner_auth_user_id: str,
+) -> dict[str, Any]:
+    """Evaluate the retained role/assignment compatibility projection."""
+    role_field = _first_model_attribute(ProjectRole, ("project_db_id",))
+    role_value = project_db_id
+    if role_field is None:
+        role_field = _first_model_attribute(
+            ProjectRole,
+            ("chunk_project_id", "project_public_id", "project_id"),
+        )
+    if role_field is None or role_value is None:
+        role_rows, stored_role_count, role_truncated = [], 0, False
+    else:
+        role_query = session.query(ProjectRole).filter(role_field == role_value)
+        role_key_field = _first_model_attribute(
+            ProjectRole,
+            ("role_key", "role", "project_role"),
+        )
+        if role_key_field is not None:
+            role_query = role_query.filter(role_key_field.in_(DEFAULT_PROJECT_ROLE_KEYS))
+        try:
+            stored_role_count = int(role_query.count())
+        except Exception:
+            stored_role_count = 0
+        raw_role_rows = role_query.limit(
+            max(PROJECT_ACCESS_QUERY_ROW_LIMIT, len(DEFAULT_PROJECT_ROLE_KEYS) * 4) + 1
+        ).all()
+        role_truncated = bool(
+            len(raw_role_rows) > max(PROJECT_ACCESS_QUERY_ROW_LIMIT, len(DEFAULT_PROJECT_ROLE_KEYS) * 4)
+            or stored_role_count > max(PROJECT_ACCESS_QUERY_ROW_LIMIT, len(DEFAULT_PROJECT_ROLE_KEYS) * 4)
+        )
+        role_rows = list(
+            raw_role_rows[: max(PROJECT_ACCESS_QUERY_ROW_LIMIT, len(DEFAULT_PROJECT_ROLE_KEYS) * 4)]
+        )
+    now = _utc_now()
+    active_roles: dict[str, Any] = {}
+    duplicates: set[str] = set()
+    for role in role_rows:
+        role_key = _safe_str(
+            _first_row_value(role, ("role_key", "role", "project_role"), ""),
+            "",
+        ).lower()
+        if role_key not in DEFAULT_PROJECT_ROLE_KEYS or not _row_is_active(role, now):
+            continue
+        if role_key in active_roles:
+            duplicates.add(role_key)
+        else:
+            active_roles[role_key] = role
+
+    missing = sorted(set(DEFAULT_PROJECT_ROLE_KEYS) - set(active_roles))
+    roles_ready = bool(not role_truncated and not missing and not duplicates)
+    owner_role = active_roles.get("owner")
+    owner_role_db_id = _first_row_value(owner_role, ("id",), None)
+    owner_role_id = _safe_str(
+        _first_row_value(owner_role, ("role_id",), ""),
+        "",
+    ) or None
+
+    assignment_rows: list[Any] = []
+    assignment_count = 0
+    assignment_truncated = False
+    if owner_role_db_id is not None and ProjectRoleAssignment is not None:
+        project_field = _first_model_attribute(ProjectRoleAssignment, ("project_db_id",))
+        role_field = _first_model_attribute(ProjectRoleAssignment, ("role_db_id",))
+        if project_field is not None and role_field is not None:
+            query = session.query(ProjectRoleAssignment).filter(
+                project_field == project_db_id,
+                role_field == owner_role_db_id,
+            )
+            try:
+                assignment_count = int(query.count())
+            except Exception:
+                assignment_count = 0
+            rows = query.limit(PROJECT_ACCESS_QUERY_ROW_LIMIT + 1).all()
+            assignment_truncated = (
+                len(rows) > PROJECT_ACCESS_QUERY_ROW_LIMIT
+                or assignment_count > PROJECT_ACCESS_QUERY_ROW_LIMIT
+            )
+            assignment_rows = list(rows[:PROJECT_ACCESS_QUERY_ROW_LIMIT])
+
+    effective_rows = [row for row in assignment_rows if _row_is_active(row, now)]
+    matching_rows = [
+        row
+        for row in effective_rows
+        if _safe_str(
+            _first_row_value(row, ("subject_type", "assignment_type"), "user"),
+            "user",
+        ).lower() in {"user", "direct"}
+        and _safe_str(
+            _first_row_value(row, ("user_id", "auth_user_id", "subject_auth_user_id"), ""),
+            "",
+        ) == owner_auth_user_id
+    ]
+    owner_assignment_ready = bool(
+        not assignment_truncated
+        and len(effective_rows) == 1
+        and len(matching_rows) == 1
+    )
+    ready = bool(roles_ready and owner_assignment_ready)
+    return {
+        "ready": ready,
+        "rolesReady": roles_ready,
+        "ownerAssignmentReady": owner_assignment_ready,
+        "activeRoleKeys": sorted(active_roles),
+        "missingRoleKeys": missing,
+        "duplicateActiveRoleKeys": sorted(duplicates),
+        "ownerRoleId": owner_role_id,
+        "ownerRoleDbId": owner_role_db_id,
+        "roleCount": stored_role_count,
+        "activeOwnerAssignmentCount": len(effective_rows),
+        "matchingOwnerAssignmentCount": len(matching_rows),
+        "storedOwnerAssignmentCount": assignment_count,
+        "scanTruncated": bool(role_truncated or assignment_truncated),
     }
 
 
@@ -2111,13 +2846,9 @@ def run_project_access_readiness_check(
     db_extension: Any = None,
     project_id: str | None = None,
     owner_user_id: str | None = None,
+    owner_auth_user_id: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Check owner/default-role readiness with bounded, read-only ORM queries.
-
-    Only Project, ProjectRole and ProjectRoleAssignment are queried. Groups,
-    memberships, worlds, chunks, snapshots, commands and events are not loaded.
-    """
+    """Check canonical and legacy access projections using bounded read-only queries."""
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     db_obj = db_extension if db_extension is not None else db
@@ -2126,13 +2857,15 @@ def run_project_access_readiness_check(
         project_id,
         _resolve_default_project_id(app, settings),
     )
-    resolved_owner_user_id = _safe_str(
-        owner_user_id,
-        _resolve_default_project_owner_user_id(app, settings),
+    resolved_owner = _normalize_owner_auth_user_id(
+        owner_auth_user_id
+        or owner_user_id
+        or _resolve_default_project_owner_auth_user_id(app, settings)
     )
     empty = _empty_project_access_runtime_status(
+        app=app,
         project_id=resolved_project_id,
-        owner_user_id=resolved_owner_user_id,
+        owner_auth_user_id=resolved_owner,
         required=bool(require_ok),
     )
 
@@ -2148,16 +2881,23 @@ def run_project_access_readiness_check(
         return empty, warnings, errors
 
     try:
-        from models import require_model_class
-
+        models_module = importlib.import_module("models")
+        require_model_class = getattr(models_module, "require_model_class")
         Project = require_model_class("Project")
+        ProjectAccessAssignment = require_model_class("ProjectAccessAssignment")
         ProjectRole = require_model_class("ProjectRole")
         ProjectRoleAssignment = require_model_class("ProjectRoleAssignment")
 
         session = db_obj.session
+        project_field = _first_model_attribute(
+            Project,
+            ("project_id", "chunk_project_id", "project_public_id"),
+        )
+        if project_field is None:
+            raise RuntimeError("Project model has no queryable public project id.")
         project = (
             session.query(Project)
-            .filter(Project.project_id == resolved_project_id)
+            .filter(project_field == resolved_project_id)
             .limit(1)
             .one_or_none()
         )
@@ -2176,173 +2916,196 @@ def run_project_access_readiness_check(
             empty.update({"checked": True, "error": message})
             return empty, warnings, errors
 
-        project_db_id = getattr(project, "id", None)
+        project_db_id = _first_row_value(project, ("id",), None)
+        project_status = _safe_str(
+            _first_row_value(project, ("status",), "active"),
+            "active",
+        ).lower()
         project_deleted = bool(
-            getattr(project, "deleted_at", None) is not None
-            or _safe_str(getattr(project, "status", None), "").lower()
-            == "deleted"
+            _first_row_value(project, ("deleted_at",), None) is not None
+            or project_status == "deleted"
         )
+        actual_owner = _safe_str(
+            _first_row_value(
+                project,
+                (
+                    "owner_auth_user_id",
+                    "auth_owner_user_id",
+                    "owner_user_id",
+                    "owner_id",
+                ),
+                "",
+            ),
+            "",
+        )
+        owner_type = _safe_str(
+            _first_row_value(project, ("owner_type",), "user"),
+            "user",
+        ).lower()
+        owner_identity_canonical = _is_canonical_auth_user_id(actual_owner)
         owner_ready = bool(
             not project_deleted
-            and _safe_str(getattr(project, "owner_type", None), "").lower()
-            == "user"
-            and _safe_str(getattr(project, "owner_id", None), "")
-            == resolved_owner_user_id
+            and owner_type == "user"
+            and owner_identity_canonical
+            and actual_owner == resolved_owner
         )
 
-        role_rows = (
-            session.query(ProjectRole)
-            .filter(ProjectRole.project_db_id == project_db_id)
-            .filter(ProjectRole.role_key.in_(DEFAULT_PROJECT_ROLE_KEYS))
-            .limit(len(DEFAULT_PROJECT_ROLE_KEYS) * 2)
-            .all()
+        (
+            canonical_rows,
+            canonical_owner_row_count,
+            canonical_truncated,
+            canonical_count,
+        ) = _query_canonical_owner_rows(
+            session,
+            ProjectAccessAssignment,
+            project_public_id=resolved_project_id,
+            project_db_id=project_db_id,
+            limit=PROJECT_ACCESS_QUERY_ROW_LIMIT,
+        )
+        canonical = _canonical_assignment_status(
+            app,
+            canonical_rows,
+            owner_auth_user_id=actual_owner or resolved_owner,
+            truncated=canonical_truncated,
+        )
+        legacy = _legacy_access_status(
+            session,
+            ProjectRole,
+            ProjectRoleAssignment,
+            project_db_id=project_db_id,
+            owner_auth_user_id=actual_owner or resolved_owner,
         )
 
-        active_roles: dict[str, Any] = {}
-        duplicate_active_role_keys: set[str] = set()
-        for role in role_rows:
-            role_key = _safe_str(getattr(role, "role_key", None), "").lower()
-            is_active = bool(
-                role_key in DEFAULT_PROJECT_ROLE_KEYS
-                and _safe_str(getattr(role, "status", None), "").lower()
-                == "active"
-                and getattr(role, "deleted_at", None) is None
-            )
-            if not is_active:
-                continue
-            if role_key in active_roles:
-                duplicate_active_role_keys.add(role_key)
-            else:
-                active_roles[role_key] = role
-
-        active_role_keys = set(active_roles)
-        missing_role_keys = sorted(
-            set(DEFAULT_PROJECT_ROLE_KEYS) - active_role_keys
+        service_status = _load_project_access_service_status(app)
+        service_ready, service_contract = _project_access_service_contract_ready(
+            app,
+            service_status,
         )
-        roles_ready = bool(
-            not missing_role_keys and not duplicate_active_role_keys
+        viewer_read_only = bool(
+            service_contract.get("viewerReadOnly")
+            and _viewer_read_only_expected(app)
+        )
+        expected_source = _expected_access_source_service(app)
+        actual_source = _safe_str(
+            canonical.get("sourceOfTruth"),
+            service_contract.get("sourceOfTruth", expected_source),
+        ).lower()
+        source_ready = bool(
+            canonical.get("sourceOfTruthReady")
+            and service_contract.get("sourceOfTruthReady")
+            and actual_source == expected_source
         )
 
-        owner_role = active_roles.get("owner")
-        owner_role_db_id = getattr(owner_role, "id", None)
-        owner_role_id = _safe_str(
-            getattr(owner_role, "role_id", None),
+        projection_status = _safe_str(
+            _first_row_value(
+                project,
+                ("access_sync_status", "access_status"),
+                "",
+            ),
             "",
-        ) or None
-
-        assignment_rows: list[Any] = []
-        assignment_count = 0
-        assignment_scan_truncated = False
-        if owner_role_db_id is not None:
-            base_query = (
-                session.query(ProjectRoleAssignment)
-                .filter(
-                    ProjectRoleAssignment.project_db_id == project_db_id
-                )
-                .filter(
-                    ProjectRoleAssignment.role_db_id == owner_role_db_id
-                )
-                .filter(ProjectRoleAssignment.status == "active")
-                .filter(ProjectRoleAssignment.deleted_at.is_(None))
-            )
-            assignment_count = int(base_query.count())
-            assignment_scan_truncated = (
-                assignment_count > PROJECT_ACCESS_QUERY_ROW_LIMIT
-            )
-            assignment_rows = (
-                base_query.limit(PROJECT_ACCESS_QUERY_ROW_LIMIT).all()
-            )
-
-        now = _utc_now()
-        effective_owner_assignments: list[Any] = []
-        matching_owner_assignments: list[Any] = []
-        for assignment in assignment_rows:
-            if not _effective_window_ready(assignment, now):
-                continue
-            effective_owner_assignments.append(assignment)
-            if (
-                _safe_str(
-                    getattr(assignment, "subject_type", None),
-                    "",
-                ).lower()
-                == "user"
-                and _safe_str(getattr(assignment, "user_id", None), "")
-                == resolved_owner_user_id
-            ):
-                matching_owner_assignments.append(assignment)
-
-        owner_assignment_ready = bool(
-            not assignment_scan_truncated
-            and len(effective_owner_assignments) == 1
-            and len(matching_owner_assignments) == 1
+        ).lower()
+        projection_state_ready = (
+            projection_status == "ready" if projection_status else None
         )
-        access_ready = bool(
-            owner_ready and roles_ready and owner_assignment_ready
+        canonical_ready = bool(
+            owner_ready
+            and canonical.get("ready")
+            and service_ready
+            and source_ready
+            and viewer_read_only
+            and projection_state_ready is not False
         )
+        legacy_ready = bool(legacy.get("ready"))
+        access_ready = bool(canonical_ready and legacy_ready)
 
+        identity = _public_identity_fields(app, actual_owner or resolved_owner)
         result = {
             "ok": access_ready,
-            "status": (
-                CHECK_STATUS_OK if access_ready else CHECK_STATUS_WARNING
-            ),
+            "status": CHECK_STATUS_OK if access_ready else CHECK_STATUS_WARNING,
             "checked": True,
             "required": bool(require_ok),
             "projectId": resolved_project_id,
             "projectDbId": project_db_id,
             "projectExists": True,
-            "projectStatus": getattr(project, "status", None),
+            "projectStatus": project_status,
             "projectDeleted": project_deleted,
-            "ownerUserId": resolved_owner_user_id,
-            "actualOwnerType": getattr(project, "owner_type", None),
-            "actualOwnerId": getattr(project, "owner_id", None),
+            **identity,
+            "expectedOwnerIdFingerprint": _identity_fingerprint(resolved_owner),
+            "projectOwnerReady": owner_ready,
             "ownerReady": owner_ready,
-            "rolesReady": roles_ready,
-            "ownerAssignmentReady": owner_assignment_ready,
+            "canonicalProjectAccessReady": canonical_ready,
+            "canonicalReady": canonical_ready,
+            "legacyProjectAccessReady": legacy_ready,
+            "legacyReady": legacy_ready,
+            "rolesReady": legacy.get("rolesReady"),
+            "ownerAssignmentReady": bool(
+                canonical.get("ready") and legacy.get("ownerAssignmentReady")
+            ),
             "accessReady": access_ready,
+            "projectionStatus": projection_status or None,
+            "projectionStateReady": projection_state_ready,
             "requiredRoleKeys": list(DEFAULT_PROJECT_ROLE_KEYS),
-            "activeRoleKeys": sorted(active_role_keys),
-            "missingRoleKeys": missing_role_keys,
-            "duplicateActiveRoleKeys": sorted(duplicate_active_role_keys),
-            "ownerRoleId": owner_role_id,
-            "ownerRoleDbId": owner_role_db_id,
-            "activeOwnerAssignmentCount": len(
-                effective_owner_assignments
+            "activeRoleKeys": list(legacy.get("activeRoleKeys") or []),
+            "missingRoleKeys": list(legacy.get("missingRoleKeys") or []),
+            "duplicateActiveRoleKeys": list(
+                legacy.get("duplicateActiveRoleKeys") or []
             ),
-            "matchingOwnerAssignmentCount": len(
-                matching_owner_assignments
-            ),
-            "storedActiveOwnerAssignmentCount": assignment_count,
+            "ownerRoleId": legacy.get("ownerRoleId"),
+            "canonicalOwnerAssignmentCount": canonical_owner_row_count,
+            "legacyOwnerAssignmentCount": legacy.get("activeOwnerAssignmentCount", 0),
+            "matchingOwnerAssignmentCount": canonical.get("matchingOwnerAssignmentCount", 0),
+            "projectAccessAssignmentCount": canonical_count,
+            "projectAccessRoleCount": legacy.get("roleCount", 0),
             "assignmentScanLimit": PROJECT_ACCESS_QUERY_ROW_LIMIT,
-            "assignmentScanTruncated": assignment_scan_truncated,
-            "authzEnforced": False,
+            "assignmentScanTruncated": bool(
+                canonical.get("scanTruncated") or legacy.get("scanTruncated")
+            ),
+            "sourceOfTruth": actual_source,
+            "expectedSourceOfTruth": expected_source,
+            "sourceOfTruthReady": source_ready,
+            "viewerReadOnly": viewer_read_only,
+            "authzEnforced": _project_access_authz_enforced(app),
             "effectivePermissionsCalculated": False,
+            "serviceReady": service_ready,
+            "serviceContract": service_contract,
+            "counts": {
+                "canonicalAssignments": canonical_count,
+                "canonicalOwnerAssignments": canonical_owner_row_count,
+                "legacyRoles": legacy.get("roleCount", 0),
+                "legacyOwnerAssignments": legacy.get("activeOwnerAssignmentCount", 0),
+            },
             "mutated": False,
             "error": None,
         }
 
         if not access_ready:
+            failure_keys: list[str] = []
+            for ready, key in (
+                (owner_ready, "projectOwner"),
+                (canonical_ready, "canonicalProjectAccess"),
+                (legacy_ready, "legacyProjectAccess"),
+                (service_ready, "projectAccessService"),
+                (source_ready, "sourceOfTruth"),
+                (viewer_read_only, "viewerReadOnly"),
+            ):
+                if not ready:
+                    failure_keys.append(key)
+            if projection_state_ready is False:
+                failure_keys.append("projectionState")
             item = _make_message(
                 code=PROJECT_ACCESS_CHECK_FAILED_CODE,
                 message=(
-                    "Default project owner, standard roles or unique owner "
-                    "assignment are not ready."
+                    "Default project owner and canonical/legacy access projections "
+                    "are not ready."
                 ),
                 details={
                     "projectId": resolved_project_id,
-                    "ownerReady": owner_ready,
-                    "rolesReady": roles_ready,
-                    "ownerAssignmentReady": owner_assignment_ready,
-                    "missingRoleKeys": missing_role_keys,
-                    "duplicateActiveRoleKeys": sorted(
-                        duplicate_active_role_keys
-                    ),
-                    "matchingOwnerAssignmentCount": len(
-                        matching_owner_assignments
-                    ),
-                    "activeOwnerAssignmentCount": len(
-                        effective_owner_assignments
-                    ),
-                    "assignmentScanTruncated": assignment_scan_truncated,
+                    "ownerIdFingerprint": identity.get("ownerIdFingerprint"),
+                    "failureKeys": failure_keys,
+                    "canonicalOwnerAssignmentCount": canonical_owner_row_count,
+                    "legacyOwnerAssignmentCount": legacy.get("activeOwnerAssignmentCount", 0),
+                    "missingRoleKeys": legacy.get("missingRoleKeys", []),
+                    "assignmentScanTruncated": result["assignmentScanTruncated"],
                     "requireOk": bool(require_ok),
                     "repairHint": (
                         "Run the explicit default-seed or DB-bootstrap repair; "
@@ -2365,6 +3128,7 @@ def run_project_access_readiness_check(
             details={
                 "exceptionType": exc.__class__.__name__,
                 "projectId": resolved_project_id,
+                "ownerIdFingerprint": _identity_fingerprint(resolved_owner),
                 "requireOk": bool(require_ok),
             },
         )
@@ -2621,8 +3385,20 @@ def run_runtime_checks(
             settings,
             attribute_name="require_project_access",
             config_key="VECTOPLAN_CHUNK_RUNTIME_REQUIRE_PROJECT_ACCESS",
-            default=False,
+            default=bool(require_database),
             aliases=("CHUNK_RUNTIME_REQUIRE_PROJECT_ACCESS",),
+        )
+
+    if require_project_access and not check_project_access:
+        check_project_access = True
+        warnings.append(
+            _make_message(
+                code="project_access_check_forced",
+                message=(
+                    "Project-access readiness is required, so the read-only "
+                    "access check was enabled."
+                ),
+            )
         )
 
     metadata = collect_app_metadata(app, settings=settings)
@@ -2637,7 +3413,10 @@ def run_runtime_checks(
         "requireSchema": bool(require_schema),
         "checkProjectAccess": bool(check_project_access),
         "requireProjectAccess": bool(require_project_access),
-        "projectAccessAuthzEnforced": False,
+        "canonicalUserIdField": DEFAULT_CANONICAL_USER_ID_FIELD,
+        "projectAccessSourceOfTruth": _expected_access_source_service(app),
+        "viewerReadOnly": _viewer_read_only_expected(app),
+        "projectAccessAuthzEnforced": _project_access_authz_enforced(app),
     }
 
     try:
@@ -2862,9 +3641,10 @@ def run_runtime_checks(
                 )
                 (errors if require_project_access else warnings).append(item)
                 project_access = _empty_project_access_runtime_status(
+                    app=app,
                     project_id=_resolve_default_project_id(app, settings),
-                    owner_user_id=(
-                        _resolve_default_project_owner_user_id(app, settings)
+                    owner_auth_user_id=(
+                        _resolve_default_project_owner_auth_user_id(app, settings)
                     ),
                     required=bool(require_project_access),
                     error=message,
@@ -2892,7 +3672,7 @@ def run_runtime_checks(
                 "checked": False,
                 "required": bool(require_project_access),
                 "message": "Project-access readiness check skipped by settings.",
-                "authzEnforced": False,
+                "authzEnforced": _project_access_authz_enforced(app),
                 "mutated": False,
             }
     except Exception as exc:
@@ -2911,7 +3691,7 @@ def run_runtime_checks(
             "checked": True,
             "required": bool(require_project_access),
             "error": item["message"],
-            "authzEnforced": False,
+            "authzEnforced": _project_access_authz_enforced(app),
             "mutated": False,
         }
 
@@ -2962,7 +3742,7 @@ def runtime_checks_result_to_dict(result: RuntimeChecksResult | Mapping[str, Any
 
 
 def build_runtime_checks_summary(result: RuntimeChecksResult | Mapping[str, Any] | Any) -> dict[str, Any]:
-    """Build compact runtime-check summary."""
+    """Build compact runtime-check summary without raw user identities."""
     data = runtime_checks_result_to_dict(result)
 
     paths = data.get("paths") or []
@@ -2970,6 +3750,9 @@ def build_runtime_checks_summary(result: RuntimeChecksResult | Mapping[str, Any]
     routes = data.get("routes") or []
     warnings = data.get("warnings") or []
     errors = data.get("errors") or []
+    schema = _safe_dict(data.get("schema"))
+    access = _safe_dict(data.get("project_access"))
+    models = _safe_dict(data.get("models"))
 
     def count_failed(items: Any) -> int:
         try:
@@ -2986,7 +3769,7 @@ def build_runtime_checks_summary(result: RuntimeChecksResult | Mapping[str, Any]
         "pathCount": len(paths),
         "fileCount": len(files),
         "routeCount": _safe_int(
-            (data.get("route_summary") or {}).get("count", len(routes)),
+            _safe_dict(data.get("route_summary")).get("count", len(routes)),
             len(routes),
             minimum=0,
         ),
@@ -2994,41 +3777,55 @@ def build_runtime_checks_summary(result: RuntimeChecksResult | Mapping[str, Any]
         "failedFileChecks": count_failed(files),
         "failedRouteChecks": count_failed(routes),
         "resultVersion": data.get("result_version"),
-        "modelsOk": bool((data.get("models") or {}).get("ok")),
-        "databaseChecked": bool((data.get("database") or {}).get("connectionChecked")),
-        "databaseOk": (data.get("database") or {}).get("connectionOk"),
-        "schemaChecked": bool((data.get("schema") or {}).get("checked")),
-        "schemaOk": (data.get("schema") or {}).get("ok"),
-        "projectOwnerColumnsReady": (
-            (data.get("schema") or {}).get("projectOwnerColumnsReady")
+        "modelsOk": bool(models.get("ok")),
+        "canonicalProjectAccessShapeReady": models.get(
+            "canonicalProjectAccessShapeReady"
         ),
-        "projectAccessSchemaReady": (
-            (data.get("schema") or {}).get("projectAccessSchemaReady")
+        "legacyProjectAccessShapeReady": models.get(
+            "legacyProjectAccessShapeReady"
         ),
-        "projectAccessChecked": bool(
-            (data.get("project_access") or {}).get("checked")
+        "databaseChecked": bool(_safe_dict(data.get("database")).get("connectionChecked")),
+        "databaseOk": _safe_dict(data.get("database")).get("connectionOk"),
+        "schemaChecked": bool(schema.get("checked")),
+        "schemaOk": schema.get("ok"),
+        "projectOwnerColumnsReady": schema.get("projectOwnerColumnsReady"),
+        "projectAccessSchemaReady": schema.get("projectAccessSchemaReady"),
+        "canonicalProjectAccessSchemaReady": schema.get(
+            "canonicalProjectAccessSchemaReady"
         ),
-        "projectAccessReady": (
-            (data.get("project_access") or {}).get("accessReady",
-                (data.get("project_access") or {}).get("ok"))
+        "legacyProjectAccessSchemaReady": schema.get(
+            "legacyProjectAccessSchemaReady"
         ),
-        "defaultProjectOwnerReady": (
-            (data.get("project_access") or {}).get("ownerReady")
+        "projectAccessChecked": bool(access.get("checked")),
+        "projectAccessReady": access.get("accessReady", access.get("ok")),
+        "defaultProjectOwnerReady": access.get(
+            "projectOwnerReady",
+            access.get("ownerReady"),
         ),
-        "defaultProjectRolesReady": (
-            (data.get("project_access") or {}).get("rolesReady")
+        "canonicalProjectAccessReady": access.get(
+            "canonicalProjectAccessReady",
+            access.get("canonicalReady"),
         ),
-        "defaultProjectOwnerAssignmentReady": (
-            (data.get("project_access") or {}).get("ownerAssignmentReady")
+        "legacyProjectAccessReady": access.get(
+            "legacyProjectAccessReady",
+            access.get("legacyReady"),
         ),
-        "projectAccessAuthzEnforced": False,
+        "defaultProjectRolesReady": access.get("rolesReady"),
+        "defaultProjectOwnerAssignmentReady": access.get(
+            "ownerAssignmentReady"
+        ),
+        "ownerIdFingerprint": access.get("ownerIdFingerprint"),
+        "projectAccessSourceOfTruth": access.get("sourceOfTruth"),
+        "projectAccessSourceOfTruthReady": access.get("sourceOfTruthReady"),
+        "viewerReadOnly": access.get("viewerReadOnly"),
+        "projectAccessAuthzEnforced": access.get("authzEnforced"),
         "warningCount": len(warnings),
         "errorCount": len(errors),
         "requiredMissingRoutes": list(
-            (data.get("route_summary") or {}).get("requiredMissing", []) or []
+            _safe_dict(data.get("route_summary")).get("requiredMissing", []) or []
         ),
         "optionalMissingRoutes": list(
-            (data.get("route_summary") or {}).get("optionalMissing", []) or []
+            _safe_dict(data.get("route_summary")).get("optionalMissing", []) or []
         ),
     }
 
@@ -3092,7 +3889,10 @@ __all__ = [
     "CHECK_STATUS_WARNING",
     "RUNTIME_CHECKS_RESULT_VERSION",
     "DEFAULT_PROJECT_ID",
+    "DEFAULT_PROJECT_OWNER_AUTH_USER_ID",
     "DEFAULT_PROJECT_OWNER_USER_ID",
+    "DEFAULT_CANONICAL_USER_ID_FIELD",
+    "DEFAULT_PROJECT_ACCESS_SOURCE_SERVICE",
     "DEFAULT_PROJECT_ROLE_KEYS",
     "CheckMessage",
     "FileCheckSpec",
@@ -3118,6 +3918,7 @@ __all__ = [
     "run_database_check",
     "run_file_checks",
     "run_model_registry_check",
+    "_load_project_access_service_status",
     "run_path_checks",
     "run_route_checks",
     "run_schema_readiness_check",
