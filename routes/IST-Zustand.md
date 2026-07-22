@@ -4,36 +4,45 @@
 
 ## Status dieser Fassung
 
-Stand: 2026-07-17  
-Status: Aktualisierte vollständige Bestandsaufnahme der Flask-Route-Schicht einschließlich Project Access, atomarem Flat-/Earth-Provisioning und der zuletzt bestätigten Runtime-/DB-Integration des `vectoplan-chunk`-Services.
+Stand: 2026-07-19  
+Status: Vollständige statische Bestandsaufnahme der Flask-Route-Schicht einschließlich Project-/World-/Chunk-/Commandpfaden, Legacy-Project-Access-CRUD, Owner-Transfer, projektweitem Access-Soft-Delete sowie der noch offenen Umstellung auf die kanonische Access-Projektion.
 
 
 
 Diese Fassung aktualisiert den zuvor dokumentierten Stand, ohne bestehende Kapitel oder Detailbereiche zu entfernen. Neu aufgenommen beziehungsweise nachgeführt wurden insbesondere:
 
 ```text
-routes/project_access.py als verpflichtender produktiver Blueprint
-→ Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen
-
-routes/__init__.py 0.6.0
-→ Project-Access-Featuregate, Pflichtstatus und Route-Surface-Validierung
-
 routes/projects.py 0.5.1
-→ Provisioning-Responses v2, Access-Readiness und App-Link-Löschung
+→ direkte Projektanlage erzeugt Project, Access, Universe und World in einer Transaktion
+→ PATCH kann einen explizit freigegebenen Owner-Transfer mit Access-Synchronisation ausführen
+→ DELETE soft-löscht zusätzlich den vorbereiteten Project-Access-Baum
+→ World-Template und Earth-Referenz sind nach World-Erzeugung über PATCH gesperrt
 
-atomare Earth-Provisionierung
-→ kompakte Earth-Referenz
-→ kanonischer GlobalReferencePoint
-→ EPSG:4979 / WKT2:2019
-→ Earth-v1-Grid
-→ referenzbasierter Spawn
-→ idempotenter Wiederholungsrequest
+routes/project_access.py 1.0.1
+→ nicht-leere fehlerhafte JSON-Bodies werden nicht mehr still als {} akzeptiert
+→ sichere Bodydiagnostik ohne Echo des Requestinhalts
+→ Hinweis für robuste PowerShell-/curl.exe-Übertragung
+→ weiterhin Legacy-CRUD über ProjectRole, ProjectGroup,
+  ProjectGroupMember und ProjectRoleAssignment
 
-bestätigter Runtimezustand
-→ alle Pflicht-Blueprints registriert
-→ Prestart erfolgreich
-→ Project Access ready
-→ Earth- und Flat-Provider discovery-/generierungsfähig
+Access-Übergang
+→ models/ enthält inzwischen zusätzlich ProjectAccessAssignment
+→ die vorliegenden Route-Dateien verwenden diese kanonische Projektion noch nicht
+→ authzEnforced bleibt false
+→ numerische Default-User-ID "1" steht im Konflikt mit dem neuen kanonischen
+  auth_user_id-Vertrag und muss konfigurationsseitig ersetzt werden
+
+Earth
+→ App-Provisioning bleibt der bestätigte produktive Earth-Pfad
+→ generische World-Create-Route besitzt weiterhin keinen vollständigen Referenzadapter
+→ direkte POST-/projects-Earth-Erzeugung ist mit dem aktuellen WorldInstance-
+  Factoryvertrag statisch nicht konsistent verkabelt
+
+statische Prüfung
+→ zehn Python-Dateien
+→ 19.526 Quellcodezeilen
+→ 566 Top-Level-Funktionen
+→ 81 deklarierte HTTP-Routen
 ```
 
 Diese Datei beschreibt den Ordner:
@@ -235,7 +244,7 @@ services/
 
 ## 3. Statische Bestandsaufnahme
 
-Alle neun vorliegenden Dateien sind syntaktisch gültiges Python.
+Alle zehn vorliegenden Python-Dateien sind syntaktisch gültig.
 
 Eine erfolgreiche Syntaxprüfung bedeutet nicht, dass:
 
@@ -389,6 +398,44 @@ authzEnforced = false
 ```
 
 Die Routen persistieren und verwalten den Access-Vertrag, treffen aber noch keine Entscheidung, ob der aktuelle HTTP-Aufrufer eine Operation ausführen darf.
+
+### 5.1 Zwei gleichzeitig vorhandene Access-Verträge
+
+Die Route-Schicht verwendet aktuell ausschließlich den älteren projektgescopten Verwaltungsvertrag:
+
+```text
+ProjectRole
+ProjectGroup
+ProjectGroupMember
+ProjectRoleAssignment
+```
+
+Die inzwischen in der Modelschicht vorhandene kanonische Projektion:
+
+```text
+ProjectAccessAssignment
+→ direct oder group
+→ owner / admin / editor / viewer
+→ kanonische auth_user_id
+→ synchronisierte Projektion aus vectoplan-app
+```
+
+wird von den vorliegenden Route-Dateien weder importiert noch über einen eigenen HTTP-Endpunkt verwaltet.
+
+Damit existieren aktuell zwei unterschiedliche Access-Zweige:
+
+```text
+Legacy-Verwaltungszweig
+→ routes/project_access.py
+→ src/project_access/service.py
+→ models/project_access.py
+
+kanonische Durchsetzungsprojektion
+→ models/project_access_assignment.py
+→ in diesen Route-Dateien noch nicht verwendet
+```
+
+Die Legacy-Routen sind daher nicht mit einer produktiven Autorisierungsdurchsetzung gleichzusetzen.
 
 
 ---
@@ -963,17 +1010,53 @@ Dieser Wert darf nicht als Berechtigungserfolg interpretiert werden.
 
 ## 8.7 JSON-Request-Vertrag
 
-Project-Access-Mutationsrouten lesen den Body über Flask `request.get_json(...)` und erwarten ein JSON-Objekt. Der korrigierte Stand verhindert, dass ein nicht importiertes oder falsch aufgelöstes Requestobjekt erst beim ersten Mutationsrequest einen Laufzeitfehler erzeugt.
+`project_access.py` besitzt inzwischen den strengsten Body-Parser der Route-Schicht.
+
+Ablauf:
 
 ```text
-leerer Body bei Route ohne Pflichtfelder
-→ {}
+rohen Requestbody gecacht lesen
+→ tatsächlich leerer Body
+   → {}
 
-JSON-Array oder Scalar
-→ kontrollierter 400-Fehler
+→ nicht-leerer Body
+   → request.get_json(silent=False)
 
-ungültiges JSON
-→ kontrollierter Requestfehler
+→ Parserfehler oder None trotz nicht-leerem Body
+   → ProjectAccessValidationError
+   → code = invalid_json_body
+   → HTTP 400
+
+→ JSON-Array oder Scalar
+   → kontrollierter HTTP-400-Fehler
+
+→ JSON-Objekt
+   → dict
+```
+
+Die Diagnostik gibt den Requestinhalt nicht zurück. Sie kann jedoch sicher ausgeben:
+
+```text
+Content-Type
+Mimetype
+Content-Length
+Body-Länge
+Body vorhanden ja/nein
+Parserfehlertyp
+PowerShell-Hinweis
+```
+
+Der PowerShell-Hinweis empfiehlt `Invoke-RestMethod` mit `ConvertTo-Json` oder `curl.exe --data-binary @file`, weil native Programme mehrzeilige PowerShell-Variablen sonst unerwartet zerlegen können.
+
+Wichtig:
+
+```text
+Diese strenge Logik gilt aktuell nur für routes/project_access.py.
+
+projects.py, worlds.py, chunks.py und commands.py
+→ verwenden weiterhin eigene Body-Parser
+→ teilweise request.get_json(silent=True)
+→ kein einheitlicher globaler Requestvertrag
 ```
 
 
@@ -1038,24 +1121,50 @@ Ablauf:
 
 ```text
 Requestbody lesen
-→ Project.from_create_payload() oder Fallback erzeugen
-→ Project zur Session hinzufügen
-→ flush für Project.id
+→ externe App-Projekt-ID im direkten Create-Pfad verbieten
+→ Owner und Audit-Actor bestimmen
+→ gewünschtes World-Template auflösen
+
+→ Project erzeugen
+→ Project.id flushen
+
+→ Defaultrollen und Owner-Zuweisung über Project-Access-Service initialisieren
 
 → Default-Universe erzeugen
-→ flush für Universe.id
+→ Universe.id flushen
 
-→ world_spawn erzeugen
+→ konkrete world_spawn erzeugen
 → Universe- und Project-Defaultreferenzen setzen
 
 → gemeinsamer Commit
 ```
 
-Die direkte Anlage ist nicht idempotent.
+Der gesamte direkte Create-Pfad umfasst damit inzwischen:
 
-Duplicate-/Unique-Fehler werden über Textvergleich erkannt und als HTTP 409 ausgegeben.
+```text
+Project
++ Legacy-Project-Access-Baum
++ Universe
++ WorldInstance
+```
 
-Für App-Projekte wird stattdessen das Provisioning empfohlen.
+Die direkte Anlage ist weiterhin nicht idempotent. Für App-Projekte wird der idempotente Provisioning-Pfad empfohlen.
+
+Earth-Grenze:
+
+```text
+_create_default_world_for_universe()
+→ löst worldTemplate=earth und earthReference auf
+→ schreibt Earth-Werte in Contract und Metadaten
+→ ruft im Fallback jedoch WorldInstance.create(...) ohne global_reference auf
+```
+
+Mit dem aktuellen `WorldInstance`-Factoryvertrag, der für `provider_id=earth` einen `global_reference` beim Erzeugen verlangt, ist dieser direkte Earth-Pfad statisch nicht konsistent. Der bestätigte produktive Earth-Pfad bleibt:
+
+```text
+PUT /projects/by-app/<app_project_public_id>
+→ src/world_state/provisioning.py
+```
 
 ---
 
@@ -1282,18 +1391,48 @@ Endpunkt:
 PATCH /projects/<project_id>
 ```
 
-Ablauf:
+Normaler Ablauf:
 
 ```text
 Project laden
+→ unveränderliche World-Template-/Earth-Referenzfelder ablehnen
 → Project.apply_patch_payload(...)
 → db.session.add(project)
 → commit
 ```
 
-Die Route ändert nur Project-Felder.
+Zusätzlich unterstützt die Route einen kontrollierten Owner-Transfer:
 
-Universe- und World-Änderungen gehören in eigene Routen.
+```text
+ownerUserId im Payload vorhanden
+→ bisherigen und gewünschten Owner vergleichen
+→ bei Änderung allowOwnerTransfer=true verlangen
+→ Project aktualisieren
+→ ensure_project_access_initialized(
+     replace_existing_owner=true
+   )
+→ Owner-Zuweisung im Legacy-Access-Baum synchronisieren
+→ gemeinsamer Commit
+```
+
+Die Route liefert dazu unter anderem:
+
+```text
+changed
+ownerTransferred
+project
+access
+```
+
+Universe- und World-Metadaten werden weiterhin nicht über diesen Patch verändert. `worldTemplate` und `earthReference` sind nach World-Erzeugung ausdrücklich unveränderlich.
+
+Wichtig:
+
+```text
+Der Owner-Transfer synchronisiert den Legacy-Access-Zweig.
+Eine Aktualisierung der kanonischen ProjectAccessAssignment-Projektion
+ist in den vorliegenden Route-Dateien nicht sichtbar.
+```
 
 ---
 
@@ -1311,8 +1450,21 @@ Ablauf:
 Project soft-löschen
 → alle Universes des Projekts soft-löschen
 → alle WorldInstances des Projekts soft-löschen
+→ soft_delete_project_access(...)
 → gemeinsamer Commit
 ```
+
+Der Access-Schritt ist standardmäßig Pflicht:
+
+```text
+VECTOPLAN_CHUNK_PROJECT_DELETE_REQUIRE_ACCESS = true
+
+Access-Service nicht verfügbar
+→ Projektlöschung wird abgebrochen
+→ Rollback
+```
+
+Die Löschung ist idempotent und liefert getrennte Zähler für bereits gelöschte und neu gelöschte Universes/Worlds sowie das Access-Ergebnis.
 
 
 ### App-Link-basierte Löschung
@@ -1332,15 +1484,19 @@ keine physische Löschung
 ```
 
 
-Nicht soft-gelöscht werden:
+Bewusst erhalten bleiben:
 
 ```text
 ChunkSnapshots
 WorldCommandLogs
 ChunkEvents
+WorldObjectInstances
+WorldObjectChunkRefs
 ```
 
-Diese bleiben für Historie, Audit und spätere Trainings-/Analysepfade erhalten.
+Diese Daten bleiben für Historie, Audit und spätere Trainings-/Analysepfade erhalten.
+
+Die vorliegenden Routen soft-löschen den Legacy-Project-Access-Baum. Eine separate Behandlung von `ProjectAccessAssignment` ist nicht sichtbar.
 
 ---
 
@@ -1424,7 +1580,7 @@ PostgreSQL-Zustand wird nicht verändert.
 
 ## 10.1 Aufgabe
 
-`project_access.py` ist der vorbereitete produktive HTTP-Adapter für projektbezogene Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen.
+`project_access.py` ist der vorbereitete produktive HTTP-Adapter für den älteren projektbezogenen Rollen-/Gruppenvertrag.
 
 ```text
 Project
@@ -1433,6 +1589,18 @@ Project
 │   └── ProjectGroupMember
 └── ProjectRoleAssignment
 ```
+
+Nicht verwendet wird:
+
+```text
+ProjectAccessAssignment
+→ kanonische synchronisierte Access-Projektion
+→ direct/group
+→ auth_user_id/group_id
+→ owner/admin/editor/viewer
+```
+
+Damit ist dieses Modul eine Verwaltungsoberfläche für Rollen, Gruppen und Zuweisungen, aber noch keine HTTP-Oberfläche der neuen kanonischen Access-Projektion.
 
 Das Modul:
 
@@ -3834,16 +4002,26 @@ referenzbasierter Spawn
 idempotente Reparatur
 ```
 
-Weiterhin fehlende produktive Verkabelung:
+Weiterhin fehlende oder inkonsistente produktive Verkabelung:
 
 ```text
-generische Worldanlage über worlds.py mit GlobalReferencePoint
-instance-spezifischer EarthProvider im Chunk-/Commandadapter
-X-Kanonisierung vor Chunk-Key
-X-Kanonisierung vor Snapshotlookup
-X-Kanonisierung vor Snapshotwrite
-X-Kanonisierung vor Dirty-Chunk-Ausgabe
-Objekte über die periodische Naht
+POST /projects/<project_id>/worlds
+→ kein GlobalReferencePoint-Adapter
+
+POST /projects mit worldTemplate=earth
+→ Earth-Auswahl vorhanden
+→ WorldInstance.create(...) erhält jedoch kein global_reference
+→ mit aktuellem Modelvertrag statisch inkonsistent
+
+Chunk-/Commandadapter
+→ keine instance-spezifische EarthProvider-Erzeugung
+→ keine X-Kanonisierung vor Chunk-Key
+→ keine X-Kanonisierung vor Snapshotlookup
+→ keine X-Kanonisierung vor Snapshotwrite
+→ keine X-Kanonisierung vor Dirty-Chunk-Ausgabe
+
+Objekte
+→ keine definierte Behandlung über die periodische Naht
 ```
 
 ---
@@ -3902,17 +4080,19 @@ VECTOPLAN_CHUNK_ENABLE_LEGACY_ROUTES=false
 
 ---
 
-## 25.12 Access-Daten vorhanden, aber keine Autorisierungsdurchsetzung
+## 25.12 Legacy-Access-Daten vorhanden, aber keine Autorisierungsdurchsetzung
 
-Mit `project_access.py` existieren jetzt persistente und HTTP-erreichbare:
+Mit `project_access.py` existieren persistente und HTTP-erreichbare:
 
 ```text
-Rollen
-Gruppen
-Mitgliedschaften
-Rollenzuweisungen
-Owner-Invarianten
+ProjectRole
+ProjectGroup
+ProjectGroupMember
+ProjectRoleAssignment
+Owner-Invarianten des Legacy-Zweigs
 ```
+
+Die kanonische `ProjectAccessAssignment`-Projektion wird von diesen Routen nicht verwendet.
 
 In den Route-Modulen ist weiterhin keine Durchsetzung anhand des aktuellen Callers sichtbar:
 
@@ -4059,6 +4239,86 @@ projectAccessRouteSurfaceReady
 ```
 
 
+## 25.19 Legacy-Access und kanonische Access-Projektion sind nicht verbunden
+
+Die Route-Schicht importiert:
+
+```text
+models.project_access
+→ ProjectRole
+→ ProjectGroup
+→ ProjectGroupMember
+→ ProjectRoleAssignment
+```
+
+Sie importiert nicht:
+
+```text
+models.project_access_assignment.ProjectAccessAssignment
+```
+
+Folgen:
+
+```text
+Legacy-Rollenänderung
+→ aktualisiert nicht automatisch die kanonische Projektion
+
+Owner-Transfer über PATCH /projects/<project_id>
+→ synchronisiert den Legacy-Owner
+→ kanonische Assignment-Projektion bleibt in diesen Dateien unberührt
+
+Projektlöschung
+→ soft-löscht den Legacy-Access-Baum
+→ keine sichtbare Deaktivierung der kanonischen Projection-Zeilen
+```
+
+Vor Aktivierung echter Autorisierung muss eine eindeutige Source-of-Truth- und Synchronisationsstrategie festgelegt werden.
+
+
+## 25.20 Default-User-ID steht im Konflikt mit dem kanonischen Auth-Vertrag
+
+Die Route-Dateien enthalten weiterhin Defaultwerte wie:
+
+```text
+DEFAULT_PROJECT_OWNER_USER_ID = "1"
+DEFAULT_OWNER_USER_ID = ... oder "1"
+```
+
+Die neue Modelschicht verlangt dagegen kanonische `auth_user_id`-Werte und verwirft numerische lokale AppUser-IDs.
+
+Konsequenz:
+
+```text
+ohne Konfigurationsoverride
+→ direkte Projektanlage, Access-Initialisierung oder Owner-Reparatur
+   kann an der Modelvalidierung scheitern
+```
+
+Erforderlich ist mindestens:
+
+```text
+VECTOPLAN_CHUNK_DEFAULT_PROJECT_OWNER_USER_ID=<kanonische-auth-id>
+```
+
+Langfristig sollten numerische Fallbacks vollständig aus Route-, Provisioning- und Access-Code entfernt werden.
+
+
+## 25.21 Projekt-Access-JSON ist gehärtet, andere Mutationsrouten noch nicht
+
+`project_access.py` verwirft nicht-leere fehlerhafte JSON-Bodies kontrolliert.
+
+Andere Module verwenden weiterhin eigene, teilweise stille Parser:
+
+```text
+projects.py
+worlds.py
+chunks.py
+commands.py
+```
+
+Dadurch können identische fehlerhafte Requests je nach Endpunkt unterschiedlich behandelt werden. Die strenge Parserlogik sollte in einen gemeinsamen HTTP-Contract-Helper verschoben werden.
+
+
 ---
 
 ## 26. Empfohlene spätere Zielstruktur
@@ -4134,8 +4394,11 @@ Repository
 | Blueprint hinzufügen | `routes/__init__.py` | gleich |
 | Projekt-HTTP-Endpunkt | `routes/projects.py` | Route + ProjectService |
 | App-Provisioning | `routes/projects.py` + `src/world_state/provisioning` | ProvisioningService |
-| Project-Access-HTTP | `routes/project_access.py` | Route + ProjectAccessService |
-| Rollen-/Gruppen-/Assignment-Invarianten | `src/project_access/service.py` | ProjectAccessService |
+| Legacy-Project-Access-HTTP | `routes/project_access.py` | Route + LegacyProjectAccessService |
+| Rollen-/Gruppen-/Legacy-Assignment-Invarianten | `src/project_access/service.py` | LegacyProjectAccessService |
+| Kanonische Access-Projektion | in diesen Routen nicht angebunden; Model `ProjectAccessAssignment` vorhanden | synchronisierter Projection-Service + Guards |
+| Owner-Transfer | `routes/projects.py` + Legacy-Access-Service | kanonischer atomarer Ownership-Service |
+| Projekt-Access-Soft-Delete | `routes/projects.py` + Legacy-Access-Service | beide Access-Projektionen atomar deaktivieren |
 | Autorisierungsdurchsetzung | noch nicht implementiert; `authzEnforced=false` | zentraler Authz-Layer vor Mutationen/Reads |
 | World-CRUD | `routes/worlds.py` | WorldService |
 | Blockpalette | `routes/blocks.py` | BlockQueryService |
@@ -4256,13 +4519,21 @@ projects.py
 ```
 
 
-Für Project Access:
+Für den aktuellen Legacy-Project-Access-Zweig:
 
 ```text
 project_access.py
 → src/project_access/service.py
 → models/project_access.py
 → models/project.py
+```
+
+Für die kanonische Projektion:
+
+```text
+models/project_access_assignment.py
+→ derzeit kein eigener Routeadapter in diesem Ordner
+→ vor Authz-Aktivierung mit Legacy-Zweig und App-Synchronisation verbinden
 ```
 
 
@@ -4328,9 +4599,12 @@ Projekt provisionieren
 Besonders belastbar sind:
 
 ```text
-Blueprintregistrierung einschließlich Pflicht-Project-Access
+Blueprintregistrierung einschließlich verpflichtender Legacy-Project-Access-Surface
 Projektgraph und idempotentes Flat-/Earth-App-Provisioning
-Project-Access-Datenhaltung und CRUD-Oberfläche
+Legacy-Rollen-/Gruppen-/Assignment-CRUD
+kontrollierter Owner-Transfer im Project-Patch
+projektweiter Soft-Delete einschließlich Legacy-Access-Baum
+strenge JSON-Validierung in project_access.py
 Flat- und Earth-World-Metadaten
 Blockpalette
 Snapshot-/Provider-Lesepfad
@@ -4344,13 +4618,17 @@ Noch zu härten sind:
 ```text
 Trennung von HTTP und Businesslogik
 zentrale Request-/Responsecontracts
+einheitliche strenge JSON-Verarbeitung
+Umstellung auf kanonische auth_user_id
+Verbindung von Legacy-Access und ProjectAccessAssignment-Projektion
 Authentifizierung und tatsächliche Autorisierungsdurchsetzung
-Project-Access-Contractvalidierung weiter zentralisieren
+Owner-Transfer über beide Access-Projektionen
 Command-Idempotenz
 Persistenz fehlgeschlagener Commands
 Nebenläufigkeit
 Objektkonflikte
 Earth-Kanonisierung in produktiven Chunk-/Commandpfaden
+direkter POST-/projects-Earth-Pfad
 world_test-Periodic-X-Limit und HTTP-400-Klassifizierung
 Debugroute-Absicherung
 Projekt-/World-Referenzkonsistenz
@@ -4378,32 +4656,66 @@ Damit kann der Routeordner künftig verstanden und geändert werden, ohne jede d
 
 ## 31. Aktualisierungs- und Verifikationsnachweis dieser Fassung
 
-Diese Fassung übernimmt die vollständige vorherige Route-Bestandsaufnahme und ergänzt den seitdem implementierten und getesteten Stand.
+Diese Fortschreibung basiert auf einer vollständigen statischen Auswertung aller zehn bereitgestellten Python-Dateien und der vorherigen `IST-Zustand.md`.
 
 ### 31.1 Statisch ausgewertete aktuelle Dateien
 
+| Datei | Zeilen | Top-Level-Funktionen | Routen | Version |
+|---|---:|---:|---:|---|
+| `routes/__init__.py` | 1.247 | 43 | 0 | Registry `0.6.0` |
+| `routes/projects.py` | 3.402 | 99 | 15 | `0.5.1` |
+| `routes/project_access.py` | 3.088 | 81 | 26 | `1.0.1` |
+| `routes/worlds.py` | 1.663 | 60 | 11 | `0.2.0` |
+| `routes/blocks.py` | 1.994 | 63 | 6 | `0.3.0` |
+| `routes/chunks.py` | 2.283 | 68 | 7 | `0.3.0` |
+| `routes/commands.py` | 3.424 | 103 | 4 | `0.2.0` |
+| `routes/world_test.py` | 1.577 | 30 | 10 | `0.1.0` |
+| `routes/earth_debug.py` | 127 | 2 | 1 | kein einheitlicher Modulversionswert |
+| `routes/editor.py` | 721 | 17 | 1 | kein einheitlicher Modulversionswert |
+
+Gesamt:
+
 ```text
-routes/__init__.py
-→ 1.247 Zeilen
-→ 43 Top-Level-Funktionen
-→ Registry-Version 0.6.0
-
-routes/projects.py
-→ 3.402 Zeilen
-→ 99 Top-Level-Funktionen
-→ 15 Routen
-→ Modulversion 0.5.1
-
-routes/project_access.py
-→ 3.088 Zeilen
-→ 81 Top-Level-Funktionen
-→ 26 Routen
-→ Modulversion 1.0.1
+10 Python-Dateien
+19.526 Zeilen
+566 Top-Level-Funktionen
+81 Route-Dekoratoren
 ```
 
-Die unveränderten Größenangaben der übrigen sieben Route-Dateien wurden aus der vorherigen Bestandsaufnahme übernommen.
+Alle zehn Dateien wurden erfolgreich mit dem Python-AST-Parser geprüft.
 
-### 31.2 Bestätigte Runtime-/HTTP-/DB-Ergebnisse
+### 31.2 In dieser Fortschreibung statisch bestätigte Änderungen
+
+```text
+projects.py
+→ direkter Create-Pfad erzeugt Access + Universe + World
+→ Owner-Transfer mit allowOwnerTransfer
+→ Legacy-Access-Synchronisation beim Transfer
+→ Legacy-Access-Soft-Delete beim Projekt-Delete
+→ World-Template und Earth-Referenz im Patch gesperrt
+
+project_access.py
+→ strikter Parser für nicht-leere JSON-Bodies
+→ invalid_json_body statt stiller {}
+→ sichere Bodydiagnostik
+→ PowerShell-Hinweis
+→ weiterhin authzEnforced=false
+
+Access-Architektur
+→ Route nutzt models.project_access
+→ Route nutzt nicht ProjectAccessAssignment
+→ numerischer Defaultowner "1" weiterhin vorhanden
+
+Earth
+→ App-Provisioning bleibt bevorzugter und vorher bestätigter Pfad
+→ generische worlds.py-Create-Route ohne GlobalReferencePoint
+→ direkter projects.py-Earth-Create statisch nicht mit aktuellem
+  WorldInstance.create-Vertrag vereinbar
+```
+
+### 31.3 Aus der vorherigen Fassung übernommene Runtime-/HTTP-/DB-Bestätigungen
+
+Die folgenden Aussagen wurden in dieser Fortschreibung nicht erneut ausgeführt. Sie bleiben als zuvor dokumentierte Bestätigungen erhalten:
 
 ```text
 Docker-Build erfolgreich
@@ -4411,13 +4723,13 @@ Container healthy
 alle Pflicht-Blueprints registriert
 Prestart erfolgreich
 
-Project Access
+Legacy Project Access
 → Status ready
 → Defaultrollen vorhanden
 → Owner-Assignment vorhanden
 → authzEnforced=false
 
-Earth-Provisioning
+Earth-App-Provisioning
 → erster Request created=true
 → vollständiger Project-/Access-/Universe-/World-Graph
 → EPSG:4979 als WKT2:2019 persistiert
@@ -4435,9 +4747,21 @@ identischer Folgeaufruf
 → updated=false
 ```
 
-### 31.3 Noch nicht als erfolgreich abgeschlossen eingestuft
+### 31.4 Noch nicht als erfolgreich abgeschlossen eingestuft
 
 ```text
+kanonische ProjectAccessAssignment-Projektion über HTTP
+→ in diesen Route-Dateien nicht angebunden
+
+tatsächliche Autorisierungsdurchsetzung
+→ noch nicht aktiv
+
+kanonische auth_user_id durchgehend
+→ numerische Route-/Provisioning-Fallbacks noch vorhanden
+
+Owner-Transfer über Legacy- und kanonische Projektion
+→ nicht durchgängig sichtbar
+
 world_test Periodic-X-Wrap mit chunkX=2.500.000
 → aktuell durch starres 1.000.000-Limit blockiert
 
@@ -4447,11 +4771,11 @@ produktiver Earth-Snapshot-/Commandpfad
 generische Earth-Erzeugung über worlds.py
 → vollständiger Referenzadapter noch ausstehend
 
-tatsächliche Autorisierungsdurchsetzung
-→ noch nicht aktiv
+direkte Earth-Erzeugung über POST /projects
+→ mit aktuellem Model-Factoryvertrag statisch inkonsistent
 ```
 
-### 31.4 Dokumentationsregel
+### 31.5 Dokumentationsregel
 
 Bei jeder weiteren Routeänderung müssen mindestens geprüft werden:
 
@@ -4463,9 +4787,37 @@ Pflicht-/Featuregate
 responseVersion
 Read-/Write-/Commit-Semantik
 Project-Scope
+Legacy-Access versus kanonische Projektion
+auth_user_id-Vertrag
+Owner-Transfer und Access-Synchronisation
+Projektlöschung und beide Access-Zweige
 Authn/Authz-Status
 Earth-/Periodic-X-Auswirkung
 Statusroute
 reale HTTP-/DB-Bestätigung
 ```
+
+---
+
+## 32. Fortschreibung vom 19. Juli 2026
+
+Die wichtigste Änderung dieser Fassung ist nicht ein neuer HTTP-Endpunkt, sondern die präzisere Abgrenzung der bereits vorhandenen Route-Verträge:
+
+```text
+Route-Schicht
+→ verwaltet weiterhin den Legacy-Project-Access-Baum
+→ erzwingt keine Autorisierung
+→ verwendet noch numerische User-ID-Fallbacks
+
+Modelschicht
+→ besitzt zusätzlich die kanonische ProjectAccessAssignment-Projektion
+→ verlangt kanonische auth_user_id-Werte
+
+offener Integrationsschritt
+→ beide Verträge zusammenführen
+→ App-Synchronisation und HTTP-Guards auf die kanonische Projektion stellen
+→ Owner-Transfer und Projektlöschung über beide Projektionen atomar machen
+```
+
+Bis dieser Integrationsschritt abgeschlossen ist, darf `projectAccessRouteSurfaceReady=true` nur als Aussage über die Verfügbarkeit der Legacy-CRUD-Oberfläche verstanden werden, nicht als Nachweis einer produktiven Zugriffsdurchsetzung.
 

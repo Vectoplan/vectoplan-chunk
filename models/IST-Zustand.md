@@ -4,8 +4,10 @@
 
 ## Status dieser Fassung
 
-Stand: 2026-07-17  
-Status: Vollständige, aktualisierte Bestandsaufnahme der SQLAlchemy-Modelschicht einschließlich Project Access und des bestätigten Earth-Provisioning-Pfads.
+Stand: 2026-07-19  
+Status: Aktualisierte Bestandsaufnahme der SQLAlchemy-Modelschicht mit 15 persistenten Modelklassen, kanonischer `ProjectAccessAssignment`-Projektion, Legacy-Rollen-/Gruppenkompatibilität, `Project`-Schema v3 sowie Flat-/Earth-Weltpersistenz.
+
+Diese Fortschreibung gleicht die Dokumentation mit den vorliegenden Dateien `models/__init__.py`, `project.py`, `project_access_assignment.py`, `project_access.py`, `universe.py`, `world.py`, `block.py`, `chunk.py`, `event.py` und `object.py` ab. Neue Aussagen werden als **implementiert** beschrieben, wenn sie statisch im Code vorhanden sind. Laufzeit- oder HTTP-Bestätigungen werden nur übernommen, wenn sie bereits im übergeordneten Service-IST dokumentiert waren.
 
 Diese Datei beschreibt den Ordner:
 
@@ -50,6 +52,11 @@ Project
 Zusätzlich enthält er:
 
 ```text
+ProjectAccessAssignment
+→ kanonische, synchronisierte Access-Projektion
+→ direct: auth_user_id
+→ group: group_id
+
 ProjectRole
 → ProjectRoleAssignment
 
@@ -61,9 +68,23 @@ BlockRegistry
 → BlockType
 ```
 
-Der Access-Zweig ist persistente Vorbereitung und bestätigte Provisionierungsintegration. Die Models selbst entscheiden weiterhin nicht, ob ein HTTP-Request erlaubt oder verboten wird.
+Der Access-Bereich besitzt jetzt zwei bewusst getrennte Persistenzformen:
 
-Die Modelschicht besitzt aktuell vierzehn persistente Modelklassen in acht fachlichen Python-Modulen. Vier davon bilden den projektgescopten Project-Access-Vertrag; sie speichern Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen, erzwingen aber noch keine Autorisierung.
+```text
+ProjectAccessAssignment
+→ kanonische, durch den Project-Access-Service verwendete Projektion
+→ Source of Truth bleibt vectoplan-app
+→ Rollen owner/admin/editor/viewer
+→ Viewer bleibt service-seitig read-only
+
+project_access.py
+→ Legacy-/Kompatibilitätsschicht für Rollen, Gruppen,
+  Mitgliedschaften und Rollenzuweisungen
+```
+
+Die Models selbst treffen weiterhin keine HTTP-Zugriffsentscheidung. Sie speichern, normalisieren und validieren den dafür benötigten Zustand; Authentifizierung, effektive Berechtigungsentscheidung, Owner-Transfer und Transaktionsgrenzen liegen in der Service-/Routenebene.
+
+Die Modelschicht besitzt aktuell **15 persistente Modelklassen in 9 fachlichen Python-Modulen**. Fünf Klassen gehören zum Access-Bereich: eine kanonische Projektion und vier Legacy-/Kompatibilitätsmodelle.
 
 Die zentrale fachliche Trennung lautet:
 
@@ -122,6 +143,10 @@ services/
         │   └── Project
         │       └── Tabelle: projects
         │
+        ├── project_access_assignment.py
+        │   └── ProjectAccessAssignment
+        │       └── Tabelle: project_access_assignments
+        │
         ├── project_access.py
         │   ├── ProjectRole
         │   │   └── Tabelle: project_roles
@@ -170,9 +195,10 @@ Aktuelle Größenordnung der Quelldateien:
 
 | Datei | Zeilen | Persistente Klassen | Hauptaufgabe |
 |---|---:|---:|---|
-| `__init__.py` | 1.267 | 0 | Registrierung, Diagnose, Project-Access-Vertragsprüfung und zentrale Exporte |
-| `project.py` | 2.041 | 1 | Chunk-Projekt als oberster Servicecontainer und externe Owner-/App-Verknüpfung |
-| `project_access.py` | 3.597 | 4 | projektgescopte Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen |
+| `__init__.py` | 1.521 | 0 | Registrierung, Diagnose sowie getrennte kanonische und Legacy-Access-Vertragsprüfung |
+| `project.py` | 2.934 | 1 | Chunk-Projekt, kanonischer Owner, Template-/Fallback-Zustand, Provisionierung und Access-Sync |
+| `project_access_assignment.py` | 1.554 | 1 | kanonische direkte User-/Gruppenprojektion für Access-Enforcement |
+| `project_access.py` | 3.597 | 4 | Legacy-Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen |
 | `universe.py` | 1.362 | 1 | Universum innerhalb eines Projekts |
 | `world.py` | 4.685 | 1 | konkrete Welt, Providerkontext, Spawn und Earth-Referenz |
 | `block.py` | 2.517 | 2 | Blockregistry und stabile Blockdefinitionen |
@@ -186,13 +212,14 @@ Aktuelle Größenordnung der Quelldateien:
 
 | Python-Klasse | Tabelle | Datei | Schema-Version | Status |
 |---|---|---|---|---|
-| `Project` | `projects` | `project.py` | `project.schema.v2` | implementiert und produktiv genutzt |
-| `ProjectRole` | `project_roles` | `project_access.py` | `1` | implementiert; Standardrollen und Synchronisation bestätigt |
-| `ProjectGroup` | `project_groups` | `project_access.py` | `1` | implementiert; Create-/Read-Pfad bestätigt |
-| `ProjectGroupMember` | `project_group_members` | `project_access.py` | `1` | implementiert; projektgescopter Membership-Vertrag, vollständiger Lifecycle noch weiter zu testen |
-| `ProjectRoleAssignment` | `project_role_assignments` | `project_access.py` | `1` | implementiert; Owner-Zuweisung und direkte User-/Gruppensubjekte bestätigt |
+| `Project` | `projects` | `project.py` | `project.schema.v3` | implementiert; kanonischer Owner-, Provisionierungs- und Access-Sync-Vertrag |
+| `ProjectAccessAssignment` | `project_access_assignments` | `project_access_assignment.py` | `project-access-assignment.schema.v1` | implementiert; kanonische synchronisierte Access-Projektion |
+| `ProjectRole` | `project_roles` | `project_access.py` | `1` | implementierte Legacy-/Kompatibilitätsrolle |
+| `ProjectGroup` | `project_groups` | `project_access.py` | `1` | implementierte Legacy-/Kompatibilitätsgruppe |
+| `ProjectGroupMember` | `project_group_members` | `project_access.py` | `1` | implementierter Legacy-Membership-Vertrag; vollständiger Lifecycle weiter zu testen |
+| `ProjectRoleAssignment` | `project_role_assignments` | `project_access.py` | `1` | implementierte Legacy-User-/Gruppenrollenzuweisung |
 | `Universe` | `universes` | `universe.py` | `universe.schema.v2` | implementiert und produktiv genutzt |
-| `WorldInstance` | `world_instances` | `world.py` | `world-instance.schema.v3` | Flat produktiv; Earth-Provisionierung, Persistenz und Idempotenz bestätigt |
+| `WorldInstance` | `world_instances` | `world.py` | `world-instance.schema.v3` | Flat produktiv; Earth-Vertrag und persistente Referenz implementiert |
 | `BlockRegistry` | `block_registries` | `block.py` | `block-registry.schema.v1` | implementiert und produktiv genutzt |
 | `BlockType` | `block_types` | `block.py` | `block-type.schema.v1` | implementiert und produktiv genutzt |
 | `ChunkSnapshot` | `chunk_snapshots` | `chunk.py` | `chunk-snapshot.schema.v1` | implementiert und für Set-/RemoveBlock bestätigt |
@@ -208,14 +235,20 @@ Aktuelle Größenordnung der Quelldateien:
 ```text
 Project
 │
-├── ProjectRole
-│   └── ProjectRoleAssignment
-│       ├── user:<external-user-id>
-│       └── group:<group-id>
+├── ProjectAccessAssignment
+│   ├── direct
+│   │   └── auth_user_id → owner/admin/editor/viewer
+│   └── group
+│       └── group_id → admin/editor/viewer
 │
-├── ProjectGroup
-│   ├── ProjectGroupMember
-│   └── ProjectRoleAssignment
+├── Legacy-/Kompatibilitätszweig
+│   ├── ProjectRole
+│   │   └── ProjectRoleAssignment
+│   │       ├── user:<legacy-user-id>
+│   │       └── group:<group-id>
+│   └── ProjectGroup
+│       ├── ProjectGroupMember
+│       └── ProjectRoleAssignment
 │
 ├── Universe
 │   │
@@ -232,10 +265,15 @@ Project
     ├── Project.external_app_project_id
     │   → öffentliche Projekt-ID aus vectoplan-app
     │   → keine Datenbank-Fremdschlüsselbeziehung
-    └── Project-Access-Userfelder
-        → externe String-IDs wie "1" oder spätere Auth-User-IDs
-        → keine Foreign Keys zu vectoplan-auth oder vectoplan-app
+    ├── Project.owner_auth_user_id
+    │   → kanonische Auth-Benutzeridentität
+    └── ProjectAccessAssignment.chunk_project_id
+        → öffentliche Chunk-Projekt-ID
+        → bewusst kein Cross-Service-Foreign-Key
 ```
+
+Die kanonische Access-Projektion referenziert das Chunk-Projekt über `chunk_project_id` und nicht über den lokalen Datenbankprimärschlüssel. Die vier Legacy-Modelle bleiben dagegen über `project_db_id` an `projects.id` gebunden. Dadurch können Repositories die neue serviceübergreifende Projektion verwenden, während bestehende Rollen-/Gruppenpfade kompatibel bleiben.
+
 
 Blockdefinitionen stehen parallel zum Projektgraphen:
 
@@ -308,13 +346,23 @@ project_id / universe_id / world_id / snapshot_id / command_id / event_id / ...
 Für Project Access gilt zusätzlich:
 
 ```text
-ProjectGroupMember.user_id
-ProjectRoleAssignment.user_id
-created_by_user_id / updated_by_user_id
-assigned_by_user_id / revoked_by_user_id
-added_by_user_id / removed_by_user_id
-→ externe String-IDs
-→ keine Cross-Service-Foreign-Keys
+Kanonischer Vertrag
+→ Project.owner_auth_user_id
+→ Project.created_by_auth_user_id
+→ Project.updated_by_auth_user_id
+→ ProjectAccessAssignment.auth_user_id
+→ ausschließlich kanonische auth_user_id
+→ numerische lokale IDs und E-Mail-Adressen werden abgelehnt
+
+Gruppenvertrag
+→ ProjectAccessAssignment.group_id
+→ genau ein Subject: auth_user_id XOR group_id
+
+Legacy-/Kompatibilitätsvertrag
+→ ProjectGroupMember.user_id
+→ ProjectRoleAssignment.user_id
+→ historische externe Stringfelder ohne Cross-Service-Foreign-Key
+→ neue Servicepfade dürfen diese Felder nicht als alternative Identitätswahrheit verwenden
 ```
 
 Beispiel:
@@ -440,6 +488,7 @@ alle Modelmodule importiert werden
 
 ```text
 project
+→ project_access_assignment
 → project_access
 → universe
 → world
@@ -455,6 +504,7 @@ Die Reihenfolge ist bewusst stabil.
 
 ```text
 Project
+ProjectAccessAssignment
 ProjectRole
 ProjectGroup
 ProjectGroupMember
@@ -542,7 +592,11 @@ get_model_debug_summary()
 is_model_column_available()
 
 is_app_integration_model_shape_ready()
+get_project_access_projection_contract()
+get_legacy_project_access_model_contract()
 get_project_access_model_contract()
+is_project_access_projection_model_shape_ready()
+is_legacy_project_access_model_shape_ready()
 is_project_access_model_shape_ready()
 is_core_world_model_shape_ready()
 
@@ -560,14 +614,36 @@ reset_model_import_cache()
 `ready = true` bedeutet aktuell:
 
 ```text
-alle acht erwarteten Module wurden importiert
+alle neun erwarteten Module wurden importiert
 und
-alle vierzehn erwarteten Modelklassen sind vorhanden
+alle fünfzehn erwarteten Modelklassen sind vorhanden
 ```
 
 Fehlende erwartete Spalten werden separat gemeldet. Sie machen den Paketimport nicht automatisch hart ungültig, damit ältere lokale Datenbanken vor einem expliziten Bootstrap-/Migrationslauf noch diagnostiziert werden können.
 
-Für die vier Project-Access-Models enthält `EXPECTED_MODEL_COLUMNS` vollständige kritische Spaltenlisten. Zusätzlich liefert `get_project_access_model_contract()` einen DB-freien Vertrag mit Tabellen, Spalten, Standardrollen, Permission-Keys, Subject-Typen sowie den expliziten Flags `authzEnforced=false` und `externalUserForeignKeys=false`.
+Die Access-Diagnostik ist jetzt dreigeteilt:
+
+```text
+get_project_access_projection_contract()
+→ kanonisches ProjectAccessAssignment-Modell
+→ canonicalUserIdField = auth_user_id
+→ projectIdField = chunk_project_id
+→ Rollen owner/admin/editor/viewer
+→ direct/group
+→ viewerReadOnly = true
+
+get_legacy_project_access_model_contract()
+→ vier bestehende Rollen-/Gruppenmodelle
+→ deren Modelvertrag meldet weiterhin authzEnforced = false
+
+get_project_access_model_contract()
+→ kombinierter Gesamtvertrag
+→ canonicalProjection + legacyRoleGroups
+→ sourceOfTruth = vectoplan-app
+→ viewerReadOnly = true
+```
+
+`is_project_access_model_shape_ready()` ist nur dann wahr, wenn sowohl die kanonische Projektion als auch die Legacy-Rollen-/Gruppenstruktur vollständig registriert sind.
 
 ### 6.8 Was diese Datei bewusst nicht macht
 
@@ -646,13 +722,60 @@ source_service
 external_url
 ```
 
-Eigentümer- und Auditkontext:
+Kanonischer Eigentümer- und Auditkontext:
 
 ```text
+owner_auth_user_id
 owner_type
 owner_id
+created_by_auth_user_id
+updated_by_auth_user_id
 created_by_user_id
 updated_by_user_id
+```
+
+Die Legacy-Spalten `owner_id`, `created_by_user_id` und `updated_by_user_id` führen im aktuellen Vertrag denselben kanonischen Auth-Wert. Sie dürfen nicht mit lokalen numerischen App-IDs befüllt werden.
+
+World-Template- und Fallbackzustand:
+
+```text
+world_template_requested
+world_template_effective
+world_fallback_used
+world_fallback_code
+earth_reference_fingerprint
+world_metadata_json
+```
+
+Provisionierungszustand:
+
+```text
+provisioning_status
+provisioning_fingerprint
+provisioning_request_id
+provisioning_correlation_id
+provisioning_error_code
+provisioning_retryable
+provisioning_repair_required
+provisioning_attempts
+provisioned_at
+provisioning_updated_at
+```
+
+Access-Sync-Zustand:
+
+```text
+access_sync_status
+access_projection_version
+access_projection_fingerprint
+access_sync_request_id
+access_sync_correlation_id
+access_sync_error_code
+access_sync_retryable
+access_sync_repair_required
+access_sync_attempts
+access_synced_at
+access_sync_updated_at
 ```
 
 Metadaten und Zeitstempel:
@@ -692,9 +815,12 @@ Dev-Default:
 Project.create_dev_project(
     project_id="dev-project",
     default_universe_id="dev-universe",
-    default_world_id="world_spawn"
+    default_world_id="world_spawn",
+    owner_user_id="auth_dev_owner"
 )
 ```
+
+Der Dev-Graph fordert bewusst `flat` an, setzt den Provisionierungsstatus auf `ready` und lässt die Access-Projektion zunächst `pending`, bis Bootstrap/Access-Service die Owner-Zuweisungen synchronisiert hat.
 
 App-Provisioning:
 
@@ -705,7 +831,7 @@ Project.create_for_app_project(
 )
 ```
 
-Dabei entsteht eine serviceeigene `project_id`, während die App-ID in `external_app_project_id` gespeichert wird.
+Dabei entsteht eine deterministische serviceeigene `project_id`, während die App-ID in `external_app_project_id` gespeichert wird. Der Owner ist verpflichtend und muss eine kanonische `auth_user_id` sein. Neue App-Projekte fordern standardmäßig das Template `earth` an; der effektive Templatezustand wird erst durch den Provisionierungsservice gesetzt.
 
 API-Payload:
 
@@ -735,10 +861,17 @@ set_default_world_id()
 set_spawn_world_id()
 set_world_refs()
 
+ensure_external_app_link()
 set_external_app_link()
 set_owner()
-set_status()
+set_owner_user()
+clear_owner()
 
+set_world_template_state()
+apply_provisioning_state()
+apply_access_sync_state()
+
+set_status()
 archive()
 restore()
 soft_delete()
@@ -747,13 +880,22 @@ replace_metadata()
 update_metadata()
 merge_provisioning_metadata()
 apply_patch_payload()
+normalize_for_persistence()
 ```
+
+`apply_patch_payload()` schützt Owner-, App-Link-, World-Referenz-, Template-, Provisionierungs- und Access-Sync-Felder standardmäßig. Diese Felder gehören in dedizierte interne Serviceoperationen; ein generischer Projektpatch darf sie nicht still verändern.
 
 ### 7.7 Project-Access-Bezug
 
-`Project` bleibt die projektgescopte Parent-Identität für alle Access-Zeilen. Die Access-Models referenzieren ausschließlich den internen Schlüssel:
+`Project` ist die fachliche Parent-Identität für beide Access-Persistenzformen:
 
 ```text
+Kanonische Projektion
+ProjectAccessAssignment.chunk_project_id
+→ referenziert Project.project_id als stabile öffentliche ID
+→ bewusst ohne lokalen Foreign Key
+
+Legacy-/Kompatibilitätsmodelle
 ProjectRole.project_db_id
 ProjectGroup.project_db_id
 ProjectGroupMember.project_db_id
@@ -762,7 +904,7 @@ ProjectRoleAssignment.project_db_id
 → ondelete = CASCADE
 ```
 
-Externe Benutzeridentitäten werden nicht in `Project` aufgelöst. `Project.owner_id` und Access-Userfelder bleiben opaque Strings. Die verbindliche Owner-Zuweisung wird außerhalb des Models durch den Project-Access-Service atomar synchronisiert.
+`Project.owner_auth_user_id` ist die kanonische Owneridentität. Das Modell lehnt numerische lokale IDs, E-Mail-Adressen, anonyme Identitäten sowie widersprüchliche Owner-Aliase ab. Die verbindliche Owner-Projektion und ein Owner-Transfer werden außerhalb des Models atomar durch den Project-Access-Service synchronisiert.
 
 ### 7.8 Wichtige Invarianten
 
@@ -771,18 +913,309 @@ Project.project_id ist die öffentliche Chunk-Projekt-ID.
 
 Project.external_app_project_id ist nur eine Serviceverknüpfung.
 
+Project.owner_auth_user_id ist die kanonische Owneridentität.
+
+Lokale numerische User-IDs und E-Mail-Adressen sind keine zulässigen Owner-/Actor-Identitäten.
+
+Normale Provisionierungs-Retries dürfen weder Owner noch bestehendes requested/effective Template still ändern.
+
+Earth→Flat wird nur als expliziter Fallbackzustand mit Code gespeichert.
+
+Öffentliche Serialisierung gibt keine rohen Auth-IDs oder internen URLs aus.
+
+Generische Metadaten werden begrenzt und um Credentials, Identitäten sowie Chunk-/World-Rohdaten bereinigt.
+
 Project erzeugt Universe und WorldInstance nicht selbst.
 
-Project führt keine Transaktion und keinen Commit aus.
+Project führt keine Abfragen, Remote Calls, Transaktionen oder Commits aus.
 
 Soft-Delete behält historische Chunks, Commands und Events grundsätzlich bei.
 ```
 
 ---
 
-## 8. `universe.py` – `Universe`
+## 8. `project_access_assignment.py` – `ProjectAccessAssignment`
 
-### 8.1 Aufgabe
+### 8.1 Aufgabe und Sicherheitsgrenze
+
+`ProjectAccessAssignment` ist die kanonische persistente Zugriffsprojektion des Chunk-Services.
+
+```text
+vectoplan-app
+→ bleibt Source of Truth für Mitgliedschaft und Projektrolle
+
+ProjectAccessAssignment
+→ speichert die synchronisierte, lokal durchsetzbare Projektion
+
+project_access_service.py
+→ berechnet Entscheidungen, synchronisiert Assignments und erzwingt Owner-/Viewer-Regeln
+```
+
+Das Model selbst authentifiziert keinen Request und entscheidet nicht, ob eine konkrete Route ausgeführt werden darf. Es stellt jedoch den gehärteten Datenvertrag bereit, auf dem diese Entscheidung basiert.
+
+### 8.2 Tabelle und Schema
+
+```text
+Tabelle        = project_access_assignments
+Schema-Version = project-access-assignment.schema.v1
+Projektion     = app-project-access-v1
+```
+
+### 8.3 Feldgruppen
+
+Identität und Projektbezug:
+
+```text
+id
+assignment_id
+chunk_project_id
+```
+
+Subject und Rolle:
+
+```text
+auth_user_id
+group_id
+role
+assignment_type
+```
+
+Synchronisierungszustand:
+
+```text
+active
+managed
+source_service
+projection_version
+projection_fingerprint
+request_id
+correlation_id
+```
+
+Metadaten, Version und Zeit:
+
+```text
+metadata_json
+schema_version
+revision
+created_at
+updated_at
+deactivated_at
+```
+
+### 8.4 Subject-Vertrag
+
+Es existieren genau zwei Assignmenttypen:
+
+```text
+direct
+→ auth_user_id gesetzt
+→ group_id leer
+
+group
+→ group_id gesetzt
+→ auth_user_id leer
+```
+
+Die Datenbank sichert dieses XOR über `ck_project_access_subject_complete` ab.
+
+Direkte User-Assignments akzeptieren ausschließlich kanonische, opaque `auth_user_id`-Werte. Abgelehnt werden insbesondere:
+
+```text
+rein numerische lokale User-IDs
+E-Mail-Adressen
+Account-/AppUser-Felder
+verschachtelte user.id-/owner.id-Payloads
+Pfade oder Backslashes in der Identität
+leere oder ungültige Subjects
+```
+
+`from_payload()` prüft eingehende Payloads rekursiv auf lokale Identitätsfelder. Gruppen sind im App-Direct-Projection-Pfad standardmäßig nicht erlaubt und benötigen ein ausdrückliches `allow_group=True`.
+
+### 8.5 Rollenvertrag
+
+Erlaubt sind exakt:
+
+```text
+owner
+admin
+editor
+viewer
+```
+
+Aliase wie `administrator`, `write`, `read` oder `readonly` werden kanonisch normalisiert.
+
+Owner-Invariante:
+
+```text
+owner
+→ immer assignment_type = direct
+→ immer kanonische auth_user_id
+→ niemals Gruppe
+```
+
+Die Datenbank enthält bewusst keine partielle Unique-Constraint für den aktiven Owner. Genau ein aktiver Owner wird transaktional im `project_access_service.py` erzwungen, damit ein atomarer Owner-Transfer nicht durch SQLAlchemy-Autoflush blockiert wird.
+
+### 8.6 Eindeutigkeiten und Indizes
+
+```text
+assignment_id
+→ global eindeutig
+
+unique(chunk_project_id, assignment_type, auth_user_id)
+→ höchstens ein Direct Assignment pro Projekt/User
+
+unique(chunk_project_id, assignment_type, group_id)
+→ höchstens ein Group Assignment pro Projekt/Gruppe
+```
+
+Zusätzliche Indizes unterstützen:
+
+```text
+Projekt + active + assignment_type
+Projekt + role + active
+source_service + Projekt
+```
+
+### 8.7 Erzeugung
+
+Direkt:
+
+```text
+ProjectAccessAssignment.create_direct(
+    chunk_project_id=...,
+    auth_user_id=...,
+    role=...,
+)
+```
+
+Gruppe:
+
+```text
+ProjectAccessAssignment.create_group(
+    chunk_project_id=...,
+    group_id=...,
+    role=...,
+)
+```
+
+Wichtige Defaults:
+
+```text
+Direct Assignment
+→ managed = true
+→ source_service = vectoplan-app
+→ projection_version = app-project-access-v1
+
+Group Assignment
+→ managed = false
+→ source_service = group-directory
+→ Owner-Rolle verboten
+```
+
+Keine Factory fügt das Objekt einer Session hinzu oder committed.
+
+### 8.8 Mutationen und Idempotenz
+
+```text
+set_role()
+activate()
+deactivate()
+apply_direct_projection()
+replace_metadata()
+update_metadata()
+touch()
+```
+
+`apply_direct_projection()` ist idempotent und schützt die Subject-Identität:
+
+```text
+bestehendes Direct Assignment
+→ auth_user_id darf nicht auf einen anderen User umgebogen werden
+→ Rolle/Projektionsdaten dürfen aktualisiert werden
+→ managed und active werden für die App-Projektion wiederhergestellt
+```
+
+Deaktivierung erhält Audit- und Projektionshistorie; es findet kein hartes Löschen statt.
+
+### 8.9 Serialisierung und Redaction
+
+```text
+to_public_dict()
+→ keine lokale DB-ID
+→ keine rohe auth_user_id
+→ keine rohe group_id
+→ Subject nur als nicht umkehrbarer Fingerprint
+
+to_service_dict()
+→ rohe Subject-ID für vertrauenswürdige interne Services
+→ sanitisierte Metadaten
+
+to_dict(include_private=..., include_internal=...)
+→ explizit steuerbarer Vertrag
+```
+
+Metadaten entfernen beziehungsweise redigieren Secrets, E-Mail-Adressen, URLs, lokale Identitätsfelder und große Domainpayloads wie Chunks, Blocks, Geometrien oder Snapshots.
+
+### 8.10 SQLAlchemy-Hooks
+
+Idempotent installierte `before_insert`-/`before_update`-Listener normalisieren und validieren:
+
+```text
+IDs
+Assignmenttyp
+Rolle
+Subject-XOR
+Source Service
+Projektionsfelder
+Metadaten
+Revision
+Zeitstempel
+active/deactivated_at-Konsistenz
+```
+
+Die Listener führen keine Queries und keine Commits aus.
+
+### 8.11 Verhältnis zu `project_access.py`
+
+```text
+ProjectAccessAssignment
+→ kanonische serviceübergreifende Projektion
+→ auth_user_id
+→ direkt für Access-Reconciliation und Enforcement vorgesehen
+
+project_access.py
+→ Legacy-/Kompatibilitätsstruktur
+→ detaillierte Rollen-, Gruppen- und Membershiptabellen
+→ weiterhin für Bootstrap, Gruppenstruktur und Übergangspfad vorhanden
+```
+
+Beide Strukturen sind im aktuellen Modelpaket registriert und werden getrennt diagnostiziert. `is_project_access_model_shape_ready()` verlangt aktuell beide Verträge.
+
+### 8.12 Aktueller Status
+
+Implementiert und statisch im vorliegenden Code bestätigt:
+
+```text
+kanonische User-ID-Validierung
+Direct-/Group-XOR
+Owner nur direct
+Viewer-Rolle
+Public-Redaction
+Projection-Fingerprints
+idempotente Direct-Reconciliation
+Gruppenerhalt als eigener Assignmenttyp
+SQLAlchemy-Adapter-Aliase
+Insert-/Update-Listener
+```
+
+Die vollständige HTTP-Guard-Abdeckung und der dedizierte Owner-Transfer über reale Routen bleiben außerhalb dieser Modeldatei als End-to-End-Integrationspunkte zu bestätigen.
+
+---
+
+## 9. `universe.py` – `Universe`
+
+### 9.1 Aufgabe
 
 Ein `Universe` gruppiert eine oder mehrere konkrete `WorldInstance`-Zeilen innerhalb eines Chunk-Projekts.
 
@@ -792,13 +1225,13 @@ Project
     └── WorldInstance
 ```
 
-### 8.2 Tabelle
+### 9.2 Tabelle
 
 ```text
 universes
 ```
 
-### 8.3 Feldgruppen
+### 9.3 Feldgruppen
 
 Elternbezug und Identität:
 
@@ -840,7 +1273,7 @@ archived_at
 deleted_at
 ```
 
-### 8.4 Eindeutigkeit
+### 9.4 Eindeutigkeit
 
 ```text
 unique(project_db_id, universe_id)
@@ -849,7 +1282,7 @@ unique(project_db_id, slug)
 
 Eine `universe_id` muss damit nur innerhalb eines Projekts eindeutig sein.
 
-### 8.5 Rollen
+### 9.5 Rollen
 
 ```text
 default
@@ -864,7 +1297,7 @@ Aktueller Scope:
 project
 ```
 
-### 8.6 Erzeugung
+### 9.6 Erzeugung
 
 ```text
 Universe.create(...)
@@ -874,7 +1307,7 @@ Universe.from_create_payload(...)
 
 `create_for_project()` benötigt ein bereits persistiertes `Project.id`.
 
-### 8.7 Mutationen
+### 9.7 Mutationen
 
 ```text
 rename()
@@ -896,7 +1329,7 @@ merge_provisioning_metadata()
 apply_patch_payload()
 ```
 
-### 8.8 Fallbackreferenzen
+### 9.8 Fallbackreferenzen
 
 ```text
 effective_default_world_id
@@ -906,7 +1339,7 @@ effective_spawn_world_id
 → spawn_world_id oder default_world_id
 ```
 
-### 8.9 Wichtige Invarianten
+### 9.9 Wichtige Invarianten
 
 ```text
 Universe bleibt vollständig intern im Chunk-Service.
@@ -921,9 +1354,9 @@ Worlds werden nicht innerhalb des Models erstellt.
 
 ---
 
-## 9. `world.py` – `WorldInstance`
+## 10. `world.py` – `WorldInstance`
 
-### 9.1 Aufgabe
+### 10.1 Aufgabe
 
 `WorldInstance` ist die konkrete persistente editierbare Welt.
 
@@ -954,13 +1387,13 @@ world_id = flat
 world_id = earth
 ```
 
-### 9.2 Tabelle
+### 10.2 Tabelle
 
 ```text
 world_instances
 ```
 
-### 9.3 Feldgruppen
+### 10.3 Feldgruppen
 
 Hierarchie und Identität:
 
@@ -1066,7 +1499,7 @@ archived_at
 deleted_at
 ```
 
-### 9.4 Eindeutigkeit
+### 10.4 Eindeutigkeit
 
 ```text
 unique(universe_db_id, world_id)
@@ -1075,7 +1508,7 @@ unique(universe_db_id, slug)
 
 Eine `world_id` ist nur innerhalb eines Universums eindeutig.
 
-### 9.5 Flat-Defaults
+### 10.5 Flat-Defaults
 
 ```text
 world_id          = world_spawn
@@ -1100,7 +1533,7 @@ Factory:
 WorldInstance.create_flat_spawn(...)
 ```
 
-### 9.6 Earth-v1-Vertrag
+### 10.6 Earth-v1-Vertrag
 
 Earth ist als zusätzlicher Provider im Model implementiert.
 
@@ -1162,7 +1595,7 @@ reference version   = 1
 
 Der Integer-Spawn wird aus dem präzisen lokalen Spawn mit mathematischem Floor abgeleitet. Generische Flat-Defaults dürfen Earth-Spawn oder Earth-Vertikalgrenzen nicht überschreiben.
 
-### 9.7 Earth-Feldinvarianten
+### 10.7 Earth-Feldinvarianten
 
 Flat-Welt:
 
@@ -1194,7 +1627,7 @@ entweder alle drei null
 oder alle drei gesetzt
 ```
 
-### 9.8 Globale Referenz und Reanchoring
+### 10.8 Globale Referenz und Reanchoring
 
 Zentrale Methoden:
 
@@ -1229,7 +1662,7 @@ set_spawn_metric_position()
 → reanchort die Welt nicht
 ```
 
-### 9.9 Provider- und Konfigurationsmethoden
+### 10.9 Provider- und Konfigurationsmethoden
 
 ```text
 set_provider_mapping()
@@ -1242,7 +1675,7 @@ set_source_context()
 ensure_bootstrap_defaults()
 ```
 
-### 9.10 Runtime-/API-Kontexte
+### 10.10 Runtime-/API-Kontexte
 
 Properties und Hilfen:
 
@@ -1265,7 +1698,7 @@ build_world_context_key()
 build_route_hints()
 ```
 
-### 9.11 Erzeugung
+### 10.11 Erzeugung
 
 ```text
 WorldInstance.create(...)
@@ -1277,7 +1710,7 @@ WorldInstance.from_create_payload(...)
 
 `from_create_payload()` erkennt anhand von `providerId`, ob Flat- oder Earth-Defaults verwendet werden müssen.
 
-### 9.12 Wichtige Invarianten
+### 10.12 Wichtige Invarianten
 
 ```text
 WorldInstance speichert Weltkonfiguration, keine Chunkzellen.
@@ -1299,11 +1732,13 @@ WorldInstance führt keinen Commit aus.
 
 ---
 
-## 10. `project_access.py` – projektgescopte Rollen, Gruppen und Zuweisungen
+## 11. `project_access.py` – Legacy-Rollen, Gruppen und Zuweisungen
 
-### 10.1 Aufgabe und Sicherheitsgrenze
+### 11.1 Aufgabe und Sicherheitsgrenze
 
-`project_access.py` stellt die persistente Grundlage für spätere projektbezogene Zugriffsentscheidungen bereit.
+`project_access.py` ist die weiterhin registrierte Legacy-/Kompatibilitätsschicht für detaillierte projektbezogene Rollen, Gruppen, Mitgliedschaften und Rollenzuweisungen.
+
+Der kanonische serviceübergreifende Direct-User-Vertrag liegt inzwischen in `project_access_assignment.py`. Das Legacy-Modul bleibt wichtig für bestehende Daten, Gruppenstrukturen, Bootstrapkompatibilität und den Übergangspfad, ist aber nicht die neue Identitätswahrheit.
 
 Das Modul speichert:
 
@@ -1314,7 +1749,7 @@ ProjectGroupMember
 ProjectRoleAssignment
 ```
 
-Es führt ausdrücklich noch keine Authentifizierung oder Autorisierung aus.
+Es führt ausdrücklich keine Authentifizierung oder Autorisierung aus.
 
 ```text
 Persistenzvertrag
@@ -1324,9 +1759,9 @@ Berechnung effektiver Rechte
 → Serviceverantwortung
 
 HTTP-Request erlauben/verbieten
-→ noch nicht aktiviert
+→ nicht Aufgabe dieses Legacy-Moduls
 
-öffentlicher Status
+Legacy-Modelvertrag
 → authzEnforced = false
 ```
 
@@ -1336,12 +1771,16 @@ Die zentrale Servicegrenze lautet:
 vectoplan-app / vectoplan-auth
 → besitzt Benutzeridentitäten
 
-vectoplan-chunk
-→ speichert nur opaque externe User-ID-Strings
-→ besitzt keine Foreign Keys in fremde Datenbanken
+ProjectAccessAssignment
+→ kanonischer neuer Vertrag mit auth_user_id
+
+project_access.py
+→ Legacy-Userfelder und Gruppenstruktur
+→ keine Foreign Keys in fremde Datenbanken
+→ darf nicht als konkurrierende Source of Truth verwendet werden
 ```
 
-### 10.2 Gemeinsame Basisklasse `ProjectAccessRecord`
+### 11.2 Gemeinsame Basisklasse `ProjectAccessRecord`
 
 Die abstrakte Basisklasse enthält:
 
@@ -1378,7 +1817,7 @@ Soft-Delete erhält Historie
 Modelmethoden führen keine DB-Abfragen, Commits oder Rollbacks aus
 ```
 
-### 10.3 Standardrollen und Permissions
+### 11.3 Standardrollen und Permissions
 
 Feste Standardrollen:
 
@@ -1426,7 +1865,7 @@ Permissions werden kanonisch als JSON gespeichert:
 
 Doppelte Einträge werden normalisiert. Ein expliziter Deny-Eintrag bleibt Teil des gespeicherten Vertrags. Die tatsächliche Auswertung gehört in die Service-/Autorisierungsschicht.
 
-### 10.4 `ProjectRole`
+### 11.4 `ProjectRole`
 
 Tabelle:
 
@@ -1481,7 +1920,7 @@ to_dict(...)
 
 Die Beziehung `assignments` verwendet `lazy="raise"`. Dadurch werden Rollenzuweisungen nicht versehentlich durch eine normale Rollenserialisierung nachgeladen.
 
-### 10.5 `ProjectGroup`
+### 11.5 `ProjectGroup`
 
 Tabelle:
 
@@ -1537,7 +1976,7 @@ validate_or_raise()
 to_dict(...)
 ```
 
-### 10.6 `ProjectGroupMember`
+### 11.6 `ProjectGroupMember`
 
 Tabelle:
 
@@ -1606,7 +2045,7 @@ validate_or_raise()
 to_dict(...)
 ```
 
-### 10.7 `ProjectRoleAssignment`
+### 11.7 `ProjectRoleAssignment`
 
 Tabelle:
 
@@ -1694,7 +2133,7 @@ to_dict(...)
 
 `is_effective()` berücksichtigt Status, Soft-Delete, Gültigkeitsfenster und Widerruf.
 
-### 10.8 Foreign Keys, Cascades und Scope
+### 11.8 Foreign Keys, Cascades und Scope
 
 Interne Beziehungen:
 
@@ -1733,7 +2172,7 @@ revoked_by_user_id
 
 Alle Lookups und Unique-Verträge bleiben über `project_db_id` projektgescopt.
 
-### 10.9 Öffentlicher Modelvertrag und Diagnose
+### 11.9 Öffentlicher Modelvertrag und Diagnose
 
 `get_project_access_model_contract()` liefert ohne Datenbankzugriff:
 
@@ -1757,7 +2196,7 @@ is_project_access_model_shape_ready()
 build_model_schema_report()
 ```
 
-### 10.10 Bestätigter Laufzeitstand
+### 11.10 Bestätigter Laufzeitstand
 
 Bestätigt wurden:
 
@@ -1768,9 +2207,14 @@ vier Standardrollen pro Projekt
 → editor
 → viewer
 
-direkte Owner-Zuweisung
+Legacy-Owner-Zuweisung
 → subjectType = user
-→ subjectId = "1"
+→ aktuelle Bootstrapidentität = auth_dev_owner
+→ Rolle owner
+
+kanonische Owner-Projektion
+→ ProjectAccessAssignment.assignmentType = direct
+→ auth_user_id = auth_dev_owner oder realer App-Owner
 → Rolle owner
 
 wiederholte Initialisierung
@@ -1791,23 +2235,20 @@ Provisioning-Antwort
 → projectId gesetzt
 ```
 
-Noch nicht aktiviert ist:
-
-```text
-effektive Berechtigungsentscheidung im normalen Requestpfad
-```
-
-Deshalb muss der öffentliche Vertrag weiterhin ausdrücklich melden:
+Das Legacy-Modul selbst wertet weiterhin keine effektiven Berechtigungen aus. Sein eigener DB-freier Vertrag meldet deshalb weiterhin:
 
 ```text
 authzEnforced = false
+externalUserForeignKeys = false
 ```
+
+Das widerspricht nicht dem neuen Servicevertrag: Die eigentliche Berechtigungsentscheidung liegt im `project_access_service.py` und nutzt primär die kanonische `ProjectAccessAssignment`-Projektion. Die vollständige Guard-Anbindung aller HTTP-Routen bleibt separat zu bestätigen.
 
 ---
 
-## 11. `block.py` – `BlockRegistry` und `BlockType`
+## 12. `block.py` – `BlockRegistry` und `BlockType`
 
-## 11.1 `BlockRegistry`
+## 12.1 `BlockRegistry`
 
 ### Aufgabe
 
@@ -1881,7 +2322,7 @@ update_metadata()
 
 ---
 
-## 11.2 `BlockType`
+## 12.2 `BlockType`
 
 ### Aufgabe
 
@@ -2043,7 +2484,7 @@ default_cell_value
 
 ---
 
-## 11.3 Air-Invariante
+## 12.3 Air-Invariante
 
 Air ist kein `BlockType`.
 
@@ -2066,7 +2507,7 @@ RemoveBlock erzeugt Air
 
 ---
 
-## 11.4 Systemblöcke
+## 12.4 Systemblöcke
 
 Die eigentlichen Code-Definitionen von Systemblöcken liegen nicht in `models/`.
 
@@ -2090,9 +2531,9 @@ BlockType-Mirror
 
 ---
 
-## 12. `chunk.py` – `ChunkSnapshot`
+## 13. `chunk.py` – `ChunkSnapshot`
 
-### 12.1 Aufgabe
+### 13.1 Aufgabe
 
 `ChunkSnapshot` ist die aktuelle persistente Lade-Wahrheit eines materialisierten Chunks.
 
@@ -2111,13 +2552,13 @@ Chunk-Service
 → Provider/Generator verwenden
 ```
 
-### 12.2 Tabelle
+### 13.2 Tabelle
 
 ```text
 chunk_snapshots
 ```
 
-### 12.3 Identität und Hierarchie
+### 13.3 Identität und Hierarchie
 
 ```text
 id
@@ -2133,7 +2574,7 @@ chunk_z
 chunk_key
 ```
 
-### 12.4 Eindeutigkeit
+### 13.4 Eindeutigkeit
 
 ```text
 unique(world_db_id, chunk_x, chunk_y, chunk_z)
@@ -2141,7 +2582,7 @@ unique(world_db_id, chunk_x, chunk_y, chunk_z)
 
 Damit existiert pro konkreter Welt und Chunkadresse ein materialisierter Snapshotdatensatz, der bei Änderungen aktualisiert wird.
 
-### 12.5 Version und Status
+### 13.5 Version und Status
 
 ```text
 status
@@ -2166,7 +2607,7 @@ bump_revision()
 → chunk_version neu formatieren
 ```
 
-### 12.6 Inhalt
+### 13.6 Inhalt
 
 ```text
 content_encoding
@@ -2188,7 +2629,7 @@ external_ref
 
 Aktuell wird primär JSON verwendet. Binäre, komprimierte und externe Formate sind bereits im Schema vorbereitet.
 
-### 12.7 Abgeleitete Runtimeinformationen
+### 13.7 Abgeleitete Runtimeinformationen
 
 ```text
 palette_json
@@ -2203,7 +2644,7 @@ cell_count
 non_air_cell_count
 ```
 
-### 12.8 Zell- und Geometrievertrag
+### 13.8 Zell- und Geometrievertrag
 
 ```text
 chunk_size
@@ -2224,7 +2665,7 @@ air_cell_value = 0
 block_cell_value_rule = paletteIndex + 1
 ```
 
-### 12.9 Registry-, Provider- und Generatorhistorie
+### 13.9 Registry-, Provider- und Generatorhistorie
 
 Der Snapshot speichert zusätzlich den Kontext, in dem sein Inhalt interpretierbar ist:
 
@@ -2243,7 +2684,7 @@ generator_type
 generator_version
 ```
 
-### 12.10 Änderungsherkunft
+### 13.10 Änderungsherkunft
 
 ```text
 snapshot_source
@@ -2281,7 +2722,7 @@ manual
 system
 ```
 
-### 12.11 Erzeugung
+### 13.11 Erzeugung
 
 ```text
 ChunkSnapshot.create(...)
@@ -2289,7 +2730,7 @@ ChunkSnapshot.create_for_world(...)
 ChunkSnapshot.from_runtime_content(...)
 ```
 
-### 12.12 Inhaltsänderung
+### 13.12 Inhaltsänderung
 
 ```text
 replace_content(...)
@@ -2323,7 +2764,7 @@ to_dict()
 to_public_dict()
 ```
 
-### 12.13 Wichtige Invarianten
+### 13.13 Wichtige Invarianten
 
 ```text
 Snapshot ist Lade-Wahrheit.
@@ -2341,9 +2782,9 @@ Ein bestehender aktiver Snapshot wird bei Änderungen aktualisiert.
 
 ---
 
-## 13. `event.py` – `WorldCommandLog` und `ChunkEvent`
+## 14. `event.py` – `WorldCommandLog` und `ChunkEvent`
 
-## 13.1 Trennung
+## 14.1 Trennung
 
 ```text
 WorldCommandLog
@@ -2358,7 +2799,7 @@ ChunkEvent
 
 ---
 
-## 13.2 `WorldCommandLog`
+## 14.2 `WorldCommandLog`
 
 ### Tabelle
 
@@ -2515,7 +2956,7 @@ increment_event_count(...)
 
 ---
 
-## 13.3 `ChunkEvent`
+## 14.3 `ChunkEvent`
 
 ### Tabelle
 
@@ -2682,9 +3123,9 @@ Events sollen nach Bestätigung append-only behandelt werden.
 
 ---
 
-## 14. `object.py` – `WorldObjectInstance` und `WorldObjectChunkRef`
+## 15. `object.py` – `WorldObjectInstance` und `WorldObjectChunkRef`
 
-## 14.1 Zweck
+## 15.1 Zweck
 
 Die Objektmodelle bereiten persistente Mehrblockobjekte vor.
 
@@ -2712,7 +3153,7 @@ ChunkSnapshot
 
 ---
 
-## 14.2 `WorldObjectInstance`
+## 15.2 `WorldObjectInstance`
 
 ### Tabelle
 
@@ -2887,7 +3328,7 @@ update_metadata()
 
 ---
 
-## 14.3 `WorldObjectChunkRef`
+## 15.3 `WorldObjectChunkRef`
 
 ### Tabelle
 
@@ -2993,9 +3434,20 @@ Objekte über Earth-Weltnaht
 
 ---
 
-## 15. Relationship- und Cascade-Struktur
+## 16. Relationship- und Cascade-Struktur
 
-### 15.1 Projektgraph
+Die kanonische Access-Projektion ist bewusst nicht als ORM-Relationship an `Project.id` gebunden:
+
+```text
+ProjectAccessAssignment.chunk_project_id
+→ entspricht fachlich Project.project_id
+→ kein lokaler Foreign Key
+→ Repository-/Service-Lookup über stabile öffentliche ID
+```
+
+Die Legacy-Access-Tabellen verwenden dagegen weiterhin `project_db_id` mit `ondelete=CASCADE`.
+
+### 16.1 Projektgraph
 
 ```text
 Project
@@ -3005,7 +3457,7 @@ Project
             └── WorldInstance
 ```
 
-### 15.2 Weltbezogene Daten
+### 16.2 Weltbezogene Daten
 
 ```text
 Project / Universe / WorldInstance
@@ -3015,21 +3467,21 @@ Project / Universe / WorldInstance
 └── world_object_instances
 ```
 
-### 15.3 Blockregistry
+### 16.3 Blockregistry
 
 ```text
 BlockRegistry
 └── block_types
 ```
 
-### 15.4 Command und Event
+### 16.4 Command und Event
 
 ```text
 WorldCommandLog
 └── chunk_events
 ```
 
-### 15.5 Snapshot und Event
+### 16.5 Snapshot und Event
 
 ```text
 ChunkSnapshot
@@ -3038,7 +3490,7 @@ ChunkSnapshot
 
 Der Event-Foreign-Key auf einen Snapshot verwendet `SET NULL`, damit ein historisches Event nicht zusammen mit einem entfernten Snapshot verloren geht.
 
-### 15.6 Objekt und Chunkreferenzen
+### 16.6 Objekt und Chunkreferenzen
 
 ```text
 WorldObjectInstance
@@ -3046,7 +3498,7 @@ WorldObjectInstance
     └── WorldObjectChunkRef
 ```
 
-### 15.7 Ladeverhalten
+### 16.7 Ladeverhalten
 
 Die Relationships verwenden überwiegend:
 
@@ -3060,7 +3512,7 @@ Collections/Backrefs
 
 Status- und Read-Pfade sollen trotzdem keine vollständigen tiefen Relationship-Graphen serialisieren.
 
-### 15.8 Löschverhalten
+### 16.8 Löschverhalten
 
 Viele Parent-Foreign-Keys verwenden:
 
@@ -3072,9 +3524,9 @@ Die Anwendungslogik nutzt jedoch grundsätzlich Soft-Delete für fachliche Objek
 
 ---
 
-## 16. Wie die wichtigsten Daten entstehen
+## 17. Wie die wichtigsten Daten entstehen
 
-## 16.1 Default-Entwicklungsgraph
+## 17.1 Default-Entwicklungsgraph
 
 ```text
 Project.create_dev_project()
@@ -3115,7 +3567,7 @@ Objekte erzeugen
 
 ---
 
-## 16.2 App-Provisioning
+## 17.2 App-Provisioning
 
 Der aktuelle Provisioning-Service erzeugt oder repariert den vollständigen projektgescopten Graphen in einer Transaktion:
 
@@ -3125,8 +3577,15 @@ Der aktuelle Provisioning-Service erzeugt oder repariert den vollständigen proj
 → Project persistieren/flushen
 
 Project-Access-Service
-→ owner/admin/editor/viewer projektgescopt synchronisieren
-→ direkte Owner-Zuweisung für externe User-ID erzeugen oder wiederverwenden
+→ kanonische ProjectAccessAssignment-Projektion synchronisieren
+→ direkte Assignments verwenden ausschließlich auth_user_id
+→ genau einen aktiven Direct Owner sicherstellen
+→ stale direkte managed Assignments entfernen/deaktivieren
+→ bestehende Gruppenassignments erhalten
+
+Legacy-Kompatibilitätsinitialisierung
+→ owner/admin/editor/viewer in project_roles sicherstellen
+→ passende Legacy-Owner-Zuweisung erhalten oder ergänzen
 
 Universe.create_for_project()
 → Universe persistieren/flushen
@@ -3154,8 +3613,10 @@ Das Ergebnis ist:
 
 ```text
 Chunk Project
-├── ProjectRole owner/admin/editor/viewer
-├── ProjectRoleAssignment user:<owner-user-id> → owner
+├── ProjectAccessAssignment direct:<auth_user_id> → owner/admin/editor/viewer
+├── optionale ProjectAccessAssignment group:<group_id> → admin/editor/viewer
+├── Legacy ProjectRole owner/admin/editor/viewer
+├── Legacy ProjectRoleAssignment user:<auth_user_id> → owner
 ├── optionale ProjectGroup-Strukturen
 └── Universe
     └── konkrete WorldInstance world_spawn
@@ -3178,7 +3639,7 @@ identischer Folge-Request
 
 ---
 
-## 16.3 Chunk laden
+## 17.3 Chunk laden
 
 ```text
 world_db_id + chunk_x/y/z
@@ -3195,7 +3656,7 @@ Snapshot nicht vorhanden
 
 ---
 
-## 16.4 Block setzen oder entfernen
+## 17.4 Block setzen oder entfernen
 
 ```text
 Command empfangen
@@ -3220,7 +3681,7 @@ gemeinsamer Commit
 
 ---
 
-## 16.5 Earth-Welt erzeugen
+## 17.5 Earth-Welt erzeugen
 
 ```text
 GlobalReferencePoint mit explizitem CRS
@@ -3264,7 +3725,7 @@ aufrufen, damit periodische Chunkadressen und persistierte lokale Koordinaten ni
 
 ---
 
-## 16.6 Mehrblockobjekt erzeugen
+## 17.6 Mehrblockobjekt erzeugen
 
 Vorgesehener Ablauf:
 
@@ -3292,7 +3753,7 @@ Dieser Ablauf ist modellseitig vorbereitet, aber noch nicht vollständig End-to-
 
 ---
 
-## 17. Harte Invarianten des Models-Ordners
+## 18. Harte Invarianten des Models-Ordners
 
 ```text
 1. Interne DB-IDs und öffentliche API-IDs sind getrennt.
@@ -3301,94 +3762,118 @@ Dieser Ablauf ist modellseitig vorbereitet, aber noch nicht vollständig End-to-
 
 3. Project.external_app_project_id ist keine Datenbank-FK zu vectoplan-app.
 
-4. Universe.universe_id ist nur innerhalb eines Projekts eindeutig.
+4. Serviceübergreifende Benutzeridentität ist im kanonischen Vertrag ausschließlich auth_user_id.
 
-5. WorldInstance.world_id ist nur innerhalb eines Universums eindeutig.
+5. Lokale numerische AppUser-IDs und E-Mail-Adressen sind keine zulässigen kanonischen Benutzeridentitäten.
 
-6. flat und earth sind Provider-/Template-IDs, keine konkrete world_id.
+6. Project.owner_auth_user_id ist die kanonische Owneridentität.
 
-7. world_spawn ist eine konkrete editierbare WorldInstance.
+7. ProjectAccessAssignment direct besitzt auth_user_id und keine group_id.
 
-8. WorldInstance speichert Konfiguration, nicht Chunkzellen.
+8. ProjectAccessAssignment group besitzt group_id und keine auth_user_id.
 
-9. Unveränderte Chunks werden generiert.
+9. Owner-Assignments sind immer direct.
 
-10. Bearbeitete Chunks werden als ChunkSnapshot gespeichert.
+10. Genau ein aktiver Owner wird transaktional im Service erzwungen, nicht durch eine partielle Owner-Unique-Constraint.
 
-11. ChunkSnapshot ist die aktuelle Lade-Wahrheit.
+11. Viewer ist im Servicevertrag strikt read-only; das Model speichert nur die Rolle.
 
-12. ChunkEvent ist historische Wahrheit.
+12. vectoplan-app bleibt Source of Truth für App-Projektmitgliedschaften und Rollen.
 
-13. Events sind nicht der normale Ladepfad.
+13. ProjectAccessAssignment speichert nur die synchronisierte Access-Projektion.
 
-14. Pro Welt und Chunkkoordinate existiert maximal ein Snapshotdatensatz.
+14. Gruppenassignments bleiben bei Direct-User-Reconciliation erhalten.
 
-15. chunk_key muss zu chunk_x/chunk_y/chunk_z passen.
+15. ProjectAccessAssignment.chunk_project_id verwendet die stabile öffentliche Projekt-ID und keinen lokalen FK.
 
-16. cellValue 0 bedeutet Air.
+16. Die Legacy-Access-Tabellen bleiben über project_db_id an projects.id gebunden.
 
-17. Air ist kein BlockType.
+17. Legacy-Userfelder dürfen keine konkurrierende serviceübergreifende Identitätswahrheit bilden.
 
-18. Positive Zellwerte folgen paletteIndex + 1.
+18. Standardrollen sind owner, admin, editor und viewer.
 
-19. BlockRegistry und Registryversion bleiben für historische Interpretation erhalten.
+19. Normale Provisionierung darf einen bestehenden Owner nicht still ändern.
 
-20. WorldCommandLog beschreibt einen Command als Ganzes.
+20. Normale Provisionierung darf requested/effective World-Templates nicht still wechseln.
 
-21. Ein Command kann mehrere ChunkEvents erzeugen.
+21. Earth→Flat muss als expliziter Fallbackzustand mit Fehlercode gespeichert werden.
 
-22. ChunkEvents werden append-only behandelt.
+22. Universe.universe_id ist nur innerhalb eines Projekts eindeutig.
 
-23. Mehrblockobjekte ersetzen ChunkSnapshots nicht.
+23. WorldInstance.world_id ist nur innerhalb eines Universums eindeutig.
 
-24. WorldObjectChunkRef bildet Objekt-zu-Chunk-Zuordnung ab.
+24. flat und earth sind Provider-/Template-IDs, keine konkrete world_id.
 
-25. Earth-Welten benötigen genau einen globalen Referenzvertrag.
+25. world_spawn oder chk_wld_... ist eine konkrete editierbare WorldInstance.
 
-26. Flat-Welten besitzen keinen globalen Referenzvertrag.
+26. WorldInstance speichert Konfiguration, nicht Chunkzellen.
 
-27. Earth-Spawn wird lokal und präzise gespeichert.
+27. Unveränderte Chunks werden generiert.
 
-28. Spawnverschiebung ist kein Reanchoring.
+28. Bearbeitete Chunks werden als ChunkSnapshot gespeichert.
 
-29. Die globale Earth-Referenz muss nach Materialisierung gesperrt werden.
+29. ChunkSnapshot ist die aktuelle Lade-Wahrheit.
 
-30. Modelmethoden führen keine Commits aus.
+30. ChunkEvent ist historische Wahrheit.
 
-31. Projektgraphen werden außerhalb der Models atomar orchestriert.
+31. Events sind nicht der normale Ladepfad.
 
-32. Soft-Delete bewahrt historische Daten grundsätzlich.
+32. Pro Welt und Chunkkoordinate existiert maximal ein Snapshotdatensatz.
 
-33. Status- und Serializerpfade dürfen keine tiefen ORM-Graphen unkontrolliert laden.
+33. chunk_key muss zu chunk_x/chunk_y/chunk_z passen.
 
-34. Schemaänderungen gehören in einen expliziten Bootstrap-/Migrationspfad,
-    nicht in den normalen Runtime-Startup.
+34. cellValue 0 bedeutet Air.
 
-35. Project Access ist immer über project_db_id projektgescopt.
+35. Air ist kein BlockType.
 
-36. Externe User-IDs bleiben Strings ohne Foreign Key zu Auth- oder App-Datenbanken.
+36. Positive Zellwerte folgen paletteIndex + 1.
 
-37. ProjectRoleAssignment adressiert genau ein User- oder Group-Subjekt.
+37. BlockRegistry und Registryversion bleiben für historische Interpretation erhalten.
 
-38. Standardrollen sind owner, admin, editor und viewer.
+38. WorldCommandLog beschreibt einen Command als Ganzes.
 
-39. Access-Models speichern Berechtigungen, erzwingen aber noch keine Autorisierung.
+39. Ein Command kann mehrere ChunkEvents erzeugen.
 
-40. Der öffentliche Diagnosevertrag muss deshalb authzEnforced=false ausweisen.
+40. ChunkEvents werden append-only behandelt.
 
-41. Earth-spezifische Konfigurationswerte dürfen nicht aus generischen Flat-Defaults überschrieben werden.
+41. Mehrblockobjekte ersetzen ChunkSnapshots nicht.
 
-42. Integer- und Präzisionsspawn einer Earth-Welt müssen dieselbe lokale Position beschreiben.
+42. WorldObjectChunkRef bildet Objekt-zu-Chunk-Zuordnung ab.
+
+43. Earth-Welten benötigen genau einen globalen Referenzvertrag.
+
+44. Flat-Welten besitzen keinen globalen Referenzvertrag.
+
+45. Earth-Spawn wird lokal und präzise gespeichert.
+
+46. Spawnverschiebung ist kein Reanchoring.
+
+47. Die globale Earth-Referenz muss nach Materialisierung gesperrt werden.
+
+48. Modelmethoden führen keine Queries, Remote Calls, Commits oder Rollbacks aus, sofern nicht ausdrücklich anders dokumentiert; die vorliegenden Kernmodels tun dies nicht.
+
+49. Projektgraphen und Access-Synchronisierungen werden außerhalb der Models atomar orchestriert.
+
+50. Öffentliche Serialisierung darf keine rohen Auth-/Gruppen-IDs, Secrets oder internen Datenbank-IDs offenlegen.
+
+51. Status- und Serializerpfade dürfen keine tiefen ORM-Graphen unkontrolliert laden.
+
+52. Schemaänderungen gehören in einen expliziten Bootstrap-/Migrationspfad, nicht in den normalen Runtime-Startup.
+
+53. Earth-spezifische Konfigurationswerte dürfen nicht aus generischen Flat-Defaults überschrieben werden.
+
+54. Integer- und Präzisionsspawn einer Earth-Welt müssen dieselbe lokale Position beschreiben.
 ```
 
 ---
 
-## 18. Aktuell bestätigter Nutzungsstand
+## 19. Aktuell bestätigter Nutzungsstand
 
-Bestätigt genutzt:
+Bestätigt beziehungsweise im übergeordneten Service-IST als genutzt dokumentiert:
 
 ```text
 Project
+ProjectAccessAssignment
 ProjectRole
 ProjectGroup
 ProjectRoleAssignment
@@ -3408,7 +3893,8 @@ Bestätigte reale Abläufe:
 Default-Projektgraph vorhanden
 App-Projekt-Provisioning vorhanden
 Project-Access-Initialisierung mit vier Standardrollen vorhanden
-Owner-Zuweisung für externe User-ID vorhanden
+kanonische Owner-Projektion mit auth_user_id vorhanden
+Legacy-Owner-Zuweisung als Kompatibilitätsprojektion vorhanden
 Gruppen-Create-/Read-Pfad vorhanden
 Earth-Projekt-Provisioning mit kanonischer EPSG:4979-Referenz vorhanden
 Earth-Provisioning-Reparatur und Idempotenz bestätigt
@@ -3432,7 +3918,7 @@ Strukturell vorhanden, aber noch nicht vollständig bestätigt:
 WorldObjectInstance
 WorldObjectChunkRef
 ProjectGroupMember-Lifecycle einschließlich Remove/Reaktivierung/Ablauf
-Gruppenbasierte effektive Rechteauflösung
+vollständige Gruppenauflösung aus Legacy- und kanonischer Projektion in allen HTTP-Guards
 
 ReplaceBlock End-to-End
 ApplyBlockBatch End-to-End
@@ -3445,18 +3931,21 @@ Earth-Commands und Snapshots über die periodische X-Naht
 
 ---
 
-## 19. Bekannte technische Restpunkte
+## 20. Bekannte technische Restpunkte
 
-### 19.1 Modeldateien sind sehr groß
+### 20.1 Modeldateien sind sehr groß
 
 Insbesondere:
 
 ```text
-world.py   → 4.685 Zeilen
-object.py  → 2.577 Zeilen
-event.py   → 2.571 Zeilen
-block.py   → 2.517 Zeilen
-chunk.py   → 2.413 Zeilen
+world.py                     → 4.685 Zeilen
+project_access.py            → 3.597 Zeilen
+project.py                   → 2.934 Zeilen
+object.py                    → 2.577 Zeilen
+event.py                     → 2.571 Zeilen
+block.py                     → 2.517 Zeilen
+chunk.py                     → 2.413 Zeilen
+project_access_assignment.py → 1.554 Zeilen
 ```
 
 Aktuell bündeln die Dateien jeweils:
@@ -3495,7 +3984,7 @@ src/.../services.py
 
 Eine solche Aufteilung ist noch nicht umgesetzt und darf nicht ohne Tests erfolgen.
 
-### 19.2 Hilfsfunktionen sind mehrfach vorhanden
+### 20.2 Hilfsfunktionen sind mehrfach vorhanden
 
 Mehrere Dateien enthalten eigene Varianten von:
 
@@ -3525,11 +4014,11 @@ Zeitstempelserialisierung
 
 Eine spätere gemeinsame Utility-Schicht wäre möglich, muss aber zyklische Imports vermeiden.
 
-### 19.3 `models/__init__.py` prüft Spalten unterschiedlich tief
+### 20.3 `models/__init__.py` prüft Spalten unterschiedlich tief
 
 Für `Project`, `Universe` und `WorldInstance` existieren umfangreiche erwartete Spaltenlisten.
 
-Für die vier Project-Access-Klassen ist die Prüfung inzwischen vollständig auf die kritischen Spalten erweitert. Für mehrere ältere Snapshot-, Event- und Objektklassen ist die Mindestprüfung dagegen weiterhin deutlich flacher und erwartet teilweise nur:
+Für `ProjectAccessAssignment` und die vier Legacy-Access-Klassen ist die Prüfung inzwischen vollständig auf die kritischen Spalten erweitert. Für mehrere ältere Block-, Snapshot-, Event- und Objektklassen ist die Mindestprüfung dagegen weiterhin deutlich flacher und erwartet teilweise nur:
 
 ```text
 id
@@ -3547,10 +4036,34 @@ Sinnvolle Härtung:
 
 ```text
 EXPECTED_MODEL_COLUMNS
-→ für alle zehn Modelklassen auf die tatsächlich kritischen Spalten erweitern
+→ für die sieben derzeit nur flach geprüften Block-/Snapshot-/Event-/Object-Klassen auf die tatsächlich kritischen Spalten erweitern
 ```
 
-### 19.4 Produktionsmigrationen
+### 20.4 Kanonische und Legacy-Access-Struktur existieren parallel
+
+Aktuell registriert das Modelpaket gleichzeitig:
+
+```text
+project_access_assignments
+→ kanonische synchronisierte Projektion
+
+project_roles / project_groups / project_group_members / project_role_assignments
+→ Legacy-/Kompatibilitätsstruktur
+```
+
+Das ist für Bootstrap- und Übergangskompatibilität beabsichtigt, erhöht aber die Konsolidierungsanforderung:
+
+```text
+eine Source of Truth für direkte Userzuweisungen
+klare Reconciliation-Richtung
+keine divergierenden Owner
+keine divergierenden Viewer-/Editor-Rollen
+saubere Migrations- und Backfillstrategie
+```
+
+Langfristig muss entschieden werden, welche Legacy-Tabellen dauerhaft fachliche Gruppen-/Rollenmodelle bleiben und welche nur noch als Kompatibilitätsprojektion geführt werden.
+
+### 20.5 Produktionsmigrationen
 
 Die Models definieren das Zielschema, ersetzen aber kein Migrationssystem.
 
@@ -3563,7 +4076,7 @@ produktiver Schema-Upgrade-Prozess
 Trennung zwischen Dev-Repair und Production-Migration
 ```
 
-### 19.5 Nebenläufigkeit
+### 20.6 Nebenläufigkeit
 
 Die revision-Felder sind vorbereitet, aber eine vollständige Optimistic-Concurrency-Strategie ist noch nicht dokumentiert oder End-to-End bestätigt.
 
@@ -3585,7 +4098,7 @@ oder
 serialisierter Commandpfad pro Chunk
 ```
 
-### 19.6 Earth-Kanonisierung liegt nicht allein im Model
+### 20.7 Earth-Kanonisierung liegt nicht allein im Model
 
 `WorldInstance` speichert den Earth-Vertrag.
 
@@ -3601,7 +4114,7 @@ Dirty-Chunks über die Weltnaht berechnen
 
 Diese Verantwortung gehört in Koordinaten-, Provider-, Service- und Commandlogik, nicht ausschließlich in `world.py`.
 
-### 19.7 Objektpersistenz
+### 20.8 Objektpersistenz
 
 Die Objektmodelle sind umfangreich, aber noch nicht durch den vollständigen produktiven Ablauf bestätigt.
 
@@ -3620,14 +4133,15 @@ Grenz-/Earth-Nahttest
 
 ---
 
-## 20. Wo eine Änderung hingehört
+## 21. Wo eine Änderung hingehört
 
 | Änderung | Zuständige Datei/Schicht |
 |---|---|
 | neues persistentes Top-Level-Projektfeld | `models/project.py` |
 | Universe-Rolle oder Universe-Referenz | `models/universe.py` |
-| projektgescopte Rolle, Gruppe, Mitgliedschaft oder Rollenzuweisung | `models/project_access.py` |
-| Standardrollen-/Owner-Synchronisation und effektive Access-Logik | `src/project_access/service.py` |
+| kanonische direkte User-/Gruppenprojektion | `models/project_access_assignment.py` |
+| Legacy-Rolle, Gruppe, Mitgliedschaft oder Rollenzuweisung | `models/project_access.py` |
+| Standardrollen-/Owner-Synchronisation und effektive Access-Logik | `src/services/project_access_service.py` |
 | Weltkonfiguration, Provider, Spawn, Earth-Referenz | `models/world.py` |
 | Registry- oder Blockdefinition | `models/block.py` |
 | persistierter Chunkinhalt oder Snapshotmetadaten | `models/chunk.py` |
@@ -3635,7 +4149,7 @@ Grenz-/Earth-Nahttest
 | Mehrblockobjekt oder Objekt-Chunk-Zuordnung | `models/object.py` |
 | neue Modelklasse zentral registrieren | `models/__init__.py` |
 | Tabellen tatsächlich erstellen/ändern | Bootstrap/Migration außerhalb `models/` |
-| mehrere Models atomar erzeugen | Service/Repository/Bootstrap außerhalb `models/` |
+| Projektgraph und Access-Projektion atomar erzeugen/synchronisieren | `src/services/project_provisioning_service.py`, `src/services/project_access_service.py` oder Bootstrap |
 | HTTP-Payload lesen und Response senden | Route/Serializer außerhalb oder Model-Payloadfactory |
 | Chunkkoordinaten kanonisieren | `src/coordinates` beziehungsweise Provider-/Servicelogik |
 | Systemblock-Codewahrheit | `src/system_blocks` |
@@ -3643,7 +4157,7 @@ Grenz-/Earth-Nahttest
 
 ---
 
-## 21. Checkliste beim Hinzufügen oder Ändern eines Models
+## 22. Checkliste beim Hinzufügen oder Ändern eines Models
 
 ```text
 1. SQLAlchemy-Klasse und __tablename__ definieren.
@@ -3688,18 +4202,22 @@ Grenz-/Earth-Nahttest
 
 21. Bei mehreren betroffenen Models Transaktions-/Rollbacktest ergänzen.
 
-22. Bei Access-Models externe User-ID ohne Cross-Service-FK und project_db_id-Scope prüfen.
+22. Bei kanonischen Direct-Assignments ausschließlich auth_user_id akzeptieren; lokale IDs, E-Mail und verschachtelte user.id-Felder ablehnen.
 
-23. Bei Rollen-/Gruppenbeziehungen versehentliche eager Serialisierung vermeiden.
+23. Bei ProjectAccessAssignment Subject-XOR, Owner-nur-direct, Public-Redaction und Gruppen-Erhalt prüfen.
 
-24. Bei Earth-Änderungen kanonischen GlobalReferencePoint, Fingerprint, Vertikalgrenzen und Spawnkonsistenz prüfen.
+24. Bei Legacy-Access-Models project_db_id-Scope und klare Abgrenzung zur kanonischen Projektion prüfen.
 
-25. Diese IST-Zustand.md aktualisieren.
+25. Bei Rollen-/Gruppenbeziehungen versehentliche eager Serialisierung vermeiden.
+
+26. Bei Earth-Änderungen kanonischen GlobalReferencePoint, Fingerprint, Vertikalgrenzen und Spawnkonsistenz prüfen.
+
+27. Diese IST-Zustand.md aktualisieren.
 ```
 
 ---
 
-## 22. Empfohlene Navigationsreihenfolge für Entwickler
+## 23. Empfohlene Navigationsreihenfolge für Entwickler
 
 Für einen schnellen Einstieg:
 
@@ -3708,27 +4226,32 @@ Für einen schnellen Einstieg:
    → Gesamtverständnis
 
 2. models/__init__.py
-   → Registrierung und Diagnose
+   → Registrierung und getrennte Access-Diagnostik
 
 3. models/project.py
-4. models/project_access.py
-   → Projektidentität, Rollen, Gruppen und Zuweisungen
+   → Projekt, kanonischer Owner, Provisionierungs- und Access-Sync-Zustand
 
-5. models/universe.py
-6. models/world.py
+4. models/project_access_assignment.py
+   → kanonische Direct-/Group-Projektion
+
+5. models/project_access.py
+   → Legacy-Rollen, Gruppen, Memberships und Zuweisungen
+
+6. models/universe.py
+7. models/world.py
    → Projekt-/Weltgraph
 
-7. models/block.py
+8. models/block.py
    → Blockdefinitionen und Registry
 
-8. models/chunk.py
+9. models/chunk.py
    → aktuelle Chunkzustände
 
-9. models/event.py
-   → Commands und Historie
+10. models/event.py
+    → Commands und Historie
 
-10. models/object.py
-   → vorbereitete Mehrblockobjekte
+11. models/object.py
+    → vorbereitete Mehrblockobjekte
 ```
 
 Für einen Blockänderungspfad:
@@ -3744,11 +4267,12 @@ Für App-Provisioning:
 
 ```text
 project.py
-→ project_access.py
-→ src/project_access/service.py
+→ project_access_assignment.py
+→ src/services/project_access_service.py
+→ project_access.py (Legacy-Kompatibilität)
 → universe.py
 → world.py
-→ src/world_state/provisioning.py
+→ src/services/project_provisioning_service.py
 ```
 
 Für Earth:
@@ -3770,7 +4294,7 @@ object.py
 
 ---
 
-## 23. Gesamtbefund
+## 24. Gesamtbefund
 
 Der Ordner `models/` bildet inzwischen eine umfangreiche und funktional belastbare Persistenzbasis.
 
@@ -3778,7 +4302,8 @@ Bestätigt tragfähig sind:
 
 ```text
 Projektgraph
-Project-Access-Persistenz mit vier Standardrollen und Owner-Zuweisung
+kanonische ProjectAccessAssignment-Projektion mit owner/admin/editor/viewer
+Legacy-Project-Access-Persistenz mit Rollen, Gruppen und Owner-Zuweisung
 Flat-World-Konfiguration
 persistent provisionierte Earth-World mit kanonischem GlobalReferencePoint
 BlockRegistry und BlockType
@@ -3797,7 +4322,7 @@ Vorbereitet, aber weiter zu integrieren, sind:
 vollständige Mehrblockobjektpfade
 optimistische Nebenläufigkeit
 produktionsreife Migrationen
-effektive Autorisierungsentscheidung auf Basis der gespeicherten Access-Verträge
+vollständige HTTP-Guard-Abdeckung und Owner-Transfer-End-to-End auf Basis der kanonischen Access-Projektion
 produktive Earth-Snapshot-/Commandpfade einschließlich periodischer Weltnaht
 ```
 
@@ -3823,9 +4348,11 @@ Damit ist der Ordner fachlich nachvollziehbar, ohne für die normale Orientierun
 
 ---
 
-## 24. Aktualisierungs- und Verifikationsnachweis vom 2026-07-17
+## 25. Historischer Aktualisierungs- und Verifikationsnachweis vom 2026-07-17
 
-Diese Fassung ergänzt die zuvor dokumentierte Modelschicht, ohne ältere fachliche Beschreibungen zu entfernen.
+Dieser Abschnitt dokumentiert den Stand vor Einführung der kanonischen `ProjectAccessAssignment`-Projektion und von `project.schema.v3`. Angaben wie „acht Module“, „vierzehn Modelklassen“, `subjectId = "1"` oder ein ausschließlich Legacy-basierter Access-Vertrag sind daher als historischer Entwicklungsstand zu lesen und werden durch Abschnitt 26 ersetzt.
+
+Die damalige Fassung ergänzte die zuvor dokumentierte Modelschicht, ohne ältere fachliche Beschreibungen zu entfernen.
 
 Neu dokumentiert beziehungsweise hochgestuft wurden:
 
@@ -3908,3 +4435,233 @@ routes/world_test.py
 → Periodic-X-Test über vollständige Weltbreite
 → Queryvalidierungsfehler als HTTP 400 statt HTTP 500
 ```
+
+---
+
+## 26. Aktualisierung 2026-07-19 – kanonische Access-Projektion und `Project`-Schema v3
+
+### 26.1 Geprüfte Dateien
+
+Diese Fortschreibung wurde gegen folgende vorliegende Quelldateien abgeglichen:
+
+```text
+models/__init__.py
+models/project.py
+models/project_access_assignment.py
+models/project_access.py
+models/universe.py
+models/world.py
+models/block.py
+models/chunk.py
+models/event.py
+models/object.py
+```
+
+Alle Python-Dateien wurden statisch geparst; die dokumentierten Klassen-, Spalten-, Methoden- und Schemaangaben stammen aus dem vorliegenden Code. Ein statischer Abgleich bestätigt Implementierung, ersetzt aber keinen vollständigen Datenbank-/HTTP-End-to-End-Test.
+
+### 26.2 Neuer Modelgraph
+
+```text
+9 Modelmodule
+15 persistente Modelklassen
+15 Tabellen
+```
+
+Neue Importreihenfolge:
+
+```text
+project
+→ project_access_assignment
+→ project_access
+→ universe
+→ world
+→ block
+→ chunk
+→ event
+→ object
+```
+
+Neu registriert:
+
+```text
+ProjectAccessAssignment
+→ Tabelle project_access_assignments
+→ Schema project-access-assignment.schema.v1
+```
+
+### 26.3 Neue Access-Aufteilung
+
+```text
+Kanonisch
+→ ProjectAccessAssignment
+→ auth_user_id
+→ chunk_project_id
+→ direct/group
+→ owner/admin/editor/viewer
+→ Public-Redaction
+→ Source of Truth = vectoplan-app
+
+Legacy/Kompatibilität
+→ ProjectRole
+→ ProjectGroup
+→ ProjectGroupMember
+→ ProjectRoleAssignment
+→ project_db_id-Foreign-Keys
+→ eigener Vertrag authzEnforced=false
+```
+
+`models/__init__.py` liefert getrennte Verträge und Readiness-Funktionen für beide Ebenen. Der kombinierte Modelvertrag ist nur bereit, wenn kanonische Projektion und Legacy-Struktur vollständig verfügbar sind.
+
+### 26.4 `Project`-Schema v3
+
+Aktuell bestätigt implementiert:
+
+```text
+PROJECT_SCHEMA_VERSION = project.schema.v3
+DEV_PROJECT_OWNER_AUTH_USER_ID = auth_dev_owner
+```
+
+Neue beziehungsweise gehärtete Feldgruppen:
+
+```text
+owner_auth_user_id
+created_by_auth_user_id
+updated_by_auth_user_id
+
+world_template_requested
+world_template_effective
+world_fallback_used
+world_fallback_code
+earth_reference_fingerprint
+world_metadata_json
+
+provisioning_*
+access_sync_*
+```
+
+Der Project-Vertrag lehnt lokale numerische IDs, E-Mail-Adressen, anonyme Identitäten und widersprüchliche Owner-Aliase ab. Der generische Patch schützt interne Owner-, App-Link-, Template-, Provisionierungs- und Access-Sync-Felder.
+
+### 26.5 Identitäts- und Ownervertrag
+
+```text
+kanonische serviceübergreifende Benutzeridentität
+→ auth_user_id
+
+Dev-Owner
+→ auth_dev_owner
+
+Owner-Assignment
+→ direct
+→ genau ein aktiver Owner im Service
+→ Gruppen können kein Owner sein
+
+Owner-Transfer
+→ dedizierte Serviceoperation
+→ kein generischer Projekt-/Assignment-Patch
+```
+
+Die fehlende partielle Owner-Unique-Constraint ist bewusst: Der Service erzwingt die Invariante transaktional, damit Promotion und Demotion innerhalb eines atomaren Transfers nicht durch Autoflush in falscher Reihenfolge scheitern.
+
+### 26.6 Projektions- und Fallbackzustand
+
+`Project` speichert getrennt:
+
+```text
+angefordertes Template
+effektives Template
+Fallback verwendet
+Fallbackcode
+Earth-Referenzfingerprint
+Provisionierungsstatus
+Access-Sync-Status
+Request-/Correlation-IDs
+Retry-/Repair-Zustand
+Versuchszähler
+Erfolgszeitpunkte
+```
+
+Normale Retries dürfen weder Owner noch bestehende Templates still wechseln. Ein unterschiedliches requested/effective Template ist nur als expliziter Earth→Flat-Fallbackzustand zulässig.
+
+### 26.7 Public-/Private-Serialisierung
+
+```text
+Project.to_public_dict()
+→ keine rohe Owner-/Actor-auth_user_id
+→ keine interne URL
+→ Fingerprints und nicht-sensitive Zustände
+
+ProjectAccessAssignment.to_public_dict()
+→ keine rohe auth_user_id/group_id
+→ Subject-Fingerprint
+
+Private/Service-Ausgabe
+→ nur explizit
+→ sanitisierte Metadaten
+```
+
+Metadaten-Sanitizer begrenzen Größe und Tiefe und entfernen Credentials, Identitätsfelder, interne URLs sowie Chunk-/Block-/World-/Snapshot-Rohdaten.
+
+### 26.8 Unveränderte Kernaussagen
+
+Folgende bereits dokumentierte Modelverträge bleiben unverändert gültig:
+
+```text
+Universe = universe.schema.v2
+WorldInstance = world-instance.schema.v3
+BlockRegistry = block-registry.schema.v1
+BlockType = block-type.schema.v1
+ChunkSnapshot = chunk-snapshot.schema.v1
+WorldCommandLog = world-command-log.schema.v1
+ChunkEvent = chunk-event.schema.v1
+WorldObjectInstance = world-object-instance.schema.v1
+WorldObjectChunkRef = world-object-chunk-ref.schema.v1
+```
+
+Weiterhin gilt:
+
+```text
+Snapshot = Lade-Wahrheit
+Event = historische Wahrheit
+Air = cellValue 0
+Block = paletteIndex + 1
+flat/earth = Provider-/Template-IDs
+konkrete Welt = world_spawn oder chk_wld_...
+Models committen nicht
+```
+
+### 26.9 Noch separat Ende-zu-Ende zu bestätigen
+
+Aus den Modeldateien allein nicht vollständig nachgewiesen:
+
+```text
+Service-Auth auf allen Access-Mutationsrouten
+Access-Decision-Guard auf allen Projekt-/World-/Block-/Chunk-/Command-Routen
+Viewer-read-only über reale HTTP-Sitzung
+dedizierter Owner-Transfer über HTTP
+Reconciliation realer App-Mitgliedschaftsänderungen
+Migration bestehender produktiver Daten auf project.schema.v3
+Backfill project_access_assignments
+Konsolidierung der Legacy-Access-Tabellen
+Earth-Chunk-/Snapshot-/Commandpfad über die periodische X-Naht
+```
+
+### 26.10 Aktualisierter Gesamtbefund
+
+```text
+Die Modelschicht besitzt jetzt einen klaren kanonischen Access-Vertrag:
+
+vectoplan-app Membership/Rollen
+→ ProjectAccessAssignment-Projektion
+→ project_access_service Enforcement
+
+Parallel bleibt die Legacy-Rollen-/Gruppenstruktur für Kompatibilität,
+Bootstrap und Übergangspfad registriert.
+
+Project trägt mit schema.v3 den kanonischen Owner-, Template-,
+Provisionierungs- und Access-Sync-Zustand.
+
+Die World-/Chunk-/Event-/Object-Verträge bleiben fachlich kompatibel.
+```
+
+Damit ist die Model-IST-Dokumentation auf den vorliegenden Code-Stand vom 2026-07-19 aktualisiert.
+
