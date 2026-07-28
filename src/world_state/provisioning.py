@@ -2698,6 +2698,7 @@ def _create_project_instance(
                         "owner_user_id": owner_user_id,
                         "created_by_user_id": actor_user_id,
                         "metadata_json": metadata,
+                        "requested_template_id": selection.template_id,
                     },
                 ),
             ),
@@ -2933,6 +2934,128 @@ def _apply_project_state(
     if not created and changed:
         _touch_existing(project, actor_user_id=actor_user_id)
     return changed
+
+
+def _synchronize_project_provisioning_state(
+    project: Any,
+    *,
+    actor_user_id: str,
+    ids: ProvisioningIds,
+    selection: WorldTemplateSelection,
+    payload: Mapping[str, Any],
+    created: bool,
+) -> bool:
+    """Persist the successful world contract on the Chunk project row."""
+
+    desired_template = selection.template_id
+    desired_fingerprint = selection.earth_reference_fingerprint
+    current_requested = _safe_str(_get_attr(project, "world_template_requested", None), "")
+    current_effective = _safe_str(_get_attr(project, "world_template_effective", None), "")
+    current_fingerprint = _safe_str(
+        _get_attr(project, "earth_reference_fingerprint", None),
+        "",
+    )
+    template_changed = (
+        current_requested != desired_template
+        or current_effective != desired_template
+        or bool(_get_attr(project, "world_fallback_used", False))
+        or bool(_get_attr(project, "world_fallback_code", None))
+        or current_fingerprint != _safe_str(desired_fingerprint, "")
+    )
+
+    if template_changed:
+        # A row with no effective template is incomplete metadata, not a world
+        # migration. Repairing it to the already materialized world template is
+        # safe; a fully effective different template remains immutable here.
+        allow_metadata_repair = bool(created or not current_effective)
+        if (
+            current_effective
+            and current_effective != desired_template
+            and not allow_metadata_repair
+        ):
+            raise ProvisioningError(
+                "world_template_change_not_allowed",
+                "Existing world template cannot be changed by provisioning retry.",
+                details={
+                    "existing": current_effective,
+                    "requested": desired_template,
+                },
+                status_code=409,
+            )
+
+        setter = getattr(project, "set_world_template_state", None)
+        if callable(setter):
+            setter(
+                requested_template_id=desired_template,
+                effective_template_id=desired_template,
+                fallback_used=False,
+                fallback_code=None,
+                earth_reference_fingerprint=desired_fingerprint,
+                allow_template_change=allow_metadata_repair,
+                updated_by_auth_user_id=actor_user_id,
+            )
+        else:
+            _set_if_changed(project, "world_template_requested", desired_template)
+            _set_if_changed(project, "world_template_effective", desired_template)
+            _set_if_changed(project, "world_fallback_used", False)
+            _set_if_changed(project, "world_fallback_code", None)
+            _set_if_changed(
+                project,
+                "earth_reference_fingerprint",
+                desired_fingerprint,
+            )
+
+    world_metadata = _build_world_metadata(
+        ids=ids,
+        selection=selection,
+        created=False,
+    )
+    status_dirty = (
+        _safe_str(_get_attr(project, "provisioning_status", None), "").lower()
+        != "ready"
+        or bool(_get_attr(project, "provisioning_error_code", None))
+        or bool(_get_attr(project, "provisioning_retryable", False))
+        or bool(_get_attr(project, "provisioning_repair_required", False))
+        or _json_safe(_get_attr(project, "world_metadata_json", {}))
+        != _json_safe(world_metadata)
+    )
+
+    if status_dirty:
+        apply_state = getattr(project, "apply_provisioning_state", None)
+        if callable(apply_state):
+            request_id = _payload_value(
+                payload,
+                ("requestId", "request_id"),
+                default=None,
+            )
+            apply_state(
+                status="ready",
+                request_fingerprint=_payload_value(
+                    payload,
+                    ("idempotencyKey", "idempotency_key"),
+                    default=None,
+                ),
+                request_id=request_id,
+                correlation_id=_payload_value(
+                    payload,
+                    ("correlationId", "correlation_id"),
+                    default=request_id,
+                ),
+                error_code=None,
+                retryable=False,
+                repair_required=False,
+                increment_attempt=True,
+                world_metadata=world_metadata,
+                updated_by_auth_user_id=actor_user_id,
+            )
+        else:
+            _set_if_changed(project, "provisioning_status", "ready")
+            _set_if_changed(project, "provisioning_error_code", None)
+            _set_if_changed(project, "provisioning_retryable", False)
+            _set_if_changed(project, "provisioning_repair_required", False)
+            _set_if_changed(project, "world_metadata_json", world_metadata)
+
+    return bool(template_changed or status_dirty)
 
 
 def _create_universe_instance(
@@ -4147,6 +4270,18 @@ def _provision_once(
         _touch_existing(universe, actor_user_id=normalized_actor)
         if "universe" not in updated_components:
             updated_components.append("universe")
+
+    project_provisioning_state_changed = _synchronize_project_provisioning_state(
+        project,
+        actor_user_id=normalized_actor,
+        ids=ids,
+        selection=selection,
+        payload=payload,
+        created=created_project,
+    )
+    if project_provisioning_state_changed and not created_project:
+        if "project" not in updated_components:
+            updated_components.append("project")
 
     session.add(project)
     session.add(universe)

@@ -6,9 +6,9 @@ This module exposes project-scoped CRUD-style adapters for the persistent
 access structures implemented by ``models/project_access.py`` and orchestrated
 by ``src/project_access/service.py``.
 
-The routes deliberately do **not** authenticate callers and do **not** enforce
-permissions yet. They preserve the storage and transaction contracts required
-for a later authorization layer:
+Inbound callers are authenticated by the global service-auth guard. Runtime
+project permissions are enforced by the project-route guard; the App-owned
+projection endpoint additionally verifies the immutable App/Chunk mapping:
 
 * every row is scoped through the local ``Project.id``;
 * external user ids remain plain strings without cross-service foreign keys;
@@ -28,6 +28,7 @@ Readiness and summary::
     GET  /project-access/_status
     GET  /projects/<project_id>/access
     PUT  /projects/<project_id>/access/initialize
+    PUT  /projects/<project_id>/access/projection
 
 Roles::
 
@@ -66,6 +67,7 @@ All mutating endpoints are idempotent where the underlying identity is stable.
 from __future__ import annotations
 
 import copy
+import hmac
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -565,7 +567,7 @@ def _route_metadata(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "routeSource": ROUTE_SOURCE,
         "routeModuleVersion": ROUTE_MODULE_VERSION,
         "serviceVersion": PROJECT_ACCESS_SERVICE_VERSION,
-        "authzEnforced": False,
+        "authzEnforced": True,
         "externalUserForeignKeys": False,
         "transactionOwner": "route",
     }
@@ -1716,7 +1718,7 @@ def get_project_access_route_status():
             "ok": True,
             "status": "ready",
             "responseVersion": PROJECT_ACCESS_ROUTE_STATUS_VERSION,
-            "authzEnforced": False,
+            "authzEnforced": True,
             "storageContractReady": True,
             "serviceVersion": PROJECT_ACCESS_SERVICE_VERSION,
             "routeModuleVersion": ROUTE_MODULE_VERSION,
@@ -1878,6 +1880,83 @@ def initialize_project_access(project_id: str):
             }
         )
         return _json_response(data, 201 if result.changed else 200)
+    except Exception as exc:
+        _rollback_session()
+        return _error_response(exc)
+
+
+@project_access_bp.put("/projects/<project_id>/access/projection")
+def synchronize_project_access_projection(project_id: str):
+    """Atomically synchronize the canonical App-owned access projection."""
+
+    try:
+        payload = _request_json()
+        project = _resolve_route_project(project_id)
+        app_project_public_id = _safe_str(
+            payload.get(
+                "appProjectPublicId",
+                payload.get("app_project_public_id"),
+            )
+        )
+        linked_app_project_id = _safe_str(
+            getattr(project, "external_app_project_id", None)
+        )
+        if (
+            not app_project_public_id
+            or not linked_app_project_id
+            or not hmac.compare_digest(app_project_public_id, linked_app_project_id)
+        ):
+            return _json_response(
+                {
+                    "ok": False,
+                    "code": "app_chunk_project_mapping_mismatch",
+                    "error": {
+                        "code": "app_chunk_project_mapping_mismatch",
+                        "message": (
+                            "The App project identity does not match the immutable "
+                            "Chunk project mapping."
+                        ),
+                    },
+                    "statusCode": 409,
+                    "retryable": False,
+                    "repairRequired": True,
+                },
+                409,
+            )
+
+        from models.project_access_assignment import ProjectAccessAssignment
+        from src.services.project_access_service import (
+            sync_project_access_projection,
+        )
+        from src.services.service_auth_service import (
+            get_current_service_principal,
+        )
+
+        result = sync_project_access_projection(
+            project_id,
+            payload,
+            session=db.session,
+            assignment_model=ProjectAccessAssignment,
+            project_model=Project,
+            principal=get_current_service_principal(None),
+            request_id=_safe_str(request.headers.get("X-Request-ID")),
+            correlation_id=_safe_str(request.headers.get("X-Correlation-ID")),
+            idempotency_key=_safe_str(request.headers.get("Idempotency-Key")),
+            commit=True,
+            force=_safe_bool(payload.get("force"), False),
+            config=current_app.config,
+        )
+        body = result.to_dict(include_private=False)
+        if not result.ok:
+            message = _safe_str(body.get("error"), "Project access synchronization failed.")
+            body["message"] = message
+            body["error"] = {
+                "code": result.code,
+                "message": message,
+                "details": _make_json_safe(result.details),
+                "retryable": result.retryable,
+            }
+        return _json_response(body, result.status_code)
     except Exception as exc:
         _rollback_session()
         return _error_response(exc)

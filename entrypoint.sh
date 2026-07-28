@@ -370,7 +370,7 @@ ensure_world_identity_env() {
   fi
 }
 
-enforce_runtime_readonly_env() {
+enforce_runtime_policy_env() {
   ensure_world_identity_env
 
   export VECTOPLAN_CHUNK_MODE="runtime"
@@ -378,8 +378,11 @@ enforce_runtime_readonly_env() {
   export VECTOPLAN_CHUNK_RUNTIME_MODE="runtime"
 
   export VECTOPLAN_CHUNK_DB_BOOTSTRAP_ENABLED="false"
-  export VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS="false"
-  export VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY="true"
+  export VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS="${VECTOPLAN_CHUNK_ALLOW_RUNTIME_DB_MUTATIONS:-true}"
+  export VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY="${VECTOPLAN_CHUNK_RUNTIME_IS_READ_ONLY:-false}"
+  export VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED="${VECTOPLAN_CHUNK_RUNTIME_BUSINESS_MUTATIONS_ENABLED:-true}"
+  export VECTOPLAN_CHUNK_ALLOW_RUNTIME_SCHEMA_MUTATIONS="false"
+  export VECTOPLAN_CHUNK_RUNTIME_SCHEMA_IS_READ_ONLY="true"
   export VECTOPLAN_CHUNK_AUTO_CREATE_ALL="false"
   export VECTOPLAN_CHUNK_AUTO_SEED_DEFAULTS="false"
   export VECTOPLAN_CHUNK_SEED_DEBUG_BLOCKS="false"
@@ -899,7 +902,7 @@ run_database_check_only() {
 }
 
 run_schema_ready_check() {
-  enforce_runtime_readonly_env
+  enforce_runtime_policy_env
 
   if ! is_true "$VECTOPLAN_CHUNK_SCHEMA_READY_CHECK"; then
     log_warn "DB/Seed-Ready-Check wurde durch VECTOPLAN_CHUNK_SCHEMA_READY_CHECK=false übersprungen."
@@ -993,7 +996,7 @@ print_startup_summary() {
 start_gunicorn() {
   command_exists gunicorn || die "'gunicorn' ist nicht installiert oder nicht im PATH verfügbar."
 
-  enforce_runtime_readonly_env
+  enforce_runtime_policy_env
   validate_runtime_files
   wait_for_database_socket
 
@@ -1024,7 +1027,7 @@ start_gunicorn() {
 }
 
 start_python_wsgi() {
-  enforce_runtime_readonly_env
+  enforce_runtime_policy_env
   validate_runtime_files
   wait_for_database_socket
 

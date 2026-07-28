@@ -2556,7 +2556,7 @@ def _build_projects_config_status() -> dict[str, Any]:
         },
         "projectAccess": {
             "available": _access_service_available(),
-            "authzEnforced": False,
+            "authzEnforced": True,
             "creationRequired": _get_config_bool("VECTOPLAN_CHUNK_PROJECT_CREATION_REQUIRE_ACCESS", True),
             "deleteRequired": _get_config_bool("VECTOPLAN_CHUNK_PROJECT_DELETE_REQUIRE_ACCESS", True),
             "readinessRequired": _get_config_bool("VECTOPLAN_CHUNK_PROJECT_ACCESS_READY_REQUIRED", False),

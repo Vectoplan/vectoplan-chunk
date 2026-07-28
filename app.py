@@ -651,7 +651,7 @@ def _apply_config(app: Flask, config_class: type) -> None:
         "VECTOPLAN_CHUNK_REQUIRE_PROJECT_ACCESS_ROUTES",
         True,
     )
-    metadata["project_access_authz_enforced"] = False
+    metadata["project_access_authz_enforced"] = True
     metadata["project_access_blueprint_registered"] = False
     metadata["project_access_blueprint_registration"] = None
     metadata["legacy_editor_compatibility_enabled"] = True
@@ -862,7 +862,7 @@ def _build_app_routing_snapshot(app: Flask) -> dict[str, Any]:
                 _PROJECT_ACCESS_BLUEPRINT_NAME in blueprint_names
                 and not missing_project_access_rules
             ),
-            "authzEnforced": False,
+            "authzEnforced": True,
         },
     }
 
@@ -971,7 +971,7 @@ def _ensure_project_access_blueprint_registered(
     diagnostics: dict[str, Any] = {
         "enabled": enabled,
         "required": required,
-        "authzEnforced": False,
+        "authzEnforced": True,
         "blueprintName": _PROJECT_ACCESS_BLUEPRINT_NAME,
         "blueprintAttribute": _PROJECT_ACCESS_BLUEPRINT_ATTRIBUTE,
         "moduleCandidates": list(_PROJECT_ACCESS_ROUTE_MODULE_CANDIDATES),
@@ -1328,7 +1328,7 @@ def _register_root_probe(app: Flask) -> None:
                 "registered": bool(
                     metadata.get("project_access_blueprint_registered", False)
                 ),
-                "authzEnforced": False,
+                "authzEnforced": True,
                 "status": "/project-access/_status",
                 "summary": "/projects/dev-project/access",
                 "initialize": "/projects/dev-project/access/initialize",
@@ -1406,6 +1406,17 @@ def create_app(config_object: type | str | None = None) -> Flask:
     _configure_logger(app)
 
     _validate_config(config_class, app.logger)
+
+    from src.services.project_route_authorization import (
+        install_project_route_authorization,
+    )
+    from src.services.service_auth_service import install_service_auth
+
+    if not install_service_auth(app, guard_all_requests=True, allow_exempt=True):
+        raise RuntimeError("Could not install Chunk service authentication.")
+    if not install_project_route_authorization(app):
+        raise RuntimeError("Could not install Chunk project route authorization.")
+
     _initialize_extensions(app)
 
     with app.app_context():
