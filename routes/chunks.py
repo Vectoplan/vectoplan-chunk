@@ -1122,6 +1122,68 @@ def _try_generate_with_world_service(
     )
 
 
+def _try_generate_for_world_instance(
+    *,
+    world: WorldInstance,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+) -> Any:
+    """
+    Generate a chunk through the provider bound to the concrete WorldInstance.
+
+    Flat worlds continue to use the generic WorldService registry. Earth worlds
+    carry a persisted global reference and therefore must use the concrete
+    EarthWorldProvider built from that immutable reference.
+    """
+    if not bool(getattr(world, "is_earth_world", False)):
+        return _try_generate_with_world_service(
+            provider_world_id=world.provider_world_id,
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            chunk_z=chunk_z,
+        )
+
+    _log_checkpoint(
+        "before_earth_provider_generate",
+        worldId=world.world_id,
+        providerWorldId=world.provider_world_id,
+        chunkX=chunk_x,
+        chunkY=chunk_y,
+        chunkZ=chunk_z,
+    )
+
+    try:
+        build_provider = getattr(world, "build_earth_provider", None)
+        if not callable(build_provider):
+            raise RuntimeError(
+                "Earth WorldInstance does not expose build_earth_provider()."
+            )
+
+        provider = build_provider()
+        generate_chunk = getattr(provider, "generate_chunk", None)
+        if not callable(generate_chunk):
+            raise RuntimeError(
+                "EarthWorldProvider.generate_chunk is unavailable."
+            )
+
+        generated = generate_chunk(
+            (int(chunk_x), int(chunk_y), int(chunk_z))
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Concrete Earth provider chunk generation failed for "
+            f"world '{world.world_id}': {_safe_exception_message(exc)}"
+        ) from exc
+
+    _log_checkpoint(
+        "after_earth_provider_generate",
+        worldId=world.world_id,
+        resultType=type(generated).__name__,
+    )
+    return generated
+
+
 def _extract_runtime_candidate(generated: Any) -> dict[str, Any]:
     """Extract runtime chunk candidate from provider generation result."""
     data = _object_to_dict(generated)
@@ -1271,8 +1333,8 @@ def _generate_runtime_chunk(
     chunk_z: int,
 ) -> dict[str, Any]:
     """Generate runtime chunk through provider/template world layer."""
-    generated = _try_generate_with_world_service(
-        provider_world_id=world.provider_world_id,
+    generated = _try_generate_for_world_instance(
+        world=world,
         chunk_x=chunk_x,
         chunk_y=chunk_y,
         chunk_z=chunk_z,
