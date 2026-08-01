@@ -130,13 +130,20 @@ def install_project_route_authorization(app: Flask) -> bool:
         claimed_app_id = str(
             request.headers.get("X-Vectoplan-App-Project-Id") or ""
         ).strip()
-        project = Project.query.filter_by(project_id=project_id).first()
+        # Only the App/Chunk binding is needed here. Loading a full Project ORM
+        # entity causes its many select-in backrefs (worlds, snapshots, events,
+        # object refs, ...) to be traversed before every runtime request. Once a
+        # chunk is materialized this can make commands appear to hang. Selecting
+        # the scalar column keeps authorization constant-time and relationship-free.
         stored_app_id = str(
-            getattr(project, "external_app_project_id", "") or ""
+            db.session.query(Project.external_app_project_id)
+            .filter(Project.project_id == project_id)
+            .limit(1)
+            .scalar()
+            or ""
         ).strip()
         if (
-            project is None
-            or not claimed_app_id
+            not claimed_app_id
             or not stored_app_id
             or not hmac.compare_digest(claimed_app_id, stored_app_id)
         ):

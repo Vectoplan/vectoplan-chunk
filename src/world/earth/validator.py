@@ -59,7 +59,7 @@ STORAGE_ORIGIN_POLICY: Final[str] = "global-chunk-origin-floor-v1"
 CANONICAL_GEOGRAPHIC_CRS_ID: Final[str] = "EPSG:4979"
 CANONICAL_GEOCENTRIC_CRS_ID: Final[str] = "EPSG:4978"
 DEFAULT_BLOCK_TYPE_ID: Final[str] = "system_air"
-GENERATION_MODE: Final[str] = "air-only-v1"
+GENERATION_MODE: Final[str] = "sample-bigdata-v1"
 MINIMUM_PYPROJ_VERSION: Final[str] = "3.7.0"
 
 _MAX_MANIFEST_SIZE_BYTES: Final[int] = 1_048_576
@@ -2283,7 +2283,7 @@ def _validate_cross_field_invariants(
     _expect(context, ("worldType",), world_type, WORLD_TYPE)
     _expect(context, ("enabled",), enabled, True)
     _expect(context, ("generatorType",), generator_type, GENERATOR_TYPE)
-    _expect(context, ("generatorVersion",), generator_version, "1")
+    _expect(context, ("generatorVersion",), generator_version, "2")
     _expect(context, ("topologyType",), topology_type, TOPOLOGY_TYPE)
     _expect(context, ("coordinateSystemId",), coordinate_system_id, COORDINATE_SYSTEM_ID)
     _expect(context, ("axisConvention",), axis_convention, AXIS_CONVENTION)
@@ -2446,7 +2446,7 @@ def _validate_cross_field_invariants(
             (("generator", "topologyAware"), generator.topology_aware, True),
             (("generator", "defaultBlockTypeId"), generator.default_block_type_id, DEFAULT_BLOCK_TYPE_ID),
             (("generator", "generationMode"), generator.generation_mode, GENERATION_MODE),
-            (("generator", "terrainSurfaceGenerated"), generator.terrain_surface_generated, False),
+            (("generator", "terrainSurfaceGenerated"), generator.terrain_surface_generated, True),
             (("generator", "northSouthBoundaryGenerated"), generator.north_south_boundary_generated, False),
             (("generator", "periodicXBoundaryGenerated"), generator.periodic_x_boundary_generated, False),
             (("generator", "canonicalizeChunkBeforeGeneration"), generator.canonicalize_chunk_before_generation, True),
@@ -2458,7 +2458,7 @@ def _validate_cross_field_invariants(
     if spawn is not None:
         for path, actual, expected in (
             (("spawn", "persistedCoordinateSpace"), spawn.persisted_coordinate_space, "local_metric"),
-            (("spawn", "defaultPolicy"), spawn.default_policy, "global-reference-point-as-local-position"),
+            (("spawn", "defaultPolicy"), spawn.default_policy, "sample-bigdata-local-position-v1"),
             (("spawn", "globalCoordinateInputSupported"), spawn.global_coordinate_input_supported, True),
             (("spawn", "explicitCrsRequiredForGlobalInput"), spawn.explicit_crs_required_for_global_input, True),
             (("spawn", "moveChangesGlobalReference"), spawn.move_changes_global_reference, False),
@@ -2506,7 +2506,7 @@ def _validate_cross_field_invariants(
             ("periodicX", capabilities.periodic_x, True),
             ("periodicZ", capabilities.periodic_z, False),
             ("normalReanchor", capabilities.normal_reanchor, False),
-            ("terrainImport", capabilities.terrain_import, False),
+            ("terrainImport", capabilities.terrain_import, True),
             ("regionalCrs", capabilities.regional_crs, False),
             ("projectGridRotation", capabilities.project_grid_rotation, False),
         ):

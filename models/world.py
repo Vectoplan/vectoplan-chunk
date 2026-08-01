@@ -156,7 +156,7 @@ EARTH_PROVIDER_WORLD_ID = "earth"
 EARTH_WORLD_NAME = "Earth Spawn World"
 
 EARTH_GENERATOR_TYPE = "earth-flat-periodic"
-EARTH_GENERATOR_VERSION = "1"
+EARTH_GENERATOR_VERSION = "2"
 EARTH_PROJECTION_TYPE = "vectoplan-periodic-equirectangular"
 EARTH_TOPOLOGY_TYPE = "periodic-x-v1"
 EARTH_COORDINATE_SYSTEM = "vectoplan-earth-grid-v1"

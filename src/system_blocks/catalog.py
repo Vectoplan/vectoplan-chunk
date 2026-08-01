@@ -98,10 +98,20 @@ SYSTEM_BLOCK_ID_PREFIX: Final[str] = "system_"
 
 AIR_PROVIDER_KEY: Final[str] = "air"
 RAILING_PROVIDER_KEY: Final[str] = "railing"
+WATER_PROVIDER_KEY: Final[str] = "water"
+TERRAIN_PROVIDER_KEY: Final[str] = "terrain"
+TERRAIN_HUMUS_PROVIDER_KEY: Final[str] = "terrain_humus"
+TERRAIN_SOIL_PROVIDER_KEY: Final[str] = "terrain_soil"
+TERRAIN_ROCK_PROVIDER_KEY: Final[str] = "terrain_rock"
 
 AIR_SYSTEM_BLOCK_ID: Final[str] = "system_air"
 RAILING_SYSTEM_BLOCK_ID: Final[str] = "system_railing"
 RAILING_RUNTIME_BLOCK_TYPE_ID: Final[str] = "system_railing"
+WATER_SYSTEM_BLOCK_ID: Final[str] = "system_water"
+TERRAIN_SYSTEM_BLOCK_ID: Final[str] = "system_terrain"
+TERRAIN_HUMUS_SYSTEM_BLOCK_ID: Final[str] = "system_terrain_humus"
+TERRAIN_SOIL_SYSTEM_BLOCK_ID: Final[str] = "system_terrain_soil"
+TERRAIN_ROCK_SYSTEM_BLOCK_ID: Final[str] = "system_terrain_rock"
 
 
 # -----------------------------------------------------------------------------
@@ -792,6 +802,71 @@ SYSTEM_BLOCK_PROVIDER_SPECS: Final[tuple[SystemBlockProviderSpec, ...]] = (
         required=True,
         order=100,
         description="Persistent built-in Railing block definition.",
+    ),
+    SystemBlockProviderSpec(
+        provider_key=WATER_PROVIDER_KEY,
+        package_segment="natural",
+        definition_factory_name="get_water_definition",
+        expected_system_block_id=WATER_SYSTEM_BLOCK_ID,
+        expected_runtime_block_type_id=WATER_SYSTEM_BLOCK_ID,
+        expected_reserved_cell_value=None,
+        expected_persistent=True,
+        aliases=("water",),
+        required=True,
+        order=200,
+        description="Persistent built-in water admin block.",
+    ),
+    SystemBlockProviderSpec(
+        provider_key=TERRAIN_PROVIDER_KEY,
+        package_segment="natural",
+        definition_factory_name="get_terrain_definition",
+        expected_system_block_id=TERRAIN_SYSTEM_BLOCK_ID,
+        expected_runtime_block_type_id=TERRAIN_SYSTEM_BLOCK_ID,
+        expected_reserved_cell_value=None,
+        expected_persistent=True,
+        aliases=("terrain",),
+        required=True,
+        order=210,
+        description="Generic persistent terrain admin block.",
+    ),
+    SystemBlockProviderSpec(
+        provider_key=TERRAIN_HUMUS_PROVIDER_KEY,
+        package_segment="natural",
+        definition_factory_name="get_terrain_humus_definition",
+        expected_system_block_id=TERRAIN_HUMUS_SYSTEM_BLOCK_ID,
+        expected_runtime_block_type_id=TERRAIN_HUMUS_SYSTEM_BLOCK_ID,
+        expected_reserved_cell_value=None,
+        expected_persistent=True,
+        aliases=("terrain_humus", "humus"),
+        required=True,
+        order=211,
+        description="Humus subtype of the persistent terrain block family.",
+    ),
+    SystemBlockProviderSpec(
+        provider_key=TERRAIN_SOIL_PROVIDER_KEY,
+        package_segment="natural",
+        definition_factory_name="get_terrain_soil_definition",
+        expected_system_block_id=TERRAIN_SOIL_SYSTEM_BLOCK_ID,
+        expected_runtime_block_type_id=TERRAIN_SOIL_SYSTEM_BLOCK_ID,
+        expected_reserved_cell_value=None,
+        expected_persistent=True,
+        aliases=("terrain_soil", "soil", "earth"),
+        required=True,
+        order=212,
+        description="Soil subtype of the persistent terrain block family.",
+    ),
+    SystemBlockProviderSpec(
+        provider_key=TERRAIN_ROCK_PROVIDER_KEY,
+        package_segment="natural",
+        definition_factory_name="get_terrain_rock_definition",
+        expected_system_block_id=TERRAIN_ROCK_SYSTEM_BLOCK_ID,
+        expected_runtime_block_type_id=TERRAIN_ROCK_SYSTEM_BLOCK_ID,
+        expected_reserved_cell_value=None,
+        expected_persistent=True,
+        aliases=("terrain_rock", "rock"),
+        required=True,
+        order=213,
+        description="Rock subtype of the persistent terrain block family.",
     ),
 )
 
@@ -2051,6 +2126,16 @@ __all__ = [
     "RAILING_PROVIDER_KEY",
     "RAILING_RUNTIME_BLOCK_TYPE_ID",
     "RAILING_SYSTEM_BLOCK_ID",
+    "TERRAIN_HUMUS_PROVIDER_KEY",
+    "TERRAIN_HUMUS_SYSTEM_BLOCK_ID",
+    "TERRAIN_PROVIDER_KEY",
+    "TERRAIN_ROCK_PROVIDER_KEY",
+    "TERRAIN_ROCK_SYSTEM_BLOCK_ID",
+    "TERRAIN_SOIL_PROVIDER_KEY",
+    "TERRAIN_SOIL_SYSTEM_BLOCK_ID",
+    "TERRAIN_SYSTEM_BLOCK_ID",
+    "WATER_PROVIDER_KEY",
+    "WATER_SYSTEM_BLOCK_ID",
     "SYSTEM_BLOCK_CATALOG_ID",
     "SYSTEM_BLOCK_CATALOG_MODULE_VERSION",
     "SYSTEM_BLOCK_CATALOG_SCHEMA_VERSION",

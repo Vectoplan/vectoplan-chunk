@@ -55,6 +55,7 @@ from ...coordinates.topology import (
     PeriodicXTopology,
     get_periodic_x_topology,
 )
+from .sample_data import get_earth_sample_data
 from ...georeferencing.errors import (
     GeoreferencingConfigurationError,
     GeoreferencingValidationError,
@@ -101,6 +102,7 @@ class EarthGeneratorConfig:
     """Vollständig validierte Konfiguration einer Generatorinstanz."""
 
     definition_semantic_fingerprint: str
+    sample_data_fingerprint: str
     provider_id: str
     generator_type: str
     generator_version: str
@@ -125,6 +127,14 @@ class EarthGeneratorConfig:
             _require_sha256(
                 self.definition_semantic_fingerprint,
                 field_name="definitionSemanticFingerprint",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "sample_data_fingerprint",
+            _require_sha256(
+                self.sample_data_fingerprint,
+                field_name="sampleDataFingerprint",
             ),
         )
         object.__setattr__(
@@ -328,6 +338,9 @@ class EarthGeneratorConfig:
             definition_semantic_fingerprint=(
                 definition.semantic_fingerprint
             ),
+            sample_data_fingerprint=(
+                get_earth_sample_data().source_fingerprint
+            ),
             provider_id=definition.provider_id,
             generator_type=definition.generator.generator_type,
             generator_version=definition.generator.version,
@@ -388,6 +401,7 @@ class EarthGeneratorConfig:
             "definitionSemanticFingerprint": (
                 self.definition_semantic_fingerprint
             ),
+            "sampleDataFingerprint": self.sample_data_fingerprint,
             "providerId": self.provider_id,
             "generatorType": self.generator_type,
             "generatorVersion": self.generator_version,
@@ -484,17 +498,22 @@ class EarthGeneratedChunk:
                     "expectedCellCount": self.config.cell_count,
                 },
             )
-        if palette:
+        if not palette:
             raise GeoreferencingConfigurationError(
-                "Air-only-Chunk darf keine Palette besitzen.",
+                "Earth sample chunk requires its fixed block palette.",
                 details={"paletteSize": len(palette)},
             )
-        if any(
-            value != self.config.air_cell_value
-            for value in cells
+        if len(palette) != len(set(palette)) or any(
+            not isinstance(block_type_id, str) or not block_type_id.strip()
+            for block_type_id in palette
         ):
             raise GeoreferencingConfigurationError(
-                "Air-only-Chunk enthält einen Nicht-Air-Zellwert."
+                "Earth sample chunk palette contains invalid identifiers."
+            )
+        if any(value < 0 or value > len(palette) for value in cells):
+            raise GeoreferencingConfigurationError(
+                "Earth sample chunk contains a cell value outside its palette.",
+                details={"paletteSize": len(palette)},
             )
 
         object.__setattr__(self, "cells", cells)
@@ -534,7 +553,7 @@ class EarthGeneratedChunk:
 
     @property
     def non_air_cell_count(self) -> int:
-        return 0
+        return sum(value != self.config.air_cell_value for value in self.cells)
 
     @property
     def materialized(self) -> bool:
@@ -862,7 +881,7 @@ class EarthFlatPeriodicGenerator:
             ),
             "deterministic": True,
             "topologyAware": True,
-            "airOnly": True,
+            "airOnly": False,
             "materializesOnGenerate": False,
             "config": self.config.to_dict(),
         }
@@ -995,18 +1014,13 @@ def _generate_chunk_content_cached(
             },
         )
 
-    cells = _air_cells_cached(
-        config.chunk_size,
-        config.cell_count,
-        config.air_cell_value,
-    )
-    palette: tuple[str, ...] = ()
-    content_fingerprint = _air_content_fingerprint_cached(
-        config.chunk_size,
-        config.cell_count,
-        config.air_cell_value,
-        config.cell_value_encoding,
-        config.linear_index_order,
+    cells, palette, content_fingerprint = (
+        get_earth_sample_data().generate_chunk(
+            chunk_size=config.chunk_size,
+            chunk_x=address.x,
+            chunk_y=address.y,
+            chunk_z=address.z,
+        )
     )
 
     return _EarthChunkContent(
@@ -1102,12 +1116,10 @@ def earth_generator_runtime_status() -> dict[str, JsonValue]:
         payload["zeroChunkReady"] = bool(
             zero.chunk_key == "0:0:0"
             and zero.cell_count == 4_096
-            and zero.non_air_cell_count == 0
-            and zero.cell_value_by_index(0) == 0
-            and zero.cell_value_by_index(
-                zero.cell_count - 1
-            )
-            == 0
+            and zero.non_air_cell_count > 0
+            and "system_terrain_humus" in zero.palette
+            and "system_water" in zero.palette
+            and "system_terrain_rock" in zero.palette
         )
         payload["chunk"] = zero.to_dict(
             include_cells=False
@@ -1120,7 +1132,7 @@ def earth_generator_runtime_status() -> dict[str, JsonValue]:
             and negative.cell_value(
                 LocalCellPosition(15, 15, 15)
             )
-            == 0
+            >= 0
         )
 
         alias = generator.generate_at(
@@ -1273,8 +1285,8 @@ def _validate_definition_for_generation(
             "generation_mode_mismatch",
         ),
         (
-            not definition.generator.terrain_surface_generated,
-            "terrain_surface_must_be_disabled",
+            definition.generator.terrain_surface_generated,
+            "terrain_surface_must_be_enabled",
         ),
         (
             not definition.generator.north_south_boundary_generated,

@@ -967,7 +967,7 @@ def _resolve_world_selection(payload: Mapping[str, Any]) -> dict[str, Any]:
         "provider_id": "earth",
         "provider_world_id": "earth",
         "generator_type": _get_config_string("VECTOPLAN_CHUNK_EARTH_GENERATOR_TYPE", "earth-flat-periodic"),
-        "generator_version": _get_config_string("VECTOPLAN_CHUNK_EARTH_GENERATOR_VERSION", "1"),
+        "generator_version": _get_config_string("VECTOPLAN_CHUNK_EARTH_GENERATOR_VERSION", "2"),
         "projection_type": _get_config_string("VECTOPLAN_CHUNK_EARTH_PROJECTION_TYPE", "vectoplan-periodic-equirectangular"),
         "topology_type": _get_config_string("VECTOPLAN_CHUNK_EARTH_TOPOLOGY_TYPE", "periodic-x-v1"),
         "coordinate_system": _get_config_string("VECTOPLAN_CHUNK_EARTH_COORDINATE_SYSTEM", "vectoplan-earth-grid-v1"),

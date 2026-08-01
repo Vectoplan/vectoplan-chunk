@@ -119,6 +119,7 @@ from .generator import (
     get_earth_flat_periodic_generator,
     get_earth_generator_config,
 )
+from .sample_data import get_earth_sample_data
 from .validator import (
     PROVIDER_ID,
     PROVIDER_WORLD_ID,
@@ -164,7 +165,7 @@ SUPPORTED_PROVIDER_FUNCTIONS: Final[tuple[str, ...]] = (
 
 PROVIDER_SCHEMA_VERSION: Final[str] = "earth-world-provider.v1"
 CAPABILITIES_SCHEMA_VERSION: Final[str] = (
-    "earth-provider-capabilities.v1"
+    "earth-provider-capabilities.v2"
 )
 _MAX_WORLD_ID_LENGTH: Final[int] = 256
 _PROVIDER_CACHE_SIZE: Final[int] = 512
@@ -492,30 +493,27 @@ def validate_world_config(
 
 
 def _neutral_adapter_palette() -> tuple[PaletteEntry, ...]:
-    """Provide the one unused positive entry required by legacy WorldDefinition.
+    """Expose the exact positive palette used by the sample generator."""
 
-    Earth fallback chunks remain air-only and therefore contain exclusively
-    cell value ``0``. ``system_air`` is intentionally not represented as a
-    positive palette entry.
-    """
-
-    return (
+    return tuple(
         _neutral_type("PaletteEntry")(
-            block_type_id=NEUTRAL_ADAPTER_UNUSED_BLOCK_TYPE_ID,
-            label="Terrain",
-            solid=True,
-            placeable=True,
-            breakable=True,
+            block_type_id=entry.block_type_id,
+            label=entry.label,
+            solid=entry.solid,
+            placeable=entry.placeable,
+            breakable=entry.breakable,
             registry_id=NEUTRAL_ADAPTER_BLOCK_REGISTRY_ID,
             registry_version=NEUTRAL_ADAPTER_BLOCK_REGISTRY_VERSION,
             metadata={
                 "source": "system",
-                "adapterCompatibilityOnly": True,
-                "usedByEarthAirOnlyFallback": False,
+                "sampleBigData": True,
+                "color": entry.color,
+                "terrainSubtype": entry.terrain_subtype,
                 "airCellValue": 0,
                 "cellValueRule": "paletteIndex + 1",
             },
-        ),
+        )
+        for entry in get_earth_sample_data().palette
     )
 
 
@@ -571,7 +569,7 @@ def _neutral_definition_from_earth(
                 definition.global_reference.required
             ),
             "generationMode": definition.generator.generation_mode,
-            "airOnlyFallback": True,
+            "airOnlyFallback": False,
             "airCellValue": 0,
             "periodicX": True,
             "periodicZ": False,
@@ -624,13 +622,13 @@ def get_provider_info() -> WorldProviderInfo:
             "providerContractVersion": "earth-provider.v1",
             "neutralAdapterSchemaVersion": NEUTRAL_ADAPTER_SCHEMA_VERSION,
             "generatorType": "earth-flat-periodic",
-            "generatorVersion": "1",
+            "generatorVersion": "2",
             "projectionType": "vectoplan-periodic-equirectangular",
             "topologyType": "periodic-x-v1",
             "coordinateSystem": "vectoplan-earth-grid-v1",
             "concreteWorldId": NEUTRAL_ADAPTER_CONCRETE_WORLD_ID,
             "concreteWorldRequiresGlobalReference": True,
-            "airOnlyFallback": True,
+            "airOnlyFallback": False,
             "databaseUsed": False,
         },
     )
@@ -875,7 +873,7 @@ def get_provider_status(
             )
             chunk_generation_ready = bool(
                 probe.chunk_key == "0:0:0"
-                and probe.is_empty_air_chunk
+                and not probe.is_empty_air_chunk
                 and len(probe.cells) == probe.expected_cell_count
             )
         except Exception as exc:
@@ -947,10 +945,10 @@ def get_provider_contract() -> dict[str, Any]:
             "worldId": WORLD_ID,
             "returnedChunkCoordinates": "requested",
             "canonicalChunkCoordinatesInMetadata": True,
-            "positivePaletteCompatibilityEntry": (
-                NEUTRAL_ADAPTER_UNUSED_BLOCK_TYPE_ID
+            "positivePaletteEntries": list(
+                get_earth_sample_data().palette_ids
             ),
-            "generatedCellValues": [0],
+            "generatedCellValues": [0, 1, 2, 3, 4, 5],
             "airStoredInPositivePalette": False,
         },
         "concreteWorld": {
@@ -963,8 +961,8 @@ def get_provider_contract() -> dict[str, Any]:
         },
         "generator": {
             "type": "earth-flat-periodic",
-            "version": "1",
-            "airOnlyFallback": True,
+            "version": "2",
+            "airOnlyFallback": False,
             "periodicX": True,
             "periodicZ": False,
         },
@@ -1062,11 +1060,11 @@ class EarthProviderCapabilities:
             ),
             "global_spawn_input": self.global_spawn_input,
             "periodic_x": self.periodic_x,
+            "terrain_import": self.terrain_import,
         }
         required_false = {
             "periodic_z": self.periodic_z,
             "normal_reanchor": self.normal_reanchor,
-            "terrain_import": self.terrain_import,
             "regional_crs": self.regional_crs,
             "project_grid_rotation": self.project_grid_rotation,
         }
@@ -1510,24 +1508,15 @@ class EarthWorldProvider:
         )
 
     def default_spawn_position(self) -> LocalMetricPosition:
-        """Liefert den lokal persistierbaren Default-Spawn.
+        """Return the walkable spawn from the active sample-data response."""
 
-        Bei einer 2D-Referenz wird lokal Y=0 verwendet. Dadurch bleibt ein
-        lokaler Spawn speicherbar, ohne eine globale absolute Höhe zu erfinden.
-        """
-
-        reference_local = self.frame.reference_local_position
-        y_cells = (
-            reference_local.y
-            if reference_local.y is not None
-            else Decimal("0")
+        spawn_x, spawn_y, spawn_z = (
+            get_earth_sample_data().spawn_local_m
         )
-        scale = self.grid_definition.meters_per_cell
-
         return LocalMetricPosition(
-            x=float(reference_local.x * scale),
-            y=float(y_cells * scale),
-            z=float(reference_local.z * scale),
+            x=spawn_x,
+            y=spawn_y,
+            z=spawn_z,
         )
 
     def resolve_spawn_from_global(
@@ -1979,7 +1968,7 @@ def earth_provider_component_status() -> dict[str, JsonValue]:
         payload["chunkGenerationReady"] = bool(
             zero.chunk_key == "0:0:0"
             and zero.cell_count == 4_096
-            and zero.non_air_cell_count == 0
+            and zero.non_air_cell_count > 0
         )
 
         alias = provider.generate_chunk(
@@ -2027,6 +2016,7 @@ def earth_provider_component_status() -> dict[str, JsonValue]:
         )
 
         default_spawn = provider.default_spawn_position()
+        sample_spawn = get_earth_sample_data().spawn_local_m
         resolved_spawn = provider.resolve_spawn_from_global(
             reference.coordinate,
             reference.crs,
@@ -2037,11 +2027,11 @@ def earth_provider_component_status() -> dict[str, JsonValue]:
             require_vertical=True,
         )
         payload["spawnReady"] = bool(
-            abs(default_spawn.x - resolved_spawn.x)
+            abs(default_spawn.x - sample_spawn[0])
             < 0.000001
-            and abs(default_spawn.y - resolved_spawn.y)
+            and abs(default_spawn.y - sample_spawn[1])
             < 0.000001
-            and abs(default_spawn.z - resolved_spawn.z)
+            and abs(default_spawn.z - sample_spawn[2])
             < 0.000001
             and spawn_global.target_coordinate.z is not None
         )
@@ -2054,6 +2044,7 @@ def earth_provider_component_status() -> dict[str, JsonValue]:
             and capabilities.local_to_global_conversion
             and capabilities.global_spawn_input
             and capabilities.periodic_x
+            and capabilities.terrain_import
             and not capabilities.periodic_z
             and not capabilities.normal_reanchor
         )

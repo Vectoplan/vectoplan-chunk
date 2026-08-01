@@ -2133,6 +2133,64 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             }
         )
 
+    earth_sample_world_id = _env_str(
+        "VECTOPLAN_CHUNK_EARTH_SAMPLE_WORLD_ID",
+        "world_earth_sample",
+    )
+    earth_sample_world = None
+    if _env_bool("VECTOPLAN_CHUNK_SEED_EARTH_SAMPLE_WORLD", True):
+        earth_sample_world = (
+            db.session.query(WorldInstance)
+            .filter(WorldInstance.universe_db_id == universe.id)
+            .filter(WorldInstance.world_id == earth_sample_world_id)
+            .first()
+        )
+        if earth_sample_world is None:
+            from src.georeferencing.contracts import (
+                GlobalCoordinate,
+                GlobalReferencePoint,
+            )
+            from src.georeferencing.crs import canonical_geographic_crs
+            from src.world.earth.sample_data import get_earth_sample_data
+            from src.world.earth.validator import load_earth_world_definition
+
+            sample = get_earth_sample_data()
+            longitude, latitude, height_m = sample.query_coordinate
+            earth_definition = load_earth_world_definition()
+            earth_reference = GlobalReferencePoint(
+                coordinate=GlobalCoordinate.from_values(
+                    str(longitude),
+                    str(latitude),
+                    str(height_m),
+                ),
+                crs=canonical_geographic_crs(),
+                grid=earth_definition.to_earth_grid_definition().grid,
+                reference_version=1,
+                source="earth-bigdata-sample.v1",
+            )
+            earth_sample_world = WorldInstance.create_earth_spawn(
+                global_reference=earth_reference,
+                project_db_id=project.id,
+                universe_db_id=universe.id,
+                world_id=earth_sample_world_id,
+                slug="earth-sample",
+                name="Earth BigData Sample World",
+                created_by_user_id=owner_auth_user_id,
+                block_registry_id=block_registry_id,
+                block_registry_version=block_registry_version,
+                metadata_json={
+                    "seed": True,
+                    "createdBy": "bootstrap_db.py",
+                    "sampleSchemaVersion": "earth-bigdata-sample.v1",
+                    "sampleSourceFingerprint": sample.source_fingerprint,
+                },
+            )
+            db.session.add(earth_sample_world)
+            db.session.flush()
+            created.append("EarthSampleWorldInstance")
+        else:
+            reused.append("EarthSampleWorldInstance")
+
     project_access = _ensure_project_access_inner(
         project,
         owner_auth_user_id,
@@ -2159,6 +2217,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
         "defaultProjectReady": True,
         "defaultUniverseReady": True,
         "defaultWorldReady": True,
+        "earthSampleWorldReady": earth_sample_world is not None,
         "blockRegistryReady": True,
         "projectAccessReady": True,
         "projectOwnerAuthUserId": owner_auth_user_id,
@@ -2176,6 +2235,7 @@ def _direct_seed_defaults_inner() -> dict[str, Any]:
             "projectId": project_id,
             "universeId": universe_id,
             "worldId": world_id,
+            "earthSampleWorldId": earth_sample_world_id,
             "templateId": template_id,
             "providerId": provider_id,
             "providerWorldId": provider_world_id,
