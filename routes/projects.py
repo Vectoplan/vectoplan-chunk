@@ -58,16 +58,19 @@ import json
 import os
 from collections.abc import Mapping
 from typing import Any, Optional
+from threading import Thread
 
 from flask import Blueprint, current_app, jsonify, request
 
 try:
     from sqlalchemy import or_
     from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+    from sqlalchemy.orm import noload
 except Exception:  # pragma: no cover
     or_ = None  # type: ignore[assignment]
     IntegrityError = Exception  # type: ignore[misc,assignment]
     SQLAlchemyError = Exception  # type: ignore[misc,assignment]
+    noload = None  # type: ignore[assignment]
 
 from extensions import db, get_database_status
 from models import (
@@ -632,6 +635,18 @@ def _model_value(obj: Any, name: str, fallback: Any = None) -> Any:
         return getattr(obj, name, fallback)
     except Exception:
         return fallback
+
+
+def _without_automatic_relationships(query):
+    '''Keep project API reads scoped to the explicitly requested rows.
+
+    Several model backrefs intentionally use ``selectin`` for runtime graph
+    operations.  Project detail/list endpoints serialize their child rows
+    explicitly and must not prefetch snapshots, command logs and events.
+    '''
+    if noload is None:
+        return query
+    return query.options(noload('*'))
 
 
 def _serialize_model_fields(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
@@ -1245,7 +1260,7 @@ def _project_query_by_identifier(project_id: str, *, include_deleted: bool = Fal
     if not filters:
         raise RuntimeError("Project model has no supported project identifier field.")
 
-    query = Project.query
+    query = _without_automatic_relationships(Project.query)
 
     if or_ is not None and len(filters) > 1:
         query = query.filter(or_(*filters))
@@ -1333,7 +1348,7 @@ def _query_project_by_app_project_id(
             except Exception:
                 continue
 
-    query = Project.query
+    query = _without_automatic_relationships(Project.query)
 
     if filters:
         if or_ is not None and len(filters) > 1:
@@ -1345,7 +1360,7 @@ def _query_project_by_app_project_id(
             return None
 
         try:
-            candidates = Project.query.all()
+            candidates = _without_automatic_relationships(Project.query).all()
         except Exception:
             return None
 
@@ -1378,7 +1393,7 @@ def _get_project_default_universe(
     project_db_id = _model_value(project, "id")
     universe_id = _model_value(project, "default_universe_id") or _get_default_universe_id()
 
-    query = Universe.query
+    query = _without_automatic_relationships(Universe.query)
 
     if _model_supports_attr(Universe, "project_db_id") and project_db_id is not None:
         query = query.filter(Universe.project_db_id == project_db_id)
@@ -1394,7 +1409,7 @@ def _get_project_default_universe(
     universe = query.one_or_none()
 
     if universe is None:
-        fallback_query = Universe.query
+        fallback_query = _without_automatic_relationships(Universe.query)
 
         if _model_supports_attr(Universe, "project_db_id") and project_db_id is not None:
             fallback_query = fallback_query.filter(Universe.project_db_id == project_db_id)
@@ -1431,7 +1446,7 @@ def _get_universe_spawn_world(
     if _provider_like_world_id(world_id):
         world_id = _get_default_world_id()
 
-    query = WorldInstance.query
+    query = _without_automatic_relationships(WorldInstance.query)
 
     if _model_supports_attr(WorldInstance, "universe_db_id") and universe_db_id is not None:
         query = query.filter(WorldInstance.universe_db_id == universe_db_id)
@@ -1449,7 +1464,7 @@ def _get_universe_spawn_world(
     default_world_id = _model_value(universe, "default_world_id")
 
     if world is None and default_world_id and default_world_id != world_id and not _provider_like_world_id(default_world_id):
-        fallback_query = WorldInstance.query
+        fallback_query = _without_automatic_relationships(WorldInstance.query)
 
         if _model_supports_attr(WorldInstance, "universe_db_id") and universe_db_id is not None:
             fallback_query = fallback_query.filter(WorldInstance.universe_db_id == universe_db_id)
@@ -1465,7 +1480,7 @@ def _get_universe_spawn_world(
         world = fallback_query.one_or_none()
 
     if world is None:
-        fallback_query = WorldInstance.query
+        fallback_query = _without_automatic_relationships(WorldInstance.query)
 
         if _model_supports_attr(WorldInstance, "universe_db_id") and universe_db_id is not None:
             fallback_query = fallback_query.filter(WorldInstance.universe_db_id == universe_db_id)
@@ -1609,7 +1624,7 @@ def _serialize_project_bootstrap(
     }
 
     if include_worlds:
-        worlds_query = WorldInstance.query
+        worlds_query = _without_automatic_relationships(WorldInstance.query)
         if _model_supports_attr(WorldInstance, "universe_db_id"):
             worlds_query = worlds_query.filter(WorldInstance.universe_db_id == _model_value(universe, "id"))
         elif _model_supports_attr(WorldInstance, "universe_id"):
@@ -1962,7 +1977,7 @@ def _query_projects(
     search: str = "",
 ):
     """Build project list query."""
-    query = Project.query
+    query = _without_automatic_relationships(Project.query)
 
     if not include_deleted and _model_supports_attr(Project, "deleted_at"):
         query = query.filter(Project.deleted_at.is_(None))
@@ -2023,7 +2038,7 @@ def _serialize_project_detail(
 
     project_db_id = _model_value(project, "id")
     project_public_id = _get_project_public_id(project)
-    universes_query = Universe.query
+    universes_query = _without_automatic_relationships(Universe.query)
     if _model_supports_attr(Universe, "project_db_id") and project_db_id is not None:
         universes_query = universes_query.filter_by(project_db_id=project_db_id)
     elif _model_supports_attr(Universe, "project_id"):
@@ -2051,7 +2066,7 @@ def _serialize_project_detail(
             )
 
         if include_worlds:
-            worlds_query = WorldInstance.query
+            worlds_query = _without_automatic_relationships(WorldInstance.query)
             if _model_supports_attr(WorldInstance, "universe_db_id"):
                 worlds_query = worlds_query.filter_by(universe_db_id=_model_value(universe, "id"))
             elif _model_supports_attr(WorldInstance, "universe_id"):
@@ -2111,6 +2126,87 @@ def _provisioning_unavailable_response():
     )
 
 
+
+def _schedule_earth_terrain_preparation(result: Any) -> bool:
+    """Kick off Earth DGM preparation after the provisioning commit."""
+    if not _get_config_bool(
+        'VECTOPLAN_CHUNK_TERRAIN_PREPARE_ON_PROJECT_SAVE',
+        True,
+    ):
+        return False
+
+    if isinstance(result, Mapping):
+        ok = bool(result.get('ok'))
+        world_template = _coerce_string(
+            result.get('worldTemplate') or result.get('world_template')
+        ).lower()
+        ids = result.get('ids') if isinstance(result.get('ids'), Mapping) else {}
+        world_id = _coerce_string(
+            result.get('chunkWorldId')
+            or result.get('chunk_world_id')
+            or ids.get('chunkWorldId')
+        )
+    else:
+        ok = bool(getattr(result, 'ok', False))
+        world_template = _coerce_string(
+            getattr(result, 'world_template', '')
+        ).lower()
+        world_id = _coerce_string(
+            getattr(result, 'chunk_world_id', '')
+        )
+
+    if not ok or world_template != WORLD_TEMPLATE_EARTH or not world_id:
+        return False
+
+    flask_app = current_app._get_current_object()
+
+    def prepare() -> None:
+        with flask_app.app_context():
+            try:
+                query = _without_automatic_relationships(WorldInstance.query)
+                world = query.filter(WorldInstance.world_id == world_id).one_or_none()
+                if world is None:
+                    flask_app.logger.warning(
+                        'Earth terrain preparation skipped: world %s was not found.',
+                        world_id,
+                    )
+                    return
+                build_provider = getattr(world, 'build_earth_provider', None)
+                if not callable(build_provider):
+                    raise RuntimeError(
+                        f"Earth world '{world_id}' has no coordinate provider."
+                    )
+                from src.world.earth.terrain_pipeline import (
+                    get_earth_terrain_region_preview,
+                )
+
+                preview = get_earth_terrain_region_preview(
+                    world=world,
+                    provider=build_provider(),
+                )
+                flask_app.logger.info(
+                    'Earth terrain preparation for world %s: %s',
+                    world_id,
+                    preview.get('status'),
+                )
+            except Exception:
+                flask_app.logger.exception(
+                    'Earth terrain preparation kickoff failed for world %s.',
+                    world_id,
+                )
+            finally:
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass
+
+    Thread(
+        target=prepare,
+        name=f'earth-terrain-kickoff-{world_id[:32]}',
+        daemon=True,
+    ).start()
+    return True
+
 def _wrap_provisioning_result(result: Any, *, metadata: Mapping[str, Any] | None = None):
     """Convert provisioning result to HTTP response."""
     if hasattr(result, "to_dict"):
@@ -2129,10 +2225,13 @@ def _wrap_provisioning_result(result: Any, *, metadata: Mapping[str, Any] | None
         }
         status_code = 500
 
+    terrain_preparation_scheduled = _schedule_earth_terrain_preparation(result)
+
     body.setdefault("responseVersion", PROJECT_PROVISION_RESPONSE_VERSION)
     body["metadata"] = _route_metadata(
         {
             "provisioningAvailable": _provisioning_available(),
+            "terrainPreparationScheduled": terrain_preparation_scheduled,
             **dict(metadata or {}),
         }
     )
@@ -3284,7 +3383,7 @@ def _soft_delete_project_graph_response(
         project_changed = True
 
     project_db_id = _model_value(project, "id")
-    universes_query = Universe.query
+    universes_query = _without_automatic_relationships(Universe.query)
     if _model_supports_attr(Universe, "project_db_id") and project_db_id is not None:
         universes_query = universes_query.filter_by(project_db_id=project_db_id)
     universes = universes_query.all()
@@ -3300,7 +3399,7 @@ def _soft_delete_project_graph_response(
             _set_model_value_if_supported(universe, "status", "deleted", overwrite=True)
         universes_changed += 1
 
-    worlds_query = WorldInstance.query
+    worlds_query = _without_automatic_relationships(WorldInstance.query)
     if _model_supports_attr(WorldInstance, "project_db_id") and project_db_id is not None:
         worlds_query = worlds_query.filter_by(project_db_id=project_db_id)
     elif universes and _model_supports_attr(WorldInstance, "universe_db_id"):

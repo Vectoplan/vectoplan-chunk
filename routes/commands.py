@@ -1590,14 +1590,25 @@ def _try_generate_for_world_instance(
             )
 
         provider = build_provider()
-        generate_chunk = getattr(provider, "generate_chunk", None)
-        if not callable(generate_chunk):
+        terrain_module = importlib.import_module(
+            'src.world.earth.terrain_pipeline'
+        )
+        generate_terrain = getattr(
+            terrain_module,
+            'generate_earth_terrain_chunk',
+            None,
+        )
+        if not callable(generate_terrain):
             raise RuntimeError(
-                "EarthWorldProvider.generate_chunk is unavailable."
+                'Earth terrain pipeline is unavailable.'
             )
 
-        generated = generate_chunk(
-            (int(chunk_x), int(chunk_y), int(chunk_z))
+        generated = generate_terrain(
+            world=world,
+            provider=provider,
+            chunk_x=int(chunk_x),
+            chunk_y=int(chunk_y),
+            chunk_z=int(chunk_z),
         )
     except Exception as exc:
         raise RuntimeError(

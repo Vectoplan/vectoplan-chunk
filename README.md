@@ -8,6 +8,8 @@ Kurz gesagt:
 
 **Der Chunk-Service ist die operative Wahrheit der editierbaren Chunk-Welt. Unberührte Chunks werden generiert. Bearbeitete Chunks werden als Snapshots gespeichert. Jede bestätigte Änderung wird zusätzlich als Event-Historie gespeichert.**
 
+Für Earth-Welten ist zusätzlich die produktive DGM-Pipeline angeschlossen. Die vollständige serviceübergreifende Beschreibung einschließlich Freigabe, Höhenindex, Releasewechsel, Cache-Schichten, RLE-Batches, Karten-Prefetch, Spawn, Meshing und Live-Diagnose steht in [`docs/EARTH_DGM_PIPELINE.md`](docs/EARTH_DGM_PIPELINE.md).
+
 ---
 
 ## Inhalt
@@ -24,6 +26,7 @@ Kurz gesagt:
 - [API-Grundform](#api-grundform)
 - [Empfohlene Service-Struktur](#empfohlene-service-struktur)
 - [Datenfluss](#datenfluss)
+- [Earth-DGM-Pipeline](docs/EARTH_DGM_PIPELINE.md)
 - [Entwicklungsreihenfolge](#entwicklungsreihenfolge)
 - [Wichtige Invarianten](#wichtige-invarianten)
 - [Offene spätere Themen](#offene-spätere-themen)

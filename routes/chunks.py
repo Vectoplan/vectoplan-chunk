@@ -43,6 +43,7 @@ from __future__ import annotations
 import importlib
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, Optional
@@ -1161,14 +1162,25 @@ def _try_generate_for_world_instance(
             )
 
         provider = build_provider()
-        generate_chunk = getattr(provider, "generate_chunk", None)
-        if not callable(generate_chunk):
+        terrain_module = importlib.import_module(
+            'src.world.earth.terrain_pipeline'
+        )
+        generate_terrain = getattr(
+            terrain_module,
+            'generate_earth_terrain_chunk',
+            None,
+        )
+        if not callable(generate_terrain):
             raise RuntimeError(
-                "EarthWorldProvider.generate_chunk is unavailable."
+                'Earth terrain pipeline is unavailable.'
             )
 
-        generated = generate_chunk(
-            (int(chunk_x), int(chunk_y), int(chunk_z))
+        generated = generate_terrain(
+            world=world,
+            provider=provider,
+            chunk_x=int(chunk_x),
+            chunk_y=int(chunk_y),
+            chunk_z=int(chunk_z),
         )
     except Exception as exc:
         raise RuntimeError(
@@ -1275,6 +1287,45 @@ def _runtime_content_from_generated(
     if stats is None:
         stats = _extract_value(wrapper, "stats", "generationStats", fallback=None)
 
+    terrain = _extract_value(candidate, 'terrain', fallback=None)
+    if terrain is None:
+        terrain = _extract_value(wrapper, 'terrain', fallback=None)
+
+    surface_y_by_column = _extract_value(
+        candidate,
+        'surfaceYByColumn',
+        'surface_y_by_column',
+        fallback=None,
+    )
+    if surface_y_by_column is None:
+        surface_y_by_column = _extract_value(
+            wrapper,
+            'surfaceYByColumn',
+            'surface_y_by_column',
+            fallback=None,
+        )
+
+    chunk_version = _extract_value(
+        candidate,
+        'chunkVersion',
+        'chunk_version',
+        fallback=None,
+    )
+    if chunk_version is None:
+        chunk_version = _extract_value(
+            wrapper,
+            'chunkVersion',
+            'chunk_version',
+            fallback=None,
+        )
+
+    generation_mode = _extract_value(
+        candidate,
+        'generationMode',
+        'generation_mode',
+        fallback=None,
+    )
+
     runtime: dict[str, Any] = {
         "projectId": project.project_id,
         "universeId": universe.universe_id,
@@ -1314,8 +1365,25 @@ def _runtime_content_from_generated(
         "cellSize": world.cell_size,
     }
 
+    if chunk_version is not None:
+        runtime['chunkVersion'] = _coerce_string(chunk_version)
+
+    if generation_mode is not None:
+        runtime['generationMode'] = _coerce_string(generation_mode)
+
     if isinstance(stats, Mapping):
         runtime["stats"] = _make_json_safe(dict(stats), max_depth=20)
+
+    if isinstance(terrain, Mapping):
+        runtime['terrain'] = _make_json_safe(dict(terrain), max_depth=20)
+
+    if isinstance(surface_y_by_column, Sequence) and not isinstance(
+        surface_y_by_column,
+        (str, bytes, bytearray),
+    ):
+        runtime['surfaceYByColumn'] = [
+            int(value) for value in surface_y_by_column
+        ]
 
     if content_hash is not None:
         runtime["contentHash"] = _coerce_string(content_hash)
@@ -1662,6 +1730,72 @@ def _serialize_snapshot_metadata(
         }
 
 
+def _compact_chunk_cells(chunk: dict[str, Any]) -> None:
+    # Opt-in wire representation; canonical caches and snapshots stay dense.
+    cells = chunk.get('cells')
+    if not isinstance(cells, list) or not cells:
+        return
+
+    runs: list[int] = []
+    previous = cells[0]
+    count = 1
+    for value in cells[1:]:
+        if value == previous and count < 2_147_483_647:
+            count += 1
+            continue
+        runs.extend((int(previous), count))
+        previous = value
+        count = 1
+    runs.extend((int(previous), count))
+
+    if len(runs) >= len(cells):
+        return
+
+    chunk['cells'] = {
+        'encoding': 'rle-value-count.v1',
+        'decodedCellCount': len(cells),
+        'runCount': len(runs) // 2,
+        'runs': runs,
+    }
+
+SURFACE_SHELL_PROFILE = 'surface-shell.v1'
+SURFACE_SHELL_DEPTH = 5
+IMPLICIT_SOLID_CELL_VALUE = -1
+
+
+def _requested_chunk_content_profile() -> str:
+    header_profile = request.headers.get(
+        'X-Vectoplan-Chunk-Content-Profile',
+        '',
+    ).strip().lower()
+
+    requested = _get_query_string(
+        'contentProfile',
+        'content_profile',
+        fallback='',
+    ).strip().lower()
+    if header_profile:
+        requested = header_profile
+    if requested in {'full', 'dense', 'canonical'}:
+        return 'full'
+    if requested in {'surface', 'surface-shell', SURFACE_SHELL_PROFILE}:
+        return SURFACE_SHELL_PROFILE
+    if 'vectoplan-editor' in request.headers.get('User-Agent', '').lower():
+        return SURFACE_SHELL_PROFILE
+    return 'full'
+
+
+def _apply_surface_shell(chunk: dict[str, Any]) -> bool:
+    from src.world.earth.terrain_pipeline import apply_earth_surface_shell
+
+    return apply_earth_surface_shell(
+        chunk,
+        depth=SURFACE_SHELL_DEPTH,
+        implicit_solid_value=IMPLICIT_SOLID_CELL_VALUE,
+    )
+
+
+
 def _serialize_chunk_load_result(
     *,
     project: Project,
@@ -1671,6 +1805,7 @@ def _serialize_chunk_load_result(
     include_context: bool = False,
     include_snapshot_metadata: bool = True,
     include_route_hints: bool = True,
+    compact_cells: bool = False,
     api_prefix: str = "",
 ) -> dict[str, Any]:
     """Serialize one chunk load result."""
@@ -1694,6 +1829,15 @@ def _serialize_chunk_load_result(
             "createdSnapshot": bool(result.get("createdSnapshot")),
         },
     }
+
+    if (
+        result.get('source') == 'generated'
+        and _requested_chunk_content_profile() == SURFACE_SHELL_PROFILE
+    ):
+        _apply_surface_shell(body['chunk'])
+
+    if compact_cells or 'vectoplan-editor' in request.headers.get('User-Agent', '').lower():
+        _compact_chunk_cells(body['chunk'])
 
     if include_context:
         body["context"] = {
@@ -1898,6 +2042,69 @@ def get_project_world_chunk(project_id: str, world_id: str):
         return _error_response(exc)
 
 
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/terrain/region")
+def get_project_world_terrain_region(project_id: str, world_id: str):
+    """Return the prepared low-resolution Earth terrain map for one project."""
+    try:
+        universe_id = _get_query_string(
+            "universeId",
+            "universe_id",
+            fallback="",
+        ) or None
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+            include_deleted=False,
+        )
+        template_id = _coerce_string(getattr(world, "template_id", "")).lower()
+        provider_world_id = _coerce_string(
+            getattr(world, "provider_world_id", "")
+        ).lower()
+        if template_id != "earth" and provider_world_id != "earth":
+            raise ValueError(
+                "Eine vorbereitete Terrain-Region ist nur fuer Earth-Welten verfuegbar."
+            )
+        build_provider = getattr(world, "build_earth_provider", None)
+        if not callable(build_provider):
+            raise RuntimeError(
+                "Die Earth-Welt stellt keinen Koordinatenprovider bereit."
+            )
+        from src.world.earth.terrain_pipeline import (
+            get_earth_terrain_region_preview,
+        )
+
+        region = get_earth_terrain_region_preview(
+            world=world,
+            provider=build_provider(),
+        )
+        return _json_response(
+            _ok_response(
+                response_version="earth-terrain-region-response.v1",
+                payload={
+                    "projectId": project.project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "terrainRegion": region,
+                },
+                metadata={
+                    "projectScoped": True,
+                    "worldTemplate": template_id,
+                },
+            ),
+            200,
+        )
+    except LookupError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="terrain_region_not_found", status_code=404)
+    except ValueError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="terrain_region_not_supported", status_code=400)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc, code="terrain_region_failed", status_code=500)
+
+
 @chunks_bp.post("/projects/<project_id>/worlds/<world_id>/chunks/batch")
 def post_project_world_chunks_batch(project_id: str, world_id: str):
     """
@@ -1957,24 +2164,88 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
         snapshot_count = 0
         generated_count = 0
 
-        for item in chunk_items:
+        parallel_outcomes: Optional[list[Any]] = None
+        parallel_generation = bool(
+            getattr(world, "is_earth_world", False)
+            and allow_generated
+            and not materialize_generated
+            and len(chunk_items) > 1
+        )
+        if parallel_generation:
+            flask_app = current_app._get_current_object()
+            worker_count = max(
+                1,
+                min(
+                    8,
+                    len(chunk_items),
+                    int(os.getenv("VECTOPLAN_CHUNK_BATCH_GENERATION_WORKERS", "6")),
+                ),
+            )
+
+            def load_parallel(item: Mapping[str, Any]) -> Any:
+                with flask_app.app_context():
+                    try:
+                        worker_project, worker_universe, worker_world = (
+                            _resolve_project_world_context(
+                                project.project_id,
+                                world.world_id,
+                                universe_id=universe.universe_id,
+                                include_deleted=include_deleted,
+                            )
+                        )
+                        return _load_or_generate_chunk(
+                            project=worker_project,
+                            universe=worker_universe,
+                            world=worker_world,
+                            chunk_x=item["chunkX"],
+                            chunk_y=item["chunkY"],
+                            chunk_z=item["chunkZ"],
+                            include_deleted_snapshots=include_deleted,
+                            prefer_snapshot=prefer_snapshot,
+                            allow_generated=allow_generated,
+                            materialize_generated=False,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
+                    except BaseException as exc:
+                        _safe_rollback()
+                        return exc
+                    finally:
+                        try:
+                            db.session.remove()
+                        except Exception:
+                            pass
+
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="earth-chunk-batch",
+            ) as executor:
+                parallel_outcomes = list(executor.map(load_parallel, chunk_items))
+
+        for item_index, item in enumerate(chunk_items):
             requested.append(dict(item))
 
             try:
-                result = _load_or_generate_chunk(
-                    project=project,
-                    universe=universe,
-                    world=world,
-                    chunk_x=item["chunkX"],
-                    chunk_y=item["chunkY"],
-                    chunk_z=item["chunkZ"],
-                    include_deleted_snapshots=include_deleted,
-                    prefer_snapshot=prefer_snapshot,
-                    allow_generated=allow_generated,
-                    materialize_generated=materialize_generated,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
+                if parallel_outcomes is not None:
+                    outcome = parallel_outcomes[item_index]
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    result = outcome
+                else:
+                    result = _load_or_generate_chunk(
+                        project=project,
+                        universe=universe,
+                        world=world,
+                        chunk_x=item["chunkX"],
+                        chunk_y=item["chunkY"],
+                        chunk_z=item["chunkZ"],
+                        include_deleted_snapshots=include_deleted,
+                        prefer_snapshot=prefer_snapshot,
+                        allow_generated=allow_generated,
+                        materialize_generated=materialize_generated,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
 
                 if result.get("source") == "snapshot":
                     snapshot_count += 1
