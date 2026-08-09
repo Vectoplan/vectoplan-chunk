@@ -985,7 +985,7 @@ Sicherstellen:
 * CRS-Transformation startet ohne Netzwerkzugriff;
 * keine Transformationsgitter während der Runtime automatisch herunterladen.
 
-## 4.28 `docker-compose.all.yml`
+## 4.28 `docker-compose.yml`
 
 Ergänzen:
 

@@ -535,7 +535,7 @@ DB-Initialisierung ist aus Runtime herausgezogen.
 Aktuell relevant:
 
 ```text
-services/vectoplan-server/docker-compose.all.yml
+services/vectoplan-server/docker-compose.yml
 ```
 
 Wichtige Entscheidung:
@@ -1308,7 +1308,7 @@ src/bootstrap/default_seed.py
 src/bootstrap/db_bootstrap.py
 routes/projects.py
 models/world.py
-docker-compose.all.yml
+docker-compose.yml
 ```
 
 Bereits zuvor wichtig:
@@ -2742,7 +2742,7 @@ Runtime-Start ist nicht DB-Bootstrap.
 
 ---
 
-### 11.6 `docker-compose.all.yml`
+### 11.6 `docker-compose.yml`
 
 Aktueller Stand:
 
@@ -4498,7 +4498,7 @@ Damit ist der erste Backend-Stand für die editierbare Chunk-Welt und die App-/E
 ### 24.1 Infrastruktur
 
 ```text
-services/vectoplan-server/docker-compose.all.yml
+services/vectoplan-server/docker-compose.yml
 ```
 
 Wichtigste Änderung:
@@ -7853,7 +7853,7 @@ Die bisherigen Flat-, Systemblock-, Snapshot-, Event-, Command-, Bootstrap- und 
 Bestätigter Build:
 
 ```text
-docker compose -f docker-compose.all.yml build --no-cache vectoplan-chunk
+docker compose -f docker-compose.yml build --no-cache vectoplan-chunk
 → erfolgreich
 → Python 3.12-slim
 → requirements installiert
@@ -7864,7 +7864,7 @@ docker compose -f docker-compose.all.yml build --no-cache vectoplan-chunk
 Bestätigter Recreate:
 
 ```text
-docker compose -f docker-compose.all.yml up -d --force-recreate vectoplan-chunk
+docker compose -f docker-compose.yml up -d --force-recreate vectoplan-chunk
 → PostgreSQL healthy
 → Init-Container erfolgreich beendet
 → Runtime-Container gestartet
@@ -7887,9 +7887,9 @@ vectoplan-chunk-db
 Aktuelle Compose-Service-Namen werden über die Compose-Datei angesprochen. Für neue PowerShell-Befehle ist deshalb zu bevorzugen:
 
 ```powershell
-docker compose -f docker-compose.all.yml ps
+docker compose -f docker-compose.yml ps
 
-docker compose -f docker-compose.all.yml logs `
+docker compose -f docker-compose.yml logs `
   --tail 200 `
   vectoplan-chunk
 ```
@@ -9275,7 +9275,7 @@ $BASE = "http://localhost:5102"
 Container:
 
 ```powershell
-docker compose -f docker-compose.all.yml ps
+docker compose -f docker-compose.yml ps
 ```
 
 Project-/Access-Readiness:

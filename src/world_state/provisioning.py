@@ -216,7 +216,7 @@ def _default_world_template_contracts() -> Mapping[str, Mapping[str, Any]]:
                 "provider_id": "earth",
                 "provider_world_id": "earth",
                 "generator_type": "earth-flat-periodic",
-                "generator_version": "1",
+                "generator_version": "2",
                 "projection_type": "vectoplan-periodic-equirectangular",
                 "topology_type": "periodic-x-v1",
                 "coordinate_system": "vectoplan-earth-grid-v1",
@@ -3361,39 +3361,48 @@ def _floor_precise_spawn_value(value: Any, *, field_name: str) -> int:
     return int(number.to_integral_value(rounding=ROUND_FLOOR))
 
 
-def _synchronize_earth_spawn_from_precise(world: Any) -> bool:
+def _synchronize_earth_spawn_from_sample(world: Any) -> bool:
     """
-    Keep integer and precise Earth spawn coordinates internally consistent.
+    Keep every Earth project on the walkable sample-data spawn.
 
-    ``WorldInstance.create_earth_spawn`` derives ``spawn_*_precise`` from the
-    canonical reference and stores integer coordinates using mathematical floor.
-    Provisioning must never replace those values with Flat/default configuration.
-    Existing rows created by the previous policy are repaired idempotently when
-    their precise fields are available.
+    The temporary Earth generator reads water, terrain and geological layers
+    from the bundled BigData sample. Its spawn is part of that data contract,
+    so existing provisioned worlds must be reconciled when the sample changes.
+    Moving this local player spawn does not re-anchor the immutable global
+    Earth reference.
     """
 
+    try:
+        from ..world.earth.sample_data import get_earth_sample_data
+    except ImportError:  # pragma: no cover - top-level tooling import mode.
+        from src.world.earth.sample_data import get_earth_sample_data
+
+    sample_spawn = get_earth_sample_data().spawn_local_m
     pairs = (
-        ("spawn_x", "spawn_x_precise"),
-        ("spawn_y", "spawn_y_precise"),
-        ("spawn_z", "spawn_z_precise"),
+        ("spawn_x", "spawn_x_precise", sample_spawn[0]),
+        ("spawn_y", "spawn_y_precise", sample_spawn[1]),
+        ("spawn_z", "spawn_z_precise", sample_spawn[2]),
     )
-    available = [
-        (integer_field, precise_field)
-        for integer_field, precise_field in pairs
-        if _supports_attr(world, precise_field)
-        and _get_attr(world, precise_field, None) not in (None, "")
-    ]
-
-    if not available:
-        # Compatibility with model variants that do not persist precise spawn
-        # columns: preserve the values produced by the Earth factory.
-        return False
 
     changed = False
-    for integer_field, precise_field in available:
+    for integer_field, precise_field, sample_value in pairs:
+        normalized = Decimal(str(sample_value))
+        if not normalized.is_finite():
+            raise ProvisioningError(
+                "earth_sample_spawn_invalid",
+                "Earth sample spawn contains a non-finite coordinate.",
+                details={"field": precise_field},
+                status_code=500,
+            )
+        if _supports_attr(world, precise_field):
+            changed = _set_if_changed(
+                world,
+                precise_field,
+                normalized,
+            ) or changed
         derived = _floor_precise_spawn_value(
-            _get_attr(world, precise_field, None),
-            field_name=f"WorldInstance.{precise_field}",
+            normalized,
+            field_name=f"EarthSampleData.{precise_field}",
         )
         changed = _set_if_changed(world, integer_field, derived) or changed
     return changed
@@ -3602,7 +3611,7 @@ def _apply_world_state(
         ) or changed
 
     if selection.is_earth:
-        changed = _synchronize_earth_spawn_from_precise(world) or changed
+        changed = _synchronize_earth_spawn_from_sample(world) or changed
     else:
         for field_name in ("spawn_x", "spawn_y", "spawn_z"):
             changed = _set_if_changed(

@@ -1,0 +1,101 @@
+{
+  "$comment": "Example response contract for the future Earth big-data scraper/storage query. This file is intentionally consumed by the Earth generator until real datasets are available.",
+  "schemaVersion": "earth-bigdata-sample.v1",
+  "query": {
+    "coordinate": {
+      "crs": "EPSG:4979",
+      "longitude": 8.682127,
+      "latitude": 50.110924,
+      "heightM": 112.0
+    },
+    "radiusM": 64,
+    "datasets": [
+      "terrain-surface",
+      "hydrography",
+      "geology"
+    ]
+  },
+  "response": {
+    "localOriginM": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "spawnLocalM": {
+      "x": 8.5,
+      "y": 2.0,
+      "z": 8.5
+    },
+    "coverageLocalBlocks": {
+      "minimumX": -64,
+      "maximumX": 63,
+      "minimumZ": -64,
+      "maximumZ": 63
+    },
+    "palette": [
+      {
+        "blockTypeId": "system_terrain_humus",
+        "label": "Terrain · Humus",
+        "solid": true,
+        "placeable": true,
+        "breakable": true,
+        "color": "#526f35",
+        "terrainSubtype": "humus"
+      },
+      {
+        "blockTypeId": "system_terrain_soil",
+        "label": "Terrain · Erdreich",
+        "solid": true,
+        "placeable": true,
+        "breakable": true,
+        "color": "#76543a",
+        "terrainSubtype": "soil"
+      },
+      {
+        "blockTypeId": "system_terrain_rock",
+        "label": "Terrain · Fels",
+        "solid": true,
+        "placeable": true,
+        "breakable": true,
+        "color": "#6e7376",
+        "terrainSubtype": "rock"
+      },
+      {
+        "blockTypeId": "system_water",
+        "label": "Wasser",
+        "solid": false,
+        "placeable": false,
+        "breakable": true,
+        "color": "#2f82d8",
+        "terrainSubtype": null
+      },
+      {
+        "blockTypeId": "system_terrain",
+        "label": "Terrain",
+        "solid": true,
+        "placeable": true,
+        "breakable": true,
+        "color": "#7a5a3a",
+        "terrainSubtype": "generic"
+      }
+    ],
+    "terrain": {
+      "landSurfaceY": 0,
+      "humusDepth": 1,
+      "soilDepth": 2,
+      "minimumTerrainY": -8
+    },
+    "waterBodies": [
+      {
+        "id": "sample-pond",
+        "shape": "rectangle",
+        "minimumX": 20,
+        "maximumX": 31,
+        "minimumZ": 3,
+        "maximumZ": 14,
+        "bedSurfaceY": -2,
+        "waterSurfaceY": 0
+      }
+    ]
+  }
+}

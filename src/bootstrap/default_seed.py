@@ -108,6 +108,7 @@ try:
         build_seed_bootstrap_settings,
         build_world_defaults_settings,
         get_bool_setting,
+        get_str_setting,
     )
 except Exception:  # pragma: no cover - fallback for direct import tests
     BlockDefaultsSettings = Any  # type: ignore[misc, assignment]
@@ -149,6 +150,20 @@ except Exception:  # pragma: no cover - fallback for direct import tests
         return default
 
 
+    def get_str_setting(
+        app: Any,
+        key: str,
+        default: str = "",
+        aliases: Sequence[str] | None = None,
+        prefer_env: bool = True,
+    ) -> str:
+        try:
+            value = getattr(app, "config", {}).get(key, default)
+        except Exception:
+            value = default
+        text_value = str(value).strip()
+        return text_value or default
+
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
@@ -179,6 +194,9 @@ DEFAULT_WORLD_NAME: Final[str] = "Flat Spawn World"
 DEFAULT_TEMPLATE_ID: Final[str] = "flat"
 DEFAULT_PROVIDER_ID: Final[str] = "flat"
 DEFAULT_PROVIDER_WORLD_ID: Final[str] = "flat"
+
+DEFAULT_EARTH_SAMPLE_WORLD_ID: Final[str] = "world_earth_sample"
+DEFAULT_EARTH_SAMPLE_SCHEMA_VERSION: Final[str] = "earth-bigdata-sample.v1"
 
 DEFAULT_BLOCK_REGISTRY_ID: Final[str] = "debug-blocks"
 DEFAULT_BLOCK_REGISTRY_VERSION: Final[str] = "1"
@@ -2570,6 +2588,7 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
         "defaultUniverseId": universe_id,
         "defaultWorldId": world_id,
         "spawnWorldId": world_id,
+        "appProjectId": project_id,
     }
 
     create_dev_project = getattr(model_class, "create_dev_project", None)
@@ -2597,6 +2616,7 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
                 "default_universe_id": universe_id,
                 "default_world_id": world_id,
                 "spawn_world_id": world_id,
+                "external_app_project_id": project_id,
                 "owner_user_id": owner_user_id,
                 "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
                 "metadata_json": metadata_json,
@@ -2606,6 +2626,7 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
                 "name": project_name,
                 "default_universe_id": universe_id,
                 "default_world_id": world_id,
+                "external_app_project_id": project_id,
                 "owner_type": "user",
                 "owner_id": owner_user_id,
                 "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
@@ -2633,6 +2654,7 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
         "default_universe_id": universe_id,
         "default_world_id": world_id,
         "spawn_world_id": world_id,
+        "external_app_project_id": project_id,
         "owner_type": "user",
         "owner_id": owner_user_id,
         "created_by_user_id": DEFAULT_PROJECT_ACCESS_ACTOR_USER_ID,
@@ -2649,6 +2671,7 @@ def create_project_object(model_class: Any, world_defaults: Any) -> Any:
 def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
     """Repair default world references and preserve the canonical auth owner."""
     changed = False
+    project_id = _resolve_project_id(world_defaults)
     universe_id = _resolve_universe_id(world_defaults)
     world_id = _resolve_world_id(world_defaults)
     owner_user_id = _resolve_effective_project_owner_user_id(
@@ -2742,6 +2765,12 @@ def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
         overwrite=True,
     ) or changed
 
+    changed = _set_attr_if_supported(
+        project,
+        "external_app_project_id",
+        project_id,
+        overwrite=False,
+    ) or changed
     changed = _set_attr_if_supported(project, "status", "active", overwrite=False) or changed
     changed = _set_attr_if_supported(
         project,
@@ -2757,6 +2786,10 @@ def apply_project_defaults_to_object(project: Any, world_defaults: Any) -> bool:
             "defaultUniverseId": universe_id,
             "defaultWorldId": world_id,
             "spawnWorldId": world_id,
+            "appProjectId": _safe_str(
+                getattr(project, "external_app_project_id", None),
+                project_id,
+            ),
         },
     ) or changed
     return changed
@@ -3440,6 +3473,150 @@ def seed_debug_blocks(
     return operations
 
 
+def seed_earth_sample_world(
+    app: Flask,
+    models: dict[str, Any],
+    project: Any,
+    universe: Any,
+    world_defaults: Any,
+    *,
+    db_extension: Any = None,
+) -> dict[str, Any]:
+    """Seed the deterministic Earth BigData example beside the flat dev world."""
+    started_at = _utc_now_iso()
+    enabled = get_bool_setting(
+        app,
+        "VECTOPLAN_CHUNK_SEED_EARTH_SAMPLE_WORLD",
+        True,
+        prefer_env=True,
+    )
+    earth_world_id = _safe_str(
+        get_str_setting(
+            app,
+            "VECTOPLAN_CHUNK_EARTH_SAMPLE_WORLD_ID",
+            DEFAULT_EARTH_SAMPLE_WORLD_ID,
+            prefer_env=True,
+        ),
+        DEFAULT_EARTH_SAMPLE_WORLD_ID,
+    )
+
+    if not enabled:
+        return _make_operation(
+            name="earth_sample_world",
+            ok=True,
+            status=OP_STATUS_SKIPPED,
+            skipped=True,
+            message="Earth sample world seed is disabled.",
+            started_at=started_at,
+            data={"worldId": earth_world_id},
+        )
+
+    WorldInstance = models["WorldInstance"]
+    project_db_id = _safe_model_id(project)
+    universe_db_id = _safe_model_id(universe)
+    if project_db_id is None or universe_db_id is None:
+        raise RuntimeError("Earth sample world requires persisted project and universe ids.")
+
+    world = _query_first_by(
+        WorldInstance,
+        universe_db_id=universe_db_id,
+        world_id=earth_world_id,
+    )
+    if world is not None:
+        if (
+            _safe_str(getattr(world, "template_id", ""), "") != "earth"
+            or _safe_str(getattr(world, "provider_id", ""), "") != "earth"
+        ):
+            raise RuntimeError(
+                f"Configured Earth sample world '{earth_world_id}' exists with non-Earth semantics."
+            )
+        return _make_operation(
+            name="earth_sample_world",
+            ok=True,
+            status=OP_STATUS_SKIPPED,
+            skipped=True,
+            message="Earth sample world already exists.",
+            started_at=started_at,
+            data={
+                "worldId": earth_world_id,
+                "worldDbId": _safe_model_id(world),
+                "templateId": "earth",
+                "generatorVersion": _safe_str(
+                    getattr(world, "generator_version", ""),
+                    "",
+                ),
+            },
+        )
+
+    from src.georeferencing.contracts import GlobalCoordinate, GlobalReferencePoint
+    from src.georeferencing.crs import canonical_geographic_crs
+    from src.world.earth.sample_data import get_earth_sample_data
+    from src.world.earth.validator import load_earth_world_definition
+
+    sample = get_earth_sample_data()
+    longitude, latitude, height_m = sample.query_coordinate
+    definition = load_earth_world_definition()
+    reference = GlobalReferencePoint(
+        coordinate=GlobalCoordinate.from_values(
+            str(longitude),
+            str(latitude),
+            str(height_m),
+        ),
+        crs=canonical_geographic_crs(),
+        grid=definition.to_earth_grid_definition().grid,
+        reference_version=1,
+        source=DEFAULT_EARTH_SAMPLE_SCHEMA_VERSION,
+    )
+
+    factory = getattr(WorldInstance, "create_earth_spawn", None)
+    if not callable(factory):
+        raise RuntimeError("WorldInstance.create_earth_spawn is unavailable.")
+
+    world = factory(
+        global_reference=reference,
+        project_db_id=project_db_id,
+        universe_db_id=universe_db_id,
+        world_id=earth_world_id,
+        slug="earth-sample",
+        name="Earth BigData Sample World",
+        created_by_user_id="bootstrap",
+        block_registry_id=_resolve_block_registry_id_from_world(world_defaults),
+        block_registry_version=_resolve_block_registry_version_from_world(world_defaults),
+        source_service="vectoplan-chunk-default-seed",
+        external_ref=earth_world_id,
+        metadata_json={
+            "seededBy": "vectoplan-chunk.default_seed",
+            "sampleSchemaVersion": DEFAULT_EARTH_SAMPLE_SCHEMA_VERSION,
+            "sampleSourceFingerprint": sample.source_fingerprint,
+        },
+    )
+    _add_to_session(world, db_extension)
+    _flush_session(db_extension)
+
+    return _make_operation(
+        name="earth_sample_world",
+        ok=True,
+        status=OP_STATUS_OK,
+        created=True,
+        message="Earth sample world created.",
+        started_at=started_at,
+        data={
+            "worldId": earth_world_id,
+            "worldDbId": _safe_model_id(world),
+            "templateId": "earth",
+            "generatorVersion": _safe_str(
+                getattr(world, "generator_version", ""),
+                "",
+            ),
+            "spawn": {
+                "x": getattr(world, "spawn_x_precise", getattr(world, "spawn_x", None)),
+                "y": getattr(world, "spawn_y_precise", getattr(world, "spawn_y", None)),
+                "z": getattr(world, "spawn_z_precise", getattr(world, "spawn_z", None)),
+            },
+        },
+    )
+
+
 def seed_dev_project_universe_world(
     app: Flask,
     models: dict[str, Any],
@@ -3631,6 +3808,17 @@ def seed_dev_project_universe_world(
                 },
             )
         )
+
+    operations.append(
+        seed_earth_sample_world(
+            app,
+            models,
+            project,
+            universe,
+            world_defaults,
+            db_extension=db_extension,
+        )
+    )
 
     return operations
 
@@ -4784,4 +4972,5 @@ __all__ = [
     "seed_system_blocks",
     "seed_default_project_access",
     "seed_dev_project_universe_world",
+    "seed_earth_sample_world",
 ]

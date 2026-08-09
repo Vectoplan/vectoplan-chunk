@@ -1288,6 +1288,41 @@ def _run_optional_startup_hooks(app: Flask) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Lightweight container probes
+# -----------------------------------------------------------------------------
+
+def _register_health_probes(app: Flask) -> None:
+    """Register constant-size probes that never build diagnostic status payloads."""
+    try:
+        existing_rules = {str(rule.rule) for rule in app.url_map.iter_rules()}
+    except Exception:
+        existing_rules = set()
+
+    if "/health/live" not in existing_rules:
+        @app.get("/health/live")
+        def _vectoplan_chunk_liveness_probe():
+            return {
+                "ok": True,
+                "status": "alive",
+                "service": app.config.get("SERVICE_NAME", _DEFAULT_SERVICE_NAME),
+            }
+
+    if "/health/ready" not in existing_rules:
+        @app.get("/health/ready")
+        def _vectoplan_chunk_readiness_probe():
+            metadata = _ensure_app_metadata_registry(app)
+            ready = bool(metadata.get("app_factory_ready", False))
+            return (
+                {
+                    "ok": ready,
+                    "status": "ready" if ready else "starting",
+                    "service": app.config.get("SERVICE_NAME", _DEFAULT_SERVICE_NAME),
+                },
+                200 if ready else 503,
+            )
+
+
+# -----------------------------------------------------------------------------
 # Root probe
 # -----------------------------------------------------------------------------
 
@@ -1423,6 +1458,7 @@ def create_app(config_object: type | str | None = None) -> Flask:
         _run_database_startup_check(app)
 
     _register_blueprints(app)
+    _register_health_probes(app)
     _register_root_probe(app)
 
     with app.app_context():

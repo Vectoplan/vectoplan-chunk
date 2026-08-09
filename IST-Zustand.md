@@ -461,7 +461,7 @@ DB-Initialisierung ist aus Runtime herausgezogen.
 Aktuell relevant:
 
 ```text
-services/vectoplan-server/docker-compose.all.yml
+services/vectoplan-server/docker-compose.yml
 ```
 
 Wichtige Entscheidung:
@@ -1234,7 +1234,7 @@ src/bootstrap/default_seed.py
 src/bootstrap/db_bootstrap.py
 routes/projects.py
 models/world.py
-docker-compose.all.yml
+docker-compose.yml
 ```
 
 Bereits zuvor wichtig:
@@ -2668,7 +2668,7 @@ Runtime-Start ist nicht DB-Bootstrap.
 
 ---
 
-### 11.6 `docker-compose.all.yml`
+### 11.6 `docker-compose.yml`
 
 Aktueller Stand:
 
@@ -4424,7 +4424,7 @@ Damit ist der erste Backend-Stand für die editierbare Chunk-Welt und die App-/E
 ### 24.1 Infrastruktur
 
 ```text
-services/vectoplan-server/docker-compose.all.yml
+services/vectoplan-server/docker-compose.yml
 ```
 
 Wichtigste Änderung:
@@ -8984,7 +8984,7 @@ stiller bestehender Templatewechsel
 ### 36.1 Datei
 
 ```text
-services/vectoplan-server/docker-compose.all.yml
+services/vectoplan-server/docker-compose.yml
 ```
 
 ### 36.2 Init versus Runtime
