@@ -75,6 +75,7 @@ DEFAULT_EXEMPT_PATHS: tuple[str, ...] = (
 DEFAULT_ALLOWED_SERVICE_IDS: tuple[str, ...] = (
     "vectoplan-app",
     "vectoplan-editor",
+    "vectoplan-core",
     "vectoplan-chunk-init",
 )
 

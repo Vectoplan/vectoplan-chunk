@@ -91,7 +91,7 @@ def install_project_route_authorization(app: Flask) -> bool:
         service_id = str(getattr(principal, "service_id", "") or "")
 
         # App owns provisioning and access projection. Runtime data access is
-        # always performed by Editor and is checked below.
+        # performed by Editor or, read-only, by Core and is checked below.
         if service_id == "vectoplan-app":
             return None
         if request.blueprint == "project_access":
@@ -110,31 +110,12 @@ def install_project_route_authorization(app: Flask) -> bool:
                 403,
             )
 
-        if service_id != "vectoplan-editor":
-            return _error(
-                "service_not_allowed_for_project_runtime",
-                "This service is not allowed to access project runtime routes.",
-                403,
-            )
-
         claimed_chunk_id = str(
             request.headers.get("X-Vectoplan-Chunk-Project-Id") or ""
         ).strip()
-        if not claimed_chunk_id or not hmac.compare_digest(claimed_chunk_id, project_id):
-            return _error(
-                "chunk_project_binding_mismatch",
-                "The requested Chunk project does not match the verified Editor context.",
-                403,
-            )
-
         claimed_app_id = str(
             request.headers.get("X-Vectoplan-App-Project-Id") or ""
         ).strip()
-        # Only the App/Chunk binding is needed here. Loading a full Project ORM
-        # entity causes its many select-in backrefs (worlds, snapshots, events,
-        # object refs, ...) to be traversed before every runtime request. Once a
-        # chunk is materialized this can make commands appear to hang. Selecting
-        # the scalar column keeps authorization constant-time and relationship-free.
         stored_app_id = str(
             db.session.query(Project.external_app_project_id)
             .filter(Project.project_id == project_id)
@@ -142,6 +123,56 @@ def install_project_route_authorization(app: Flask) -> bool:
             .scalar()
             or ""
         ).strip()
+
+        # Core is the translation boundary and may only read existing Chunk
+        # snapshots. It cannot mutate projects, commands or access projections.
+        if service_id == "vectoplan-core":
+            if request.blueprint != "chunks" or operation not in {
+                "chunks.read",
+                "chunks.batch.read",
+            }:
+                return _error(
+                    "core_runtime_operation_forbidden",
+                    "vectoplan-core may only read existing Chunk snapshots.",
+                    403,
+                )
+            if not claimed_chunk_id or not hmac.compare_digest(claimed_chunk_id, project_id):
+                return _error(
+                    "chunk_project_binding_mismatch",
+                    "The requested Chunk project does not match the Core project context.",
+                    403,
+                )
+            if (
+                not claimed_app_id
+                or not stored_app_id
+                or not hmac.compare_digest(claimed_app_id, stored_app_id)
+            ):
+                return _error(
+                    "app_chunk_project_binding_mismatch",
+                    "The App and Chunk project ids are not linked to the same Core project.",
+                    403,
+                )
+            return None
+
+        if service_id != "vectoplan-editor":
+            return _error(
+                "service_not_allowed_for_project_runtime",
+                "This service is not allowed to access project runtime routes.",
+                403,
+            )
+
+        if not claimed_chunk_id or not hmac.compare_digest(claimed_chunk_id, project_id):
+            return _error(
+                "chunk_project_binding_mismatch",
+                "The requested Chunk project does not match the verified Editor context.",
+                403,
+            )
+
+        # Only the App/Chunk binding is needed here. Loading a full Project ORM
+        # entity causes its many select-in backrefs (worlds, snapshots, events,
+        # object refs, ...) to be traversed before every runtime request. Once a
+        # chunk is materialized this can make commands appear to hang. Selecting
+        # the scalar column keeps authorization constant-time and relationship-free.
         if (
             not claimed_app_id
             or not stored_app_id

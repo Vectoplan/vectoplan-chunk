@@ -191,6 +191,7 @@ DEFAULT_SERVICE_AUTH_EXEMPT_PATHS: Final[tuple[str, ...]] = (
 DEFAULT_ALLOWED_SERVICE_IDS: Final[tuple[str, ...]] = (
     "vectoplan-app",
     "vectoplan-editor",
+    "vectoplan-core",
     "vectoplan-chunk-init",
 )
 DEFAULT_SERVICE_ID_HEADERS: Final[tuple[str, ...]] = (

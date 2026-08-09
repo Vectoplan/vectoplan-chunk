@@ -1,0 +1,9 @@
+.pytest_cache/
+**/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+.git/
+.venv/
+node_modules/
+dist/
+build/

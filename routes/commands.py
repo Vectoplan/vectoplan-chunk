@@ -64,6 +64,12 @@ try:
 except Exception:  # pragma: no cover
     noload = None  # type: ignore[assignment]
 
+try:
+    from sqlalchemy.exc import IntegrityError
+except Exception:  # pragma: no cover
+    class IntegrityError(Exception):
+        """Fallback used only when SQLAlchemy is unavailable at import time."""
+
 from extensions import db, get_database_status
 from models import (
     BlockRegistry,
@@ -1388,6 +1394,196 @@ def _get_block_type(
     return block
 
 
+def _mapping_value(value: Any) -> Mapping[str, Any]:
+    """Return a mapping or an immutable empty fallback."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def _first_mapping_text(
+    mappings: Sequence[Mapping[str, Any]],
+    *keys: str,
+) -> Optional[str]:
+    """Return the first non-empty text value from the supplied mappings."""
+    for mapping in mappings:
+        for key in keys:
+            text = _coerce_string(mapping.get(key))
+            if text:
+                return text
+    return None
+
+
+def _trusted_editor_service_id() -> Optional[str]:
+    """Return the authenticated editor service id for this request."""
+    try:
+        from src.services.service_auth_service import get_current_service_principal
+
+        principal = get_current_service_principal(None)
+        trusted = bool(getattr(principal, "is_trusted_service", False))
+        service_id = _coerce_string(getattr(principal, "service_id", ""))
+        if trusted and service_id == "vectoplan-editor":
+            return service_id
+    except Exception:
+        pass
+    return None
+
+
+def _library_block_registration_context(
+    payload: Mapping[str, Any],
+    *,
+    block_type_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Validate the explicit Library/VPLIB context for a new runtime block type.
+
+    Unknown identifiers remain rejected unless the authenticated editor sends
+    an explicit ``libraryContext`` whose placement command and identity agree
+    with the requested runtime block id.
+    """
+    library_context = _mapping_value(payload.get("libraryContext"))
+    if not library_context:
+        return None
+
+    library_ref = _mapping_value(library_context.get("libraryRef"))
+    placement_command = _mapping_value(library_context.get("placementCommand"))
+    metadata = _mapping_value(payload.get("metadata"))
+    sources = (library_context, library_ref, placement_command, metadata)
+
+    requested_runtime_id = _coerce_string(
+        payload.get("runtimeBlockTypeId") or payload.get("runtime_block_type_id")
+    )
+    declared_runtime_ids = [
+        requested_runtime_id,
+        _first_mapping_text(
+            (library_context, placement_command),
+            "runtimeBlockTypeId",
+            "runtime_block_type_id",
+            "blockTypeId",
+            "block_type_id",
+        )
+        or "",
+    ]
+    for declared_runtime_id in declared_runtime_ids:
+        if declared_runtime_id and declared_runtime_id != block_type_id:
+            raise ValueError(
+                "Library placement runtimeBlockTypeId does not match blockTypeId."
+            )
+
+    library_item_id = _first_mapping_text(
+        sources,
+        "libraryItemId",
+        "library_item_id",
+    )
+    family_id = _first_mapping_text(sources, "familyId", "family_id")
+    package_id = _first_mapping_text(sources, "packageId", "package_id")
+    vplib_uid = _first_mapping_text(sources, "vplibUid", "vplib_uid")
+    variant_id = _first_mapping_text(sources, "variantId", "variant_id") or "default"
+    object_kind = _first_mapping_text(sources, "objectKind", "object_kind") or "block"
+    label = _first_mapping_text(sources, "label", "displayLabel", "display_label")
+
+    if not (library_item_id or vplib_uid):
+        raise ValueError(
+            "Library placement requires libraryItemId or vplibUid for block registration."
+        )
+    if not (family_id or package_id):
+        raise ValueError(
+            "Library placement requires familyId or packageId for block registration."
+        )
+
+    category_hint = _first_mapping_text(sources, "category")
+    domain = _first_mapping_text(sources, "domain")
+    category = "terrain" if category_hint == "terrain" or domain == "earth" else "structure"
+
+    return {
+        "runtimeBlockTypeId": block_type_id,
+        "libraryItemId": library_item_id,
+        "familyId": family_id,
+        "packageId": package_id,
+        "vplibUid": vplib_uid,
+        "variantId": variant_id,
+        "objectKind": object_kind,
+        "label": label or family_id or package_id or block_type_id,
+        "category": category,
+        "libraryRef": _make_json_safe(dict(library_ref), max_depth=12),
+        "placementCommand": _make_json_safe(dict(placement_command), max_depth=12),
+    }
+
+
+def _get_or_register_library_block_type(
+    *,
+    world: WorldInstance,
+    payload: Mapping[str, Any],
+    block_type_id: str,
+    user_id: Optional[str],
+) -> BlockType:
+    """Resolve a BlockType or register an authenticated Library/VPLIB type."""
+    try:
+        return _get_block_type(
+            world=world,
+            block_type_id=block_type_id,
+            require_placeable=True,
+        )
+    except LookupError as original_error:
+        context = _library_block_registration_context(
+            payload,
+            block_type_id=block_type_id,
+        )
+        if context is None or _trusted_editor_service_id() is None:
+            raise original_error
+
+    registry = _get_registry_for_world(world)
+    block = BlockType.create_for_registry(
+        registry,
+        block_type_id=block_type_id,
+        label=context["label"],
+        description="Runtime block imported from an authenticated VECTOPLAN Library placement.",
+        status="active",
+        category=context["category"],
+        solid=True,
+        opaque=True,
+        placeable=True,
+        breakable=True,
+        selectable=True,
+        collidable=True,
+        render_mode="cube",
+        shape_type="cube",
+        material_id=block_type_id,
+        texture_id=block_type_id,
+        icon_id=block_type_id,
+        library_type_id=context["familyId"] or context["libraryItemId"],
+        library_variant_id=context["variantId"],
+        created_by_user_id=user_id,
+        metadata_json={
+            "source": "authenticated-library-placement",
+            "serviceId": "vectoplan-editor",
+            "library": context,
+        },
+    )
+
+    try:
+        with db.session.begin_nested():
+            db.session.add(block)
+            db.session.flush()
+    except IntegrityError:
+        # Concurrent first placements can race to register the same type. The
+        # unique registry/type constraint elects one row; reuse it afterwards.
+        block = _get_block_type(
+            world=world,
+            block_type_id=block_type_id,
+            require_placeable=True,
+        )
+
+    _log_checkpoint(
+        "library_block_type_registered",
+        blockTypeId=block_type_id,
+        registryId=registry.registry_id,
+        registryVersion=registry.registry_version,
+        familyId=context["familyId"],
+        vplibUid=context["vplibUid"],
+        variantId=context["variantId"],
+    )
+    return block
+
+
 def _validate_breakable_before_cell(
     *,
     world: WorldInstance,
@@ -2199,10 +2395,11 @@ def _execute_set_or_remove_block(
         materialized_reason = "remove_block"
     else:
         after_block_type_id = _get_payload_block_type_id(payload, required=True)
-        block = _get_block_type(
+        block = _get_or_register_library_block_type(
             world=world,
+            payload=payload,
             block_type_id=after_block_type_id,
-            require_placeable=True,
+            user_id=user_id,
         )
         after_cell_value = _cell_value_for_block_type(content, block)
         materialized_reason = "replace_block" if command_type == "ReplaceBlock" else "set_block"

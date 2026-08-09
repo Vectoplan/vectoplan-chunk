@@ -41,6 +41,8 @@ Robustness notes:
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -51,16 +53,21 @@ from typing import Any, Optional
 from flask import Blueprint, current_app, jsonify, request
 
 try:
+    from sqlalchemy import and_, or_
     from sqlalchemy.orm import noload
 except Exception:  # pragma: no cover - defensive fallback for unusual test envs
+    and_ = None  # type: ignore[assignment]
+    or_ = None  # type: ignore[assignment]
     noload = None  # type: ignore[assignment]
 
 from extensions import db, get_database_status
 from models import (
+    ChunkEvent,
     ChunkSnapshot,
     Project,
     Universe,
     WorldInstance,
+    WorldCommandLog,
     get_model_debug_summary,
 )
 
@@ -72,6 +79,8 @@ ROUTE_SOURCE = "routes.chunks"
 
 CHUNK_RESPONSE_VERSION = "world-state-chunk-response.v1"
 CHUNK_BATCH_RESPONSE_VERSION = "world-state-chunk-batch-response.v1"
+CHUNK_INDEX_RESPONSE_VERSION = "world-state-chunk-index-response.v1"
+CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v2"
 CHUNKS_STATUS_RESPONSE_VERSION = "chunks-route-status-response.v1"
 
 RUNTIME_CHUNK_CONTENT_VERSION = "runtime-chunk-content.v1"
@@ -1457,6 +1466,62 @@ def _find_chunk_snapshot(
     )
 
 
+def _find_chunk_snapshots(
+    *,
+    world: WorldInstance,
+    chunk_items: Sequence[Mapping[str, Any]],
+    include_deleted: bool = False,
+) -> dict[str, ChunkSnapshot]:
+    """Load all requested snapshots in one query for the batch read path."""
+    if not chunk_items:
+        return {}
+
+    if and_ is None or or_ is None:  # pragma: no cover - defensive test fallback
+        snapshots: dict[str, ChunkSnapshot] = {}
+        for item in chunk_items:
+            snapshot = _find_chunk_snapshot(
+                world=world,
+                chunk_x=int(item["chunkX"]),
+                chunk_y=int(item["chunkY"]),
+                chunk_z=int(item["chunkZ"]),
+                include_deleted=include_deleted,
+            )
+            if snapshot is not None:
+                snapshots[str(item["chunkKey"])] = snapshot
+        return snapshots
+
+    coordinate_filters = [
+        and_(
+            ChunkSnapshot.chunk_x == int(item["chunkX"]),
+            ChunkSnapshot.chunk_y == int(item["chunkY"]),
+            ChunkSnapshot.chunk_z == int(item["chunkZ"]),
+        )
+        for item in chunk_items
+    ]
+    query = ChunkSnapshot.query.filter(
+        ChunkSnapshot.world_db_id == world.id,
+        or_(*coordinate_filters),
+    )
+    query = _query_without_relationships(query)
+
+    if not include_deleted:
+        query = query.filter(ChunkSnapshot.deleted_at.is_(None))
+        query = query.filter(ChunkSnapshot.status == "active")
+
+    try:
+        rows = query.all()
+    except Exception as exc:
+        raise RuntimeError("Database lookup failed for batch ChunkSnapshots.") from exc
+
+    return {
+        _build_chunk_key(snapshot.chunk_x, snapshot.chunk_y, snapshot.chunk_z): snapshot
+        for snapshot in rows
+    }
+
+
+_PREFETCHED_SNAPSHOT_UNSET = object()
+
+
 def _runtime_content_from_snapshot(
     *,
     snapshot: ChunkSnapshot,
@@ -1583,6 +1648,7 @@ def _load_or_generate_chunk(
     materialize_generated: bool = False,
     user_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    prefetched_snapshot: Any = _PREFETCHED_SNAPSHOT_UNSET,
 ) -> dict[str, Any]:
     """Load ChunkSnapshot or generate provider chunk."""
     chunk_key = _build_chunk_key(chunk_x, chunk_y, chunk_z)
@@ -1597,19 +1663,23 @@ def _load_or_generate_chunk(
 
     snapshot = None
     if prefer_snapshot:
-        _log_checkpoint("before_snapshot_lookup", chunkKey=chunk_key)
-        snapshot = _find_chunk_snapshot(
-            world=world,
-            chunk_x=chunk_x,
-            chunk_y=chunk_y,
-            chunk_z=chunk_z,
-            include_deleted=include_deleted_snapshots,
-        )
+        if prefetched_snapshot is _PREFETCHED_SNAPSHOT_UNSET:
+            _log_checkpoint("before_snapshot_lookup", chunkKey=chunk_key)
+            snapshot = _find_chunk_snapshot(
+                world=world,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_z=chunk_z,
+                include_deleted=include_deleted_snapshots,
+            )
+        else:
+            snapshot = prefetched_snapshot
         _log_checkpoint(
             "after_snapshot_lookup",
             chunkKey=chunk_key,
             found=bool(snapshot is not None),
             snapshotId=getattr(snapshot, "snapshot_id", None),
+            prefetched=prefetched_snapshot is not _PREFETCHED_SNAPSHOT_UNSET,
         )
 
     if snapshot is not None:
@@ -1898,6 +1968,451 @@ def _serialize_chunk_load_result(
 # Routes
 # -----------------------------------------------------------------------------
 
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks/index")
+def get_project_world_chunk_index(project_id: str, world_id: str):
+    """List lightweight coordinates for materialized project chunks."""
+    try:
+        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
+        include_deleted = _get_query_bool("includeDeleted", "include_deleted", fallback=False)
+        non_air_only = _get_query_bool("nonAirOnly", "non_air_only", fallback=True)
+        offset = max(0, _get_query_int("offset", fallback=0, field_name="offset"))
+        limit = min(
+            512,
+            max(1, _get_query_int("limit", fallback=256, field_name="limit")),
+        )
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+            include_deleted=include_deleted,
+        )
+        query = db.session.query(
+            ChunkSnapshot.chunk_x,
+            ChunkSnapshot.chunk_y,
+            ChunkSnapshot.chunk_z,
+            ChunkSnapshot.chunk_key,
+            ChunkSnapshot.chunk_revision,
+            ChunkSnapshot.content_hash,
+            ChunkSnapshot.non_air_cell_count,
+            ChunkSnapshot.updated_at,
+        ).filter(ChunkSnapshot.world_db_id == world.id)
+        if not include_deleted:
+            query = query.filter(ChunkSnapshot.deleted_at.is_(None))
+            query = query.filter(ChunkSnapshot.status == "active")
+        if non_air_only:
+            query = query.filter(ChunkSnapshot.non_air_cell_count > 0)
+        rows = query.order_by(
+            ChunkSnapshot.chunk_x.asc(),
+            ChunkSnapshot.chunk_y.asc(),
+            ChunkSnapshot.chunk_z.asc(),
+        ).all()
+        entries = [
+            {
+                "chunkX": int(row.chunk_x),
+                "chunkY": int(row.chunk_y),
+                "chunkZ": int(row.chunk_z),
+                "chunkKey": str(row.chunk_key),
+                "revision": int(row.chunk_revision or 0),
+                "contentHash": str(row.content_hash or ""),
+                "nonAirCellCount": int(row.non_air_cell_count or 0),
+                "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in rows
+        ]
+        fingerprint_source = [
+            [
+                item["chunkX"],
+                item["chunkY"],
+                item["chunkZ"],
+                item["revision"],
+                item["contentHash"],
+            ]
+            for item in entries
+        ]
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_source, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        page = entries[offset : offset + limit]
+        return _json_response(
+            _ok_response(
+                response_version=CHUNK_INDEX_RESPONSE_VERSION,
+                payload={
+                    "projectId": project.project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "chunks": page,
+                    "fingerprint": fingerprint,
+                    "total": len(entries),
+                    "offset": offset,
+                    "limit": limit,
+                    "hasMore": offset + len(page) < len(entries),
+                    "nonAirOnly": non_air_only,
+                },
+                metadata={
+                    "source": ROUTE_SOURCE,
+                    "projectScoped": True,
+                    "dbBacked": True,
+                    "materializedOnly": True,
+                },
+            ),
+            200,
+        )
+    except ValueError as exc:
+        return _error_response(exc, code="invalid_chunk_index_request", status_code=400)
+    except Exception as exc:
+        return _error_response(exc)
+
+
+_LEGACY_EDITOR_PLACEMENT_COMMANDS = {
+    "SetBlock",
+    "ReplaceBlock",
+    "ApplyBlockBatch",
+    "PlaceObject",
+    "FillRegion",
+    "ReplaceRegion",
+}
+
+
+def _event_authorship_kind(
+    value: Any,
+    *,
+    command_source: Any = "",
+    command_type: Any = "",
+) -> str:
+    user_id = str(value or "").strip().lower()
+    if user_id and user_id not in {
+        "system",
+        "generator",
+        "terrain_generator",
+        "vectoplan-editor",
+    } and not user_id.startswith(("system_", "service_")):
+        return "explicit-user"
+    if (
+        str(command_source or "").strip().lower() == "editor"
+        and str(command_type or "").strip() in _LEGACY_EDITOR_PLACEMENT_COMMANDS
+    ):
+        return "legacy-editor-placement"
+    return ""
+
+
+def _is_user_authored_event(
+    value: Any,
+    *,
+    command_source: Any = "",
+    command_type: Any = "",
+) -> bool:
+    return bool(
+        _event_authorship_kind(
+            value,
+            command_source=command_source,
+            command_type=command_type,
+        )
+    )
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _first_mapping(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, Mapping) and value:
+            return dict(value)
+    return {}
+
+
+def _first_text(*values: Any) -> Optional[str]:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text[:500]
+    return None
+
+
+def _compact_definition_values(value: Any, *, limit: int = 256) -> dict[str, Any]:
+    """Keep only the declarative scalar values needed by downstream geometry."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        if len(result) >= limit:
+            break
+        key = str(raw_key or "").strip()[:240]
+        if not key or not isinstance(raw_value, (str, int, float, bool, type(None))):
+            continue
+        result[key] = raw_value
+    return result
+
+
+def _compact_placement_semantics(
+    event_payload: Any,
+    command_payload: Any = None,
+    *,
+    block_type_id: Any = None,
+    object_type_id: Any = None,
+    object_variant_id: Any = None,
+) -> dict[str, Any]:
+    """Extract a small, revision-safe Library identity from a stored command.
+
+    Chunk keeps the complete command for audit/replay.  Core deliberately gets a
+    compact semantic snapshot instead of the deeply nested editor payload.
+    """
+    payload = _first_mapping(event_payload, command_payload)
+    command = _json_mapping(command_payload)
+    metadata = _first_mapping(payload.get("metadata"), command.get("metadata"))
+    context = _first_mapping(
+        metadata.get("libraryPlacementContext"),
+        metadata.get("library_placement_context"),
+        payload.get("libraryPlacementContext"),
+    )
+    library_ref = _first_mapping(
+        context.get("libraryRef"),
+        context.get("library_ref"),
+        metadata.get("libraryRef"),
+    )
+    placement_command = _first_mapping(context.get("placementCommand"))
+    placement_payload = _json_mapping(placement_command.get("payload"))
+    semantic_profile = _first_mapping(
+        context.get("semanticProfile"),
+        context.get("semantic_profile"),
+        metadata.get("semanticProfile"),
+        metadata.get("semantic_profile"),
+        payload.get("semanticProfile"),
+    )
+    context_metadata = _json_mapping(context.get("commandMetadata"))
+    placement_record = _json_mapping(context_metadata.get("placementRecord"))
+    placement_record_metadata = _json_mapping(placement_record.get("metadata"))
+    variables = _compact_definition_values(
+        _first_mapping(
+            semantic_profile.get("variables"),
+            semantic_profile.get("definitionValues"),
+            semantic_profile.get("definition_values"),
+            context.get("definitionValues"),
+            metadata.get("definitionValues"),
+            metadata.get("definition_values"),
+            placement_record.get("definitionValues"),
+            placement_record_metadata.get("definitionValues"),
+            placement_record_metadata.get("definition_values"),
+        )
+    )
+    family_id = _first_text(
+        context.get("familyId"),
+        library_ref.get("familyId"),
+        placement_payload.get("familyId"),
+        metadata.get("familyId"),
+        object_type_id,
+    )
+    variant_id = _first_text(
+        context.get("variantId"),
+        library_ref.get("variantId"),
+        placement_payload.get("variantId"),
+        metadata.get("variantId"),
+        object_variant_id,
+    )
+    return {
+        "schemaVersion": "chunk-placement-semantics/0.1",
+        "source": _first_text(context.get("source"), placement_command.get("source"), "chunk")
+        or "chunk",
+        "runtimeBlockTypeId": _first_text(
+            context.get("runtimeBlockTypeId"),
+            payload.get("runtimeBlockTypeId"),
+            payload.get("blockTypeId"),
+            block_type_id,
+        ),
+        "library": {
+            "libraryItemId": _first_text(
+                context.get("libraryItemId"), library_ref.get("libraryItemId")
+            ),
+            "inventoryItemId": _first_text(context.get("inventoryItemId")),
+            "familyId": family_id,
+            "packageId": _first_text(
+                context.get("packageId"),
+                library_ref.get("packageId"),
+                placement_payload.get("packageId"),
+            ),
+            "vplibUid": _first_text(
+                context.get("vplibUid"),
+                library_ref.get("vplibUid"),
+                placement_payload.get("vplibUid"),
+            ),
+            "variantId": variant_id,
+            "revisionHash": _first_text(
+                context.get("revisionHash"),
+                library_ref.get("revisionHash"),
+                placement_payload.get("revisionHash"),
+                semantic_profile.get("revisionHash"),
+            ),
+        },
+        "classification": {
+            "objectKind": _first_text(context.get("objectKind"), library_ref.get("objectKind")),
+            "domain": _first_text(library_ref.get("domain"), semantic_profile.get("domain")),
+            "category": _first_text(library_ref.get("category"), semantic_profile.get("category")),
+            "subcategory": _first_text(
+                library_ref.get("subcategory"), semantic_profile.get("subcategory")
+            ),
+            "role": _first_text(
+                semantic_profile.get("role"),
+                semantic_profile.get("semanticRole"),
+                variables.get("semantic.role"),
+            ),
+        },
+        "variables": variables,
+    }
+
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks/user-placements")
+def get_project_world_user_placements(project_id: str, world_id: str):
+    """Return only current cells whose latest mutation was authored by a user."""
+    try:
+        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
+        include_deleted = _get_query_bool("includeDeleted", "include_deleted", fallback=False)
+        summary_only = _get_query_bool("summaryOnly", "summary_only", fallback=False)
+        offset = max(0, _get_query_int("offset", fallback=0, field_name="offset"))
+        limit = min(2000, max(1, _get_query_int("limit", fallback=1000, field_name="limit")))
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+            include_deleted=include_deleted,
+        )
+        latest_event_ids = (
+            db.session.query(db.func.max(ChunkEvent.id).label("event_id"))
+            .filter(ChunkEvent.world_db_id == world.id)
+            .filter(ChunkEvent.event_status == "active")
+            .filter(ChunkEvent.position_x.isnot(None))
+            .filter(ChunkEvent.position_y.isnot(None))
+            .filter(ChunkEvent.position_z.isnot(None))
+            .group_by(ChunkEvent.position_x, ChunkEvent.position_y, ChunkEvent.position_z)
+            .subquery()
+        )
+        columns = [
+            ChunkEvent.event_id,
+            ChunkEvent.command_id,
+            ChunkEvent.command_type,
+            ChunkEvent.user_id,
+            ChunkEvent.chunk_x,
+            ChunkEvent.chunk_y,
+            ChunkEvent.chunk_z,
+            ChunkEvent.chunk_key,
+            ChunkEvent.position_x,
+            ChunkEvent.position_y,
+            ChunkEvent.position_z,
+            ChunkEvent.block_after_type_id,
+            ChunkEvent.chunk_revision_after,
+            WorldCommandLog.command_source,
+        ]
+        if not summary_only:
+            columns.extend(
+                [
+                    ChunkEvent.object_type_id,
+                    ChunkEvent.object_variant_id,
+                    ChunkEvent.payload_json,
+                    WorldCommandLog.request_payload_json,
+                ]
+            )
+        rows = (
+            db.session.query(*columns)
+            .join(latest_event_ids, ChunkEvent.id == latest_event_ids.c.event_id)
+            .outerjoin(WorldCommandLog, ChunkEvent.command_log_db_id == WorldCommandLog.id)
+            .filter(ChunkEvent.block_after_type_id.isnot(None))
+            .order_by(
+                ChunkEvent.position_x.asc(),
+                ChunkEvent.position_y.asc(),
+                ChunkEvent.position_z.asc(),
+            )
+            .all()
+        )
+        entries = []
+        fingerprint_source = []
+        for row in rows:
+            authorship = _event_authorship_kind(
+                row.user_id,
+                command_source=row.command_source,
+                command_type=row.command_type,
+            )
+            if not authorship:
+                continue
+            fingerprint_source.append(
+                [
+                    int(row.position_x),
+                    int(row.position_y),
+                    int(row.position_z),
+                    str(row.block_after_type_id),
+                    str(row.event_id),
+                    int(row.chunk_revision_after or 0),
+                    authorship,
+                ]
+            )
+            if summary_only:
+                continue
+            semantics = _compact_placement_semantics(
+                row.payload_json,
+                row.request_payload_json,
+                block_type_id=row.block_after_type_id,
+                object_type_id=row.object_type_id,
+                object_variant_id=row.object_variant_id,
+            )
+            entries.append(
+                {
+                    "position": {
+                        "x": int(row.position_x),
+                        "y": int(row.position_y),
+                        "z": int(row.position_z),
+                    },
+                    "chunk": {
+                        "chunkX": int(row.chunk_x),
+                        "chunkY": int(row.chunk_y),
+                        "chunkZ": int(row.chunk_z),
+                        "chunkKey": str(row.chunk_key),
+                    },
+                    "blockTypeId": str(row.block_after_type_id),
+                    "eventId": str(row.event_id),
+                    "commandId": str(row.command_id),
+                    "commandType": str(row.command_type),
+                    "chunkRevision": int(row.chunk_revision_after or 0),
+                    "authoredByUser": True,
+                    "authorship": authorship,
+                    "semantics": semantics,
+                }
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_source, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        page = [] if summary_only else entries[offset : offset + limit]
+        return _json_response(
+            _ok_response(
+                response_version=CHUNK_USER_PLACEMENTS_RESPONSE_VERSION,
+                payload={
+                    "projectId": project.project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "placements": page,
+                    "fingerprint": fingerprint,
+                    "total": len(fingerprint_source),
+                    "offset": 0 if summary_only else offset,
+                    "limit": 0 if summary_only else limit,
+                    "hasMore": False if summary_only else offset + len(page) < len(entries),
+                    "summaryOnly": summary_only,
+                },
+                metadata={
+                    "source": ROUTE_SOURCE,
+                    "projectScoped": True,
+                    "dbBacked": True,
+                    "currentStateOnly": True,
+                    "userAuthoredOnly": True,
+                    "systemTerrainExcluded": True,
+                    "summaryOnly": summary_only,
+                },
+            ),
+            200,
+        )
+    except ValueError as exc:
+        return _error_response(exc, code="invalid_user_placements_request", status_code=400)
+    except Exception as exc:
+        return _error_response(exc)
+
+
 @chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks")
 def get_project_world_chunk(project_id: str, world_id: str):
     """
@@ -2164,7 +2679,16 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
         snapshot_count = 0
         generated_count = 0
 
-        parallel_outcomes: Optional[list[Any]] = None
+        # A moving camera requests many coordinates at once. Resolve snapshot
+        # truth with one indexed query instead of issuing one ORM round-trip per
+        # chunk before generation.
+        prefetched_snapshots = _find_chunk_snapshots(
+            world=world,
+            chunk_items=chunk_items,
+            include_deleted=include_deleted,
+        ) if prefer_snapshot else {}
+
+        parallel_outcomes: Optional[dict[int, Any]] = None
         parallel_generation = bool(
             getattr(world, "is_earth_world", False)
             and allow_generated
@@ -2172,12 +2696,18 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
             and len(chunk_items) > 1
         )
         if parallel_generation:
+            parallel_outcomes = {}
             flask_app = current_app._get_current_object()
+            generation_items = [
+                (item_index, item)
+                for item_index, item in enumerate(chunk_items)
+                if str(item["chunkKey"]) not in prefetched_snapshots
+            ]
             worker_count = max(
                 1,
                 min(
                     8,
-                    len(chunk_items),
+                    max(1, len(generation_items)),
                     int(os.getenv("VECTOPLAN_CHUNK_BATCH_GENERATION_WORKERS", "6")),
                 ),
             )
@@ -2206,6 +2736,7 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
                             materialize_generated=False,
                             user_id=user_id,
                             session_id=session_id,
+                            prefetched_snapshot=None,
                         )
                     except BaseException as exc:
                         _safe_rollback()
@@ -2216,17 +2747,29 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
                         except Exception:
                             pass
 
-            with ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="earth-chunk-batch",
-            ) as executor:
-                parallel_outcomes = list(executor.map(load_parallel, chunk_items))
+            if generation_items:
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix="earth-chunk-batch",
+                ) as executor:
+                    generated_outcomes = list(executor.map(
+                        load_parallel,
+                        [item for _, item in generation_items],
+                    ))
+                parallel_outcomes.update({
+                    item_index: outcome
+                    for (item_index, _), outcome in zip(
+                        generation_items,
+                        generated_outcomes,
+                    )
+                })
 
         for item_index, item in enumerate(chunk_items):
             requested.append(dict(item))
 
             try:
-                if parallel_outcomes is not None:
+                prefetched_snapshot = prefetched_snapshots.get(str(item["chunkKey"]))
+                if parallel_outcomes is not None and prefetched_snapshot is None:
                     outcome = parallel_outcomes[item_index]
                     if isinstance(outcome, BaseException):
                         raise outcome
@@ -2245,6 +2788,11 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
                         materialize_generated=materialize_generated,
                         user_id=user_id,
                         session_id=session_id,
+                        prefetched_snapshot=(
+                            prefetched_snapshot
+                            if prefer_snapshot
+                            else _PREFETCHED_SNAPSHOT_UNSET
+                        ),
                     )
 
                 if result.get("source") == "snapshot":

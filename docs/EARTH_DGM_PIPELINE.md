@@ -329,7 +329,7 @@ Physik und manuelle Kamerasteuerung werden auf dieselbe Position gesetzt. So sta
 
 ## 8. Betriebsparameter
 
-Wichtige Defaults aus `docker-compose.all.yml`:
+Wichtige Defaults aus `docker-compose.yml`:
 
 ```text
 VECTOPLAN_CHUNK_TERRAIN_ENABLED=true
@@ -351,7 +351,7 @@ VECTOPLAN_CHUNK_TERRAIN_REGION_BATCH_POINTS=480
 ### Container und Health
 
 ```powershell
-docker compose -f docker-compose.all.yml ps vectoplan-editor vectoplan-chunk geoserver-orchestrator
+docker compose -f docker-compose.yml ps vectoplan-editor vectoplan-chunk geoserver-orchestrator
 curl.exe -fsS http://localhost:5110/health/ready
 curl.exe -fsS http://localhost:5102/projects/_status
 ```
@@ -387,8 +387,8 @@ Diese Werte sind keine festen Grenzwerte. Sie belegen für eine reale Sitzung, d
 
 ```powershell
 docker exec vectoplan-server-vectoplan-chunk-1 python -m pytest tests/test_earth_terrain_pipeline.py -q
-docker compose -f docker-compose.all.yml build vectoplan-editor
-docker compose -f docker-compose.all.yml up -d --force-recreate --no-deps vectoplan-editor
+docker compose -f docker-compose.yml build vectoplan-editor
+docker compose -f docker-compose.yml up -d --force-recreate --no-deps vectoplan-editor
 ```
 
 Nach Frontendänderungen muss das Editor-Image neu gebaut und der Container neu erzeugt werden. Ein Neustart eines alten Images reicht nicht.
@@ -436,6 +436,6 @@ Nach Frontendänderungen muss das Editor-Image neu gebaut und der Container neu 
 | RLE- und Batch-Normalisierung | [`../../vectoplan-editor/src/frontend/api/chunk_api_normalize.ts`](../../vectoplan-editor/src/frontend/api/chunk_api_normalize.ts) |
 | Sichtweite, Spawn und Meshing | [`../../vectoplan-editor/src/frontend/scene/scene_runtime.ts`](../../vectoplan-editor/src/frontend/scene/scene_runtime.ts) |
 | 2D-Projektkarte | [`../../vectoplan-editor/src/frontend/scene/chunk_map_overlay.ts`](../../vectoplan-editor/src/frontend/scene/chunk_map_overlay.ts) |
-| Container, Ports, Volumes und ENV | [`../../../docker-compose.all.yml`](../../../docker-compose.all.yml) |
+| Container, Ports, Volumes und ENV | [`../../../docker-compose.yml`](../../../docker-compose.yml) |
 
 Die globale Earth-Koordinatenentscheidung steht in [`adr/ADR-earth-world-v1.md`](adr/ADR-earth-world-v1.md). Dieses Dokument ergänzt sie um die implementierte DGM-, Cache- und Editor-Pipeline.
