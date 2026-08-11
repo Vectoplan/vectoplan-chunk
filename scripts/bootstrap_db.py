@@ -975,6 +975,7 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
         "dryRun": bool(dry_run),
         "executed": False,
         "addedColumns": [],
+        "updatedConstraints": [],
         "skippedColumns": [],
         "errors": [],
         "warnings": [],
@@ -982,10 +983,6 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
 
     before = _inspect_database_schema_inner()
     missing_columns = before.get("missingColumns") or {}
-
-    if not missing_columns:
-        result["status"] = "nothing_to_repair"
-        return result
 
     try:
         from sqlalchemy import inspect, text
@@ -1138,6 +1135,40 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
                             }
                         )
 
+            # db.create_all() cannot update an existing CHECK constraint. The
+            # semantic parcel-grid object kind is an intentional schema enum
+            # extension and is repaired only in this explicit init path.
+            constraint_name = "ck_world_object_instances_object_kind_valid"
+            constraint_table = "world_object_instances"
+            if constraint_table in existing_tables and dialect.name == "postgresql":
+                constraints = inspector.get_check_constraints(constraint_table)
+                current = next(
+                    (item for item in constraints if item.get("name") == constraint_name),
+                    None,
+                )
+                current_sql = str((current or {}).get("sqltext") or "")
+                if "semantic_footprint" not in current_sql:
+                    quoted_table = _quote_identifier(dialect, constraint_table)
+                    quoted_constraint = _quote_identifier(dialect, constraint_name)
+                    drop_sql = f"ALTER TABLE {quoted_table} DROP CONSTRAINT IF EXISTS {quoted_constraint}"
+                    add_sql = (
+                        f"ALTER TABLE {quoted_table} ADD CONSTRAINT {quoted_constraint} CHECK ("
+                        "object_kind IN ('block_composite', 'library_object', 'imported_object', "
+                        "'runtime_object', 'structure', 'semantic_footprint', 'unknown'))"
+                    )
+                    update_record = {
+                        "table": constraint_table,
+                        "constraint": constraint_name,
+                        "previousSql": current_sql or None,
+                        "ddl": [drop_sql, add_sql],
+                        "dryRun": bool(dry_run),
+                    }
+                    result["updatedConstraints"].append(update_record)
+                    if not dry_run:
+                        connection.execute(text(drop_sql))
+                        connection.execute(text(add_sql))
+                        result["executed"] = True
+
     except Exception as exc:
         result["ok"] = False
         result["errors"].append(
@@ -1151,7 +1182,13 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
     result["before"] = before
     result["after"] = after
     result["remainingMissingColumns"] = after.get("missingColumns") or {}
-    result["status"] = "repaired" if result["ok"] and not result["remainingMissingColumns"] else "repair_incomplete"
+    result["status"] = (
+        "repaired"
+        if result["ok"] and not result["remainingMissingColumns"] and result["executed"]
+        else "nothing_to_repair"
+        if result["ok"] and not result["remainingMissingColumns"]
+        else "repair_incomplete"
+    )
 
     if result["remainingMissingColumns"]:
         result["warnings"].append(
@@ -3706,10 +3743,9 @@ def _run_preferred_or_fallback_bootstrap(
             }
 
             if args.repair_missing_columns:
-                if schema_audit_before_repair.get("missingColumns"):
-                    repair_result = _repair_missing_columns_inner(
-                        dry_run=bool(args.dry_run_repair),
-                    )
+                repair_result = _repair_missing_columns_inner(
+                    dry_run=bool(args.dry_run_repair),
+                )
 
             schema_audit_after_repair = _inspect_database_schema_inner()
             bootstrap_result["schemaRepair"] = repair_result

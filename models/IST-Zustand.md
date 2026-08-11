@@ -9,6 +9,18 @@ Status: Aktualisierte Bestandsaufnahme der SQLAlchemy-Modelschicht mit 15 persis
 
 Diese Fortschreibung gleicht die Dokumentation mit den vorliegenden Dateien `models/__init__.py`, `project.py`, `project_access_assignment.py`, `project_access.py`, `universe.py`, `world.py`, `block.py`, `chunk.py`, `event.py` und `object.py` ab. Neue Aussagen werden als **implementiert** beschrieben, wenn sie statisch im Code vorhanden sind. Laufzeit- oder HTTP-Bestätigungen werden nur übernommen, wenn sie bereits im übergeordneten Service-IST dokumentiert waren.
 
+### Aktualisierung 2026-08-10: Persistente Polygonobjekte
+
+`WorldObjectInstance` und `WorldObjectChunkRef` werden produktiv vom
+`PlaceObject`-Handler verwendet. Für schräge Grundstücksrasterkörper speichern
+sie Polygon-Footprint, explizite belegte Weltzellen, Primär-/Folge-Chunks,
+Objekttyp, Blockmaterial und Command-/Event-Provenienz. Jeder betroffene
+`ChunkSnapshot` enthält zusätzlich einen kompakten `objectRef`, sodass Renderer,
+Core und CAD die semantische Form nach einem Reload wiederherstellen können.
+
+Siehe
+[`../../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md`](../../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md).
+
 Diese Datei beschreibt den Ordner:
 
 ```text
