@@ -2141,7 +2141,9 @@ def _save_snapshot_after_mutation(
         bump_revision=True,
     )
     db.session.add(existing_snapshot)
-    db.session.flush()
+    # Existing snapshots already have their database id.  The final transaction
+    # commit can persist this update together with the event and command log;
+    # flushing here added a synchronous database round-trip to every block edit.
     return existing_snapshot
 
 
@@ -2162,7 +2164,8 @@ def _attach_event_to_snapshot(snapshot: ChunkSnapshot, event: ChunkEvent, *, use
             pass
 
     db.session.add(snapshot)
-    db.session.flush()
+    # Keep the snapshot update pending so it is written in the same flush as the
+    # event and final command state at commit time.
 
 
 # -----------------------------------------------------------------------------
@@ -2291,7 +2294,7 @@ def _create_chunk_event(
     affected_bounds_json: Optional[Mapping[str, Any]] = None,
     payload_json: Optional[Mapping[str, Any]] = None,
 ) -> ChunkEvent:
-    """Create and flush ChunkEvent."""
+    """Create ChunkEvent and leave it pending for the transaction commit."""
     event = ChunkEvent.create(
         project_db_id=project.id,
         universe_db_id=universe.id,
@@ -2341,7 +2344,6 @@ def _create_chunk_event(
     )
 
     db.session.add(event)
-    db.session.flush()
     return event
 
 
@@ -3855,6 +3857,9 @@ def _execute_command(
         raise ValueError(f"Command type '{command_type}' is not implemented in this route.")
 
     db.session.add(command_log)
+    # Flush the event, snapshot update and final command state together.  This
+    # preserves database-generated serialization fields without paying one
+    # round-trip for each intermediate object.
     db.session.flush()
 
     return command_log, result
