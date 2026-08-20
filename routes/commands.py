@@ -1419,14 +1419,14 @@ def _first_mapping_text(
 
 
 def _trusted_editor_service_id() -> Optional[str]:
-    """Return the authenticated editor service id for this request."""
+    """Return the trusted model-authoring service id for this request."""
     try:
         from src.services.service_auth_service import get_current_service_principal
 
         principal = get_current_service_principal(None)
         trusted = bool(getattr(principal, "is_trusted_service", False))
         service_id = _coerce_string(getattr(principal, "service_id", ""))
-        if trusted and service_id == "vectoplan-editor":
+        if trusted and service_id in {"vectoplan-editor", "vectoplan-core"}:
             return service_id
     except Exception:
         pass
@@ -1441,7 +1441,7 @@ def _library_block_registration_context(
     """
     Validate the explicit Library/VPLIB context for a new runtime block type.
 
-    Unknown identifiers remain rejected unless the authenticated editor sends
+    Unknown identifiers remain rejected unless an authenticated model service sends
     an explicit ``libraryContext`` whose placement command and identity agree
     with the requested runtime block id.
     """
@@ -1560,7 +1560,7 @@ def _get_or_register_library_block_type(
         created_by_user_id=user_id,
         metadata_json={
             "source": "authenticated-library-placement",
-            "serviceId": "vectoplan-editor",
+            "serviceId": _trusted_editor_service_id(),
             "library": context,
         },
     )
@@ -2475,7 +2475,18 @@ def _execute_set_or_remove_block(
     if command_type == "RemoveBlock":
         refs = content.get("objectRefs")
         for ref in list(refs) if isinstance(refs, list) else []:
-            if not isinstance(ref, Mapping) or ref.get("objectKind") != "semantic_footprint":
+            if not isinstance(ref, Mapping):
+                continue
+            ref_metadata = ref.get("metadata") if isinstance(ref.get("metadata"), Mapping) else {}
+            ref_kind = ref.get("objectKind")
+            is_parametric_library_object = (
+                ref_kind == "vplib_parametric"
+                or (
+                    ref_kind == "library_object"
+                    and ref_metadata.get("schemaVersion") == "vectoplan-vplib-parametric.v1"
+                )
+            )
+            if ref_kind != "semantic_footprint" and not is_parametric_library_object:
                 continue
             occupied_cells = ref.get("occupiedCells")
             occupies_target = any(

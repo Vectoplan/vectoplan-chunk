@@ -1917,6 +1917,14 @@ class SQLAlchemyProjectAccessRepository(ProjectAccessRepository):
         if self.project_model is None:
             return None
         query = self._project_filter(self._query(self.project_model), self.project_model, chunk_project_id)
+        try:
+            from sqlalchemy.orm import noload
+
+            query = query.options(noload("*"))
+        except (ImportError, AttributeError, TypeError):
+            # The repository also supports lightweight SQLAlchemy-style test
+            # doubles that intentionally do not implement loader options.
+            pass
         if hasattr(query, "one_or_none"):
             return query.one_or_none()
         results = list(query.limit(2).all())

@@ -49,6 +49,7 @@ from functools import lru_cache
 from typing import Any, Final, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import noload
 
 from extensions import db
 from models.project import Project
@@ -807,7 +808,10 @@ def resolve_project(
             },
         )
 
-    query = current_session.query(Project)
+    # Access operations only need the project row. Project backrefs use
+    # selectin loading for runtime graphs and would otherwise pull every
+    # world/chunk/event into this small authorization request.
+    query = current_session.query(Project).options(noload("*"))
     if project_db_id is not None:
         query = query.filter(
             Project.id == _normalize_positive_int(

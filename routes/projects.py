@@ -2146,6 +2146,11 @@ def _schedule_earth_terrain_preparation(result: Any) -> bool:
             or result.get('chunk_world_id')
             or ids.get('chunkWorldId')
         )
+        chunk_project_id = _coerce_string(
+            result.get('chunkProjectId')
+            or result.get('chunk_project_id')
+            or ids.get('chunkProjectId')
+        )
     else:
         ok = bool(getattr(result, 'ok', False))
         world_template = _coerce_string(
@@ -2154,8 +2159,16 @@ def _schedule_earth_terrain_preparation(result: Any) -> bool:
         world_id = _coerce_string(
             getattr(result, 'chunk_world_id', '')
         )
+        chunk_project_id = _coerce_string(
+            getattr(result, 'chunk_project_id', '')
+        )
 
-    if not ok or world_template != WORLD_TEMPLATE_EARTH or not world_id:
+    if (
+        not ok
+        or world_template != WORLD_TEMPLATE_EARTH
+        or not world_id
+        or not chunk_project_id
+    ):
         return False
 
     flask_app = current_app._get_current_object()
@@ -2164,7 +2177,14 @@ def _schedule_earth_terrain_preparation(result: Any) -> bool:
         with flask_app.app_context():
             try:
                 query = _without_automatic_relationships(WorldInstance.query)
-                world = query.filter(WorldInstance.world_id == world_id).one_or_none()
+                world = (
+                    query.join(Project, WorldInstance.project_db_id == Project.id)
+                    .filter(
+                        Project.project_id == chunk_project_id,
+                        WorldInstance.world_id == world_id,
+                    )
+                    .one_or_none()
+                )
                 if world is None:
                     flask_app.logger.warning(
                         'Earth terrain preparation skipped: world %s was not found.',
