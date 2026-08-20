@@ -102,6 +102,7 @@ OBJECT_KIND_LIBRARY_OBJECT = "library_object"
 OBJECT_KIND_IMPORTED_OBJECT = "imported_object"
 OBJECT_KIND_RUNTIME_OBJECT = "runtime_object"
 OBJECT_KIND_STRUCTURE = "structure"
+OBJECT_KIND_SEMANTIC_FOOTPRINT = "semantic_footprint"
 OBJECT_KIND_UNKNOWN = "unknown"
 
 VALID_OBJECT_KINDS = frozenset(
@@ -111,6 +112,7 @@ VALID_OBJECT_KINDS = frozenset(
         OBJECT_KIND_IMPORTED_OBJECT,
         OBJECT_KIND_RUNTIME_OBJECT,
         OBJECT_KIND_STRUCTURE,
+        OBJECT_KIND_SEMANTIC_FOOTPRINT,
         OBJECT_KIND_UNKNOWN,
     }
 )
@@ -1130,7 +1132,7 @@ class WorldObjectInstance(db.Model):
             name="ck_world_object_instances_object_source_valid",
         ),
         db.CheckConstraint(
-            "object_kind IN ('block_composite', 'library_object', 'imported_object', 'runtime_object', 'structure', 'unknown')",
+            "object_kind IN ('block_composite', 'library_object', 'imported_object', 'runtime_object', 'structure', 'semantic_footprint', 'unknown')",
             name="ck_world_object_instances_object_kind_valid",
         ),
         db.CheckConstraint(

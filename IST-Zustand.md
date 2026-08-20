@@ -3,10 +3,30 @@
 
 ## Status dieser aktualisierten Fassung
 
-Stand: 2026-07-19  
-Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit strikt getrenntem Runtime-/DB-Bootstrap, stabiler `world_spawn`-Welt, bestätigter App↔Chunk↔Editor-Grundintegration, betriebsfähiger Systemblock-Schicht, ausführbarem Earth-v1-Kern sowie neuem serviceauthentifiziertem App-Provisionierungs- und Projektzugriffsvertrag mit kanonischen `auth_user_id`-Identitäten, Rollenprojektion, Earth-Standard für App-Projekte, kontrolliertem Flat-Fallback und erfolgreich repariertem Init-/Startup-Pfad.
+Stand: 2026-08-10
+Status: PostgreSQL-gestützter, projektgescopter Chunk-Service mit stabilen Block-Commands, transaktionalem WorldEdit, Geodaten-Overlays und persistenter semantischer `PlaceObject`-Geometrie für das Grundstücksraster v6.
 
 Diese Aktualisierung **kürzt die bisherige IST-Dokumentation nicht**. Die vollständige bisherige Bestandsaufnahme bleibt weiter unten als historische Basis enthalten. Ergänzt wurden der inzwischen bestätigte Systemblock-Katalog, Air- und Railing-Invarianten, die persistente Registry-Spiegelung, die neuen Blockrouten und die verifizierte Editor-/Admin-Sichtbarkeit.
+
+### Aktualisierung 2026-08-10: WorldEdit und semantische Footprints
+
+Der vollständige serviceübergreifende Vertrag steht in
+[`../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md`](../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md).
+
+`PlaceObject` ist nicht mehr nur vorbereitet. Der aktive Handler:
+
+- akzeptiert explizite, deduplizierte `occupiedCells`,
+- speichert Polygon-Footprint und Metadaten in `WorldObjectInstance`,
+- legt `WorldObjectChunkRef` für alle berührten Chunks an,
+- ergänzt Snapshot-`objectRefs`, Chunk-Events und Dirty-Chunks,
+- erhält damit schräge Grundstücksrasterkörper über Reloads.
+
+Die WorldEdit-Planung prüft Zelllimit und Grundstücksmaske vor der Ausführung.
+Eine leere aktivierte Maske schlägt geschlossen fehl; `cell-contained` arbeitet
+auf der Vereinigung aller ausgewählten Flurstücke. Die fokussierte Testsuite
+`tests/test_world_edit_commands.py` umfasst 12 bestandene Verträge. Der
+angemeldete Browser-End-to-End-Nachweis für die automatische Migration bleibt
+ein separater manueller Prüfpunkt.
 
 Zusätzlich wurde der neue Earth-v1-Slice dokumentiert. Dieser ergänzt den
 bestehenden `flat`-Provider, ersetzt ihn aber nicht. Der bisherige

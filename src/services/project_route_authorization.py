@@ -1,8 +1,9 @@
 """HTTP enforcement for project-scoped Chunk routes.
 
-Only an authenticated Editor service request reaches this guard.  The Editor
+Authenticated Editor and Core service requests reach this guard. The Editor
 passes identity and public-read verification derived from the App-signed
-ticket; browser-supplied identity headers never reach Chunk directly.
+ticket. Core may execute only its bound, translated world-command path;
+browser-supplied identity headers never reach Chunk directly.
 """
 
 from __future__ import annotations
@@ -11,6 +12,26 @@ import hmac
 from typing import Any
 
 from flask import Flask, Response, current_app, jsonify, request
+
+
+_CORE_ALLOWED_RUNTIME_OPERATIONS = frozenset(
+    {
+        "chunks.read",
+        "chunks.batch.read",
+        # Core is the CAD translation boundary.  The command route is the one
+        # controlled mutation entry point it needs in order to persist the
+        # translated WorldEdit command (including newly affected chunks).
+        "commands.execute",
+    }
+)
+
+
+def _core_runtime_operation_allowed(blueprint: str, operation: str) -> bool:
+    if operation not in _CORE_ALLOWED_RUNTIME_OPERATIONS:
+        return False
+    if operation == "commands.execute":
+        return blueprint == "commands"
+    return blueprint == "chunks"
 
 
 def _header_bool(name: str) -> bool:
@@ -91,7 +112,7 @@ def install_project_route_authorization(app: Flask) -> bool:
         service_id = str(getattr(principal, "service_id", "") or "")
 
         # App owns provisioning and access projection. Runtime data access is
-        # performed by Editor or, read-only, by Core and is checked below.
+        # performed by Editor or through Core's narrow translation boundary.
         if service_id == "vectoplan-app":
             return None
         if request.blueprint == "project_access":
@@ -124,16 +145,21 @@ def install_project_route_authorization(app: Flask) -> bool:
             or ""
         ).strip()
 
-        # Core is the translation boundary and may only read existing Chunk
-        # snapshots. It cannot mutate projects, commands or access projections.
+        # Core is the translation boundary. It may read existing snapshots and
+        # execute a translated world command, but it cannot manage projects,
+        # mutate worlds directly, materialize arbitrary chunks or change access
+        # projections. Every permitted request is still bound to the exact App
+        # and Chunk project pair below.
         if service_id == "vectoplan-core":
-            if request.blueprint != "chunks" or operation not in {
-                "chunks.read",
-                "chunks.batch.read",
-            }:
+            if not _core_runtime_operation_allowed(
+                str(request.blueprint or ""), operation
+            ):
                 return _error(
                     "core_runtime_operation_forbidden",
-                    "vectoplan-core may only read existing Chunk snapshots.",
+                    (
+                        "vectoplan-core may only read existing Chunk snapshots "
+                        "or execute bound translated world commands."
+                    ),
                     403,
                 )
             if not claimed_chunk_id or not hmac.compare_digest(claimed_chunk_id, project_id):
@@ -212,4 +238,7 @@ def install_project_route_authorization(app: Flask) -> bool:
     return True
 
 
-__all__ = ["install_project_route_authorization"]
+__all__ = [
+    "install_project_route_authorization",
+    "_core_runtime_operation_allowed",
+]

@@ -10,6 +10,12 @@ Kurz gesagt:
 
 Für Earth-Welten ist zusätzlich die produktive DGM-Pipeline angeschlossen. Die vollständige serviceübergreifende Beschreibung einschließlich Freigabe, Höhenindex, Releasewechsel, Cache-Schichten, RLE-Batches, Karten-Prefetch, Spawn, Meshing und Live-Diagnose steht in [`docs/EARTH_DGM_PIPELINE.md`](docs/EARTH_DGM_PIPELINE.md).
 
+Der aktuelle Vertrag für Flurstücksauswahl, Grundstücksraster, WorldEdit und
+semantische Polygon-Platzierungen ist in
+[`../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md`](../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md)
+dokumentiert. `PlaceObject` ist für diese Footprints kein Zukunftspfad mehr,
+sondern ein produktiv genutzter Command.
+
 ---
 
 ## Inhalt
@@ -27,6 +33,8 @@ Für Earth-Welten ist zusätzlich die produktive DGM-Pipeline angeschlossen. Die
 - [Empfohlene Service-Struktur](#empfohlene-service-struktur)
 - [Datenfluss](#datenfluss)
 - [Earth-DGM-Pipeline](docs/EARTH_DGM_PIPELINE.md)
+- [Grundstücksraster und WorldEdit](../vectoplan-editor/docs/PARCEL_GRID_AND_WORLDEDIT.md)
+- [Dynamische Geodaten-Overlays](docs/GEODATA_OVERLAYS.md)
 - [Entwicklungsreihenfolge](#entwicklungsreihenfolge)
 - [Wichtige Invarianten](#wichtige-invarianten)
 - [Offene spätere Themen](#offene-spätere-themen)
@@ -626,7 +634,41 @@ Beispiel `RemoveBlock`:
 }
 ```
 
-Antwort:
+Beispiel `PlaceObject` für eine schräge Grundstücksrasterzelle:
+
+```json
+{
+  "type": "PlaceObject",
+  "worldId": "default",
+  "userId": "user_123",
+  "sessionId": "session_abc",
+  "position": {"x": 12, "y": 4, "z": 8},
+  "blockTypeId": "system_terrain",
+  "objectTypeId": "parcel_grid_body",
+  "objectKind": "semantic_footprint",
+  "dimensions": {"x": 1, "y": 1, "z": 1},
+  "footprint": {
+    "type": "Polygon",
+    "coordinateSpace": "world-cell-xz",
+    "coordinates": [[[12.0, 8.0], [12.8, 8.2], [12.6, 9.0], [12.0, 8.0]]],
+    "baseY": 4,
+    "height": 1,
+    "gridSchemaVersion": "vectoplan-parcel-grid-guide.v6"
+  },
+  "occupiedCells": [{"x": 12, "y": 4, "z": 8}],
+  "metadata": {
+    "schemaVersion": "vectoplan-parcel-grid-body.v1"
+  }
+}
+```
+
+Der Handler dedupliziert `occupiedCells`, gruppiert sie nach Chunk und speichert
+`WorldObjectInstance`, `WorldObjectChunkRef`, Snapshot-`objectRefs`, Events und
+Dirty-Chunks. Der Polygon-Footprint ist die Geometriewahrheit für Renderer,
+Reload und nachgelagerte CAD-/Core-Projektionen; die belegten Voxel bleiben die
+Kollisions- und Materialwahrheit.
+
+Beispielantwort auf `SetBlock`:
 
 ```json
 {

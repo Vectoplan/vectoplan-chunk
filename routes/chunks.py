@@ -70,6 +70,7 @@ from models import (
     WorldCommandLog,
     get_model_debug_summary,
 )
+from src.georeferencing.frame_contract import earth_grid_frame_contract
 
 
 chunks_bp = Blueprint("chunks", __name__)
@@ -1906,6 +1907,20 @@ def _serialize_chunk_load_result(
     ):
         _apply_surface_shell(body['chunk'])
 
+    # Geodata overlays are response-only rendering contracts.  They are
+    # intentionally attached after snapshot/generator resolution so source
+    # geometry is never duplicated in ChunkSnapshot and never changes cells.
+    try:
+        from src.geodata.visual_overlays import attach_geodata_overlays
+
+        attach_geodata_overlays(body['chunk'], world)
+    except Exception as exc:
+        _log_checkpoint(
+            "attach_geodata_overlays_failed",
+            chunkKey=result.get("chunkKey"),
+            error=_safe_exception_message(exc),
+        )
+
     if compact_cells or 'vectoplan-editor' in request.headers.get('User-Agent', '').lower():
         _compact_chunk_cells(body['chunk'])
 
@@ -1987,6 +2002,11 @@ def get_project_world_chunk_index(project_id: str, world_id: str):
             universe_id=universe_id,
             include_deleted=include_deleted,
         )
+        coordinate_frame = None
+        try:
+            coordinate_frame = earth_grid_frame_contract(world.build_earth_provider())
+        except (AttributeError, TypeError, ValueError):
+            coordinate_frame = None
         query = db.session.query(
             ChunkSnapshot.chunk_x,
             ChunkSnapshot.chunk_y,
@@ -2276,6 +2296,11 @@ def get_project_world_user_placements(project_id: str, world_id: str):
             universe_id=universe_id,
             include_deleted=include_deleted,
         )
+        coordinate_frame = None
+        try:
+            coordinate_frame = earth_grid_frame_contract(world.build_earth_provider())
+        except (AttributeError, TypeError, ValueError):
+            coordinate_frame = None
         latest_event_ids = (
             db.session.query(db.func.max(ChunkEvent.id).label("event_id"))
             .filter(ChunkEvent.world_db_id == world.id)
@@ -2307,6 +2332,8 @@ def get_project_world_user_placements(project_id: str, world_id: str):
                 [
                     ChunkEvent.object_type_id,
                     ChunkEvent.object_variant_id,
+                    ChunkEvent.object_instance_id,
+                    ChunkEvent.object_footprint_json,
                     ChunkEvent.payload_json,
                     WorldCommandLog.request_payload_json,
                 ]
@@ -2374,6 +2401,12 @@ def get_project_world_user_placements(project_id: str, world_id: str):
                     "authoredByUser": True,
                     "authorship": authorship,
                     "semantics": semantics,
+                    "semanticGeometry": {
+                        "schemaVersion": "vectoplan-semantic-placement-geometry.v1",
+                        "objectInstanceId": row.object_instance_id,
+                        "objectTypeId": row.object_type_id,
+                        "footprint": _make_json_safe(row.object_footprint_json or {}, max_depth=20),
+                    } if row.object_footprint_json else None,
                 }
             )
         fingerprint = hashlib.sha256(
@@ -2387,6 +2420,7 @@ def get_project_world_user_placements(project_id: str, world_id: str):
                     "projectId": project.project_id,
                     "universeId": universe.universe_id,
                     "worldId": world.world_id,
+                    "coordinateFrame": coordinate_frame,
                     "placements": page,
                     "fingerprint": fingerprint,
                     "total": len(fingerprint_source),

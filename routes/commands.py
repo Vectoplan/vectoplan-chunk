@@ -12,6 +12,7 @@ Supported command types in this slice:
 - SetBlock
 - RemoveBlock
 - ReplaceBlock
+- WorldEdit
 - PlaceObject
 - RemoveObject
 
@@ -156,6 +157,11 @@ _COMMAND_TYPE_ALIASES = {
     "replace_block": "ReplaceBlock",
     "replace-block": "ReplaceBlock",
     "ReplaceBlock": "ReplaceBlock",
+
+    "worldedit": "WorldEdit",
+    "world_edit": "WorldEdit",
+    "world-edit": "WorldEdit",
+    "WorldEdit": "WorldEdit",
 
     "placeobject": "PlaceObject",
     "place_object": "PlaceObject",
@@ -1413,14 +1419,14 @@ def _first_mapping_text(
 
 
 def _trusted_editor_service_id() -> Optional[str]:
-    """Return the authenticated editor service id for this request."""
+    """Return the trusted model-authoring service id for this request."""
     try:
         from src.services.service_auth_service import get_current_service_principal
 
         principal = get_current_service_principal(None)
         trusted = bool(getattr(principal, "is_trusted_service", False))
         service_id = _coerce_string(getattr(principal, "service_id", ""))
-        if trusted and service_id == "vectoplan-editor":
+        if trusted and service_id in {"vectoplan-editor", "vectoplan-core"}:
             return service_id
     except Exception:
         pass
@@ -1435,7 +1441,7 @@ def _library_block_registration_context(
     """
     Validate the explicit Library/VPLIB context for a new runtime block type.
 
-    Unknown identifiers remain rejected unless the authenticated editor sends
+    Unknown identifiers remain rejected unless an authenticated model service sends
     an explicit ``libraryContext`` whose placement command and identity agree
     with the requested runtime block id.
     """
@@ -1554,7 +1560,7 @@ def _get_or_register_library_block_type(
         created_by_user_id=user_id,
         metadata_json={
             "source": "authenticated-library-placement",
-            "serviceId": "vectoplan-editor",
+            "serviceId": _trusted_editor_service_id(),
             "library": context,
         },
     )
@@ -2135,7 +2141,9 @@ def _save_snapshot_after_mutation(
         bump_revision=True,
     )
     db.session.add(existing_snapshot)
-    db.session.flush()
+    # Existing snapshots already have their database id.  The final transaction
+    # commit can persist this update together with the event and command log;
+    # flushing here added a synchronous database round-trip to every block edit.
     return existing_snapshot
 
 
@@ -2156,7 +2164,8 @@ def _attach_event_to_snapshot(snapshot: ChunkSnapshot, event: ChunkEvent, *, use
             pass
 
     db.session.add(snapshot)
-    db.session.flush()
+    # Keep the snapshot update pending so it is written in the same flush as the
+    # event and final command state at commit time.
 
 
 # -----------------------------------------------------------------------------
@@ -2285,7 +2294,7 @@ def _create_chunk_event(
     affected_bounds_json: Optional[Mapping[str, Any]] = None,
     payload_json: Optional[Mapping[str, Any]] = None,
 ) -> ChunkEvent:
-    """Create and flush ChunkEvent."""
+    """Create ChunkEvent and leave it pending for the transaction commit."""
     event = ChunkEvent.create(
         project_db_id=project.id,
         universe_db_id=universe.id,
@@ -2335,7 +2344,6 @@ def _create_chunk_event(
     )
 
     db.session.add(event)
-    db.session.flush()
     return event
 
 
@@ -2459,6 +2467,41 @@ def _execute_set_or_remove_block(
         cell_value=after_cell_value,
     )
 
+    # A semantic parcel-grid body deliberately occupies one authoritative
+    # voxel for collision/history while its visible geometry comes from the
+    # stored polygon. Removing that voxel must also remove the object ref;
+    # otherwise the polygon would remain as an unbreakable ghost mesh.
+    removed_semantic_object_ids: list[str] = []
+    if command_type == "RemoveBlock":
+        refs = content.get("objectRefs")
+        for ref in list(refs) if isinstance(refs, list) else []:
+            if not isinstance(ref, Mapping):
+                continue
+            ref_metadata = ref.get("metadata") if isinstance(ref.get("metadata"), Mapping) else {}
+            ref_kind = ref.get("objectKind")
+            is_parametric_library_object = (
+                ref_kind == "vplib_parametric"
+                or (
+                    ref_kind == "library_object"
+                    and ref_metadata.get("schemaVersion") == "vectoplan-vplib-parametric.v1"
+                )
+            )
+            if ref_kind != "semantic_footprint" and not is_parametric_library_object:
+                continue
+            occupied_cells = ref.get("occupiedCells")
+            occupies_target = any(
+                isinstance(item, Mapping)
+                and all(axis in item for axis in ("x", "y", "z"))
+                and _coerce_int(item.get("x"), fallback=0) == position["x"]
+                and _coerce_int(item.get("y"), fallback=0) == position["y"]
+                and _coerce_int(item.get("z"), fallback=0) == position["z"]
+                for item in (occupied_cells if isinstance(occupied_cells, list) else [])
+            )
+            object_instance_id = _coerce_string(ref.get("objectInstanceId"))
+            if occupies_target and object_instance_id:
+                removed_semantic_object_ids.append(object_instance_id)
+                _remove_object_ref_from_content(content, object_instance_id)
+
     snapshot = _save_snapshot_after_mutation(
         project=project,
         universe=universe,
@@ -2519,6 +2562,7 @@ def _execute_set_or_remove_block(
             "chunkVersion": snapshot.chunk_version,
             "changedChunks": [cell["chunkKey"]],
             "dirtyChunks": dirty_chunks,
+            "removedSemanticObjectIds": removed_semantic_object_ids,
         },
     )
 
@@ -2528,11 +2572,355 @@ def _execute_set_or_remove_block(
         "eventIds": [event.event_id],
         "changedChunks": [cell["chunkKey"]],
         "dirtyChunks": dirty_chunks,
+        "removedSemanticObjectIds": removed_semantic_object_ids,
         "affectedCells": [affected_cell],
         "snapshotIds": [snapshot.snapshot_id],
         "chunkVersions": {
             cell["chunkKey"]: snapshot.chunk_version,
         },
+    }
+
+
+def _execute_world_edit(
+    *,
+    project: Project,
+    universe: Universe,
+    world: WorldInstance,
+    payload: Mapping[str, Any],
+    command_log: WorldCommandLog,
+    user_id: Optional[str],
+    session_id: Optional[str],
+) -> dict[str, Any]:
+    """Execute one bounded WorldEdit plan as a single database transaction."""
+    from src.world_edit.commands import build_world_edit_plan
+
+    provider = None
+    if bool(getattr(world, "is_earth_world", False)):
+        build_provider = getattr(world, "build_earth_provider", None)
+        if callable(build_provider):
+            provider = build_provider()
+
+    plan = build_world_edit_plan(
+        payload,
+        provider=provider,
+        max_cells=_get_max_command_affected_cells(),
+    )
+    chunk_size = int(world.chunk_size or 16)
+    target_block = None
+    target_block_type_id: Optional[str] = None
+    if plan.operation not in {"clear", "copy", "cut", "paste"}:
+        target_block_type_id = _get_payload_block_type_id(payload, required=True)
+        target_block = _get_or_register_library_block_type(
+            world=world,
+            payload=payload,
+            block_type_id=target_block_type_id,
+            user_id=user_id,
+        )
+
+    replace_block_type_id = _coerce_string(
+        payload.get("replaceBlockTypeId")
+        or payload.get("replace_block_type_id")
+        or payload.get("fromBlockTypeId")
+        or payload.get("from_block_type_id")
+    ).strip()
+    if plan.operation == "replace" and not replace_block_type_id:
+        raise ValueError("replaceBlockTypeId is required for WorldEdit replace.")
+
+    grouped: dict[tuple[int, int, int], list[tuple[dict[str, int], tuple[int, int, int]]]] = {}
+    for position_tuple in plan.positions:
+        position = {
+            "x": int(position_tuple[0]),
+            "y": int(position_tuple[1]),
+            "z": int(position_tuple[2]),
+        }
+        cell = _world_position_to_chunk_cell(position, chunk_size)
+        key = (cell["chunkX"], cell["chunkY"], cell["chunkZ"])
+        grouped.setdefault(key, []).append((cell, position_tuple))
+
+    def read_clipboard() -> list[dict[str, Any]]:
+        if not plan.positions:
+            return []
+        origin_x = min(position[0] for position in plan.positions)
+        origin_y = min(position[1] for position in plan.positions)
+        origin_z = min(position[2] for position in plan.positions)
+        entries: list[dict[str, Any]] = []
+        for chunk_coordinates in sorted(grouped):
+            chunk_x, chunk_y, chunk_z = chunk_coordinates
+            _snapshot, content = _load_chunk_for_mutation(
+                project=project,
+                universe=universe,
+                world=world,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_z=chunk_z,
+            )
+            for cell, position_tuple in grouped[chunk_coordinates]:
+                cell_value = _get_cell_value(
+                    content,
+                    local_x=cell["localX"],
+                    local_y=cell["localY"],
+                    local_z=cell["localZ"],
+                    chunk_size=chunk_size,
+                )
+                entries.append({
+                    "dx": position_tuple[0] - origin_x,
+                    "dy": position_tuple[1] - origin_y,
+                    "dz": position_tuple[2] - origin_z,
+                    "blockTypeId": _block_type_id_from_cell_value(content, cell_value),
+                })
+        entries.sort(key=lambda item: (item["dy"], item["dz"], item["dx"]))
+        return entries
+
+    clipboard_data = read_clipboard() if plan.operation in {"copy", "cut"} else []
+    if plan.operation == "copy":
+        summary = {
+            "changed": False,
+            "tool": plan.tool,
+            "operation": plan.operation,
+            "requestedCellCount": plan.requested_cell_count,
+            "affectedCellCount": 0,
+            "clipboardCellCount": len(clipboard_data),
+            "parcelMaskEnabled": plan.parcel_mask_enabled,
+            "parcelCount": plan.parcel_count,
+            "coveragePolicy": plan.coverage_policy,
+            "changedChunks": [],
+            "dirtyChunks": [],
+        }
+        _mark_command_applied(
+            command_log,
+            changed=False,
+            affected_chunks_json=[],
+            affected_cells_json=[],
+            event_count=0,
+            result_payload_json=summary,
+        )
+        return {
+            "changed": False,
+            "commandType": "WorldEdit",
+            "eventIds": [],
+            "changedChunks": [],
+            "dirtyChunks": [],
+            "affectedCells": [],
+            "snapshotIds": [],
+            "chunkVersions": {},
+            "clipboard": clipboard_data,
+            "worldEdit": {**summary, "clipboard": clipboard_data},
+            "message": "WorldEdit selection copied.",
+        }
+
+    paste_by_position: dict[tuple[int, int, int], Optional[str]] = {}
+    if plan.operation == "paste":
+        anchor = payload.get("position") or payload.get("target") or {}
+        anchor_x = int(_coerce_int(_mapping_value(anchor).get("x"), fallback=0))
+        anchor_y = int(_coerce_int(_mapping_value(anchor).get("y"), fallback=0))
+        anchor_z = int(_coerce_int(_mapping_value(anchor).get("z"), fallback=0))
+        for raw_entry in payload.get("clipboard") or payload.get("cells") or []:
+            entry = _mapping_value(raw_entry)
+            position_key = (
+                anchor_x + int(_coerce_int(entry.get("dx"), fallback=0)),
+                anchor_y + int(_coerce_int(entry.get("dy"), fallback=0)),
+                anchor_z + int(_coerce_int(entry.get("dz"), fallback=0)),
+            )
+            block_id = _coerce_string(entry.get("blockTypeId") or entry.get("block_type_id")).strip()
+            paste_by_position[position_key] = block_id or None
+    paste_blocks: dict[str, BlockType] = {}
+
+    affected_cells_all: list[dict[str, Any]] = []
+    event_ids: list[str] = []
+    snapshot_ids: list[str] = []
+    chunk_versions: dict[str, str] = {}
+    changed_chunks: set[str] = set()
+    dirty_chunks: set[str] = set()
+
+    for chunk_coordinates in sorted(grouped):
+        chunk_x, chunk_y, chunk_z = chunk_coordinates
+        existing_snapshot, content = _load_chunk_for_mutation(
+            project=project,
+            universe=universe,
+            world=world,
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            chunk_z=chunk_z,
+        )
+        before_revision = existing_snapshot.chunk_revision if existing_snapshot else None
+        before_version = existing_snapshot.chunk_version if existing_snapshot else "generated"
+        before_hash = existing_snapshot.content_hash if existing_snapshot else content.get("contentHash")
+        chunk_affected_cells: list[dict[str, Any]] = []
+        chunk_dirty_keys: set[str] = set()
+
+        for cell, position_tuple in grouped[chunk_coordinates]:
+            before_cell_value = _get_cell_value(
+                content,
+                local_x=cell["localX"],
+                local_y=cell["localY"],
+                local_z=cell["localZ"],
+                chunk_size=chunk_size,
+            )
+            before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
+            cell_target_block_type_id = target_block_type_id
+            if plan.operation == "paste":
+                cell_target_block_type_id = paste_by_position.get(position_tuple)
+                if cell_target_block_type_id:
+                    paste_block = paste_blocks.get(cell_target_block_type_id)
+                    if paste_block is None:
+                        paste_block = _get_or_register_library_block_type(
+                            world=world,
+                            payload=payload,
+                            block_type_id=cell_target_block_type_id,
+                            user_id=user_id,
+                        )
+                        paste_blocks[cell_target_block_type_id] = paste_block
+                    after_cell_value = _cell_value_for_block_type(content, paste_block)
+                else:
+                    after_cell_value = AIR_CELL_VALUE
+            else:
+                after_cell_value = (
+                    AIR_CELL_VALUE
+                    if plan.operation in {"clear", "cut"}
+                    else _cell_value_for_block_type(content, target_block)
+                )
+            if plan.operation == "fill" and int(before_cell_value) != AIR_CELL_VALUE:
+                continue
+            if plan.operation == "replace" and before_block_type_id != replace_block_type_id:
+                continue
+            if plan.operation in {"clear", "cut"} or (plan.operation == "paste" and int(after_cell_value) == AIR_CELL_VALUE):
+                if int(before_cell_value) == AIR_CELL_VALUE:
+                    continue
+                _validate_breakable_before_cell(
+                    world=world,
+                    content=content,
+                    before_cell_value=before_cell_value,
+                )
+            if int(before_cell_value) == int(after_cell_value):
+                continue
+
+            _set_cell_value(
+                content,
+                local_x=cell["localX"],
+                local_y=cell["localY"],
+                local_z=cell["localZ"],
+                chunk_size=chunk_size,
+                cell_value=after_cell_value,
+            )
+            affected = {
+                "x": position_tuple[0],
+                "y": position_tuple[1],
+                "z": position_tuple[2],
+                "chunkX": cell["chunkX"],
+                "chunkY": cell["chunkY"],
+                "chunkZ": cell["chunkZ"],
+                "localX": cell["localX"],
+                "localY": cell["localY"],
+                "localZ": cell["localZ"],
+                "beforeCellValue": before_cell_value,
+                "afterCellValue": after_cell_value,
+                "beforeBlockTypeId": before_block_type_id,
+                "afterBlockTypeId": cell_target_block_type_id,
+            }
+            chunk_affected_cells.append(affected)
+            affected_cells_all.append(affected)
+            chunk_dirty_keys.update(_dirty_chunk_keys_for_cell(cell, chunk_size))
+
+        if not chunk_affected_cells:
+            continue
+
+        snapshot = _save_snapshot_after_mutation(
+            project=project,
+            universe=universe,
+            world=world,
+            existing_snapshot=existing_snapshot,
+            content=content,
+            materialized_reason=f"world_edit_{plan.tool}_{plan.operation}",
+            command_log=command_log,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        chunk_key = f"{chunk_x}:{chunk_y}:{chunk_z}"
+        event = _create_chunk_event(
+            project=project,
+            universe=universe,
+            world=world,
+            command_log=command_log,
+            snapshot=snapshot,
+            command_type="WorldEdit",
+            event_type="world_edit_change",
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            chunk_z=chunk_z,
+            user_id=user_id,
+            session_id=session_id,
+            position={
+                "x": chunk_affected_cells[0]["x"],
+                "y": chunk_affected_cells[0]["y"],
+                "z": chunk_affected_cells[0]["z"],
+            },
+            local_position={
+                "x": chunk_affected_cells[0]["localX"],
+                "y": chunk_affected_cells[0]["localY"],
+                "z": chunk_affected_cells[0]["localZ"],
+            },
+            before_block_type_id=None,
+            after_block_type_id=target_block_type_id,
+            target_face=_get_payload_target_face(payload),
+            tool=plan.tool,
+            chunk_revision_before=before_revision,
+            chunk_version_before=before_version,
+            content_hash_before=before_hash,
+            affected_cells=chunk_affected_cells,
+            dirty_chunks=sorted(chunk_dirty_keys),
+            affected_bounds_json=_make_json_safe(payload.get("bounds") or {}, max_depth=10),
+            payload_json={
+                "tool": plan.tool,
+                "operation": plan.operation,
+                "requestedCellCount": plan.requested_cell_count,
+                "affectedCellCount": len(chunk_affected_cells),
+                "parcelMaskEnabled": plan.parcel_mask_enabled,
+                "parcelCount": plan.parcel_count,
+                "coveragePolicy": plan.coverage_policy,
+            },
+        )
+        _attach_event_to_snapshot(snapshot, event, user_id=user_id, session_id=session_id)
+        event_ids.append(event.event_id)
+        snapshot_ids.append(snapshot.snapshot_id)
+        chunk_versions[chunk_key] = snapshot.chunk_version
+        changed_chunks.add(chunk_key)
+        dirty_chunks.update(chunk_dirty_keys)
+
+    changed = bool(affected_cells_all)
+    result_summary = {
+        "changed": changed,
+        "tool": plan.tool,
+        "operation": plan.operation,
+        "requestedCellCount": plan.requested_cell_count,
+        "affectedCellCount": len(affected_cells_all),
+        "parcelMaskEnabled": plan.parcel_mask_enabled,
+        "parcelCount": plan.parcel_count,
+        "coveragePolicy": plan.coverage_policy,
+        "changedChunks": sorted(changed_chunks),
+        "dirtyChunks": sorted(dirty_chunks),
+    }
+    if clipboard_data:
+        result_summary["clipboardCellCount"] = len(clipboard_data)
+    _mark_command_applied(
+        command_log,
+        changed=changed,
+        affected_chunks_json=sorted(changed_chunks),
+        affected_cells_json=affected_cells_all,
+        event_count=len(event_ids),
+        result_payload_json=result_summary,
+    )
+    return {
+        "changed": changed,
+        "commandType": "WorldEdit",
+        "eventIds": event_ids,
+        "changedChunks": sorted(changed_chunks),
+        "dirtyChunks": sorted(dirty_chunks),
+        "affectedCells": affected_cells_all,
+        "snapshotIds": snapshot_ids,
+        "chunkVersions": chunk_versions,
+        "worldEdit": result_summary,
+        **({"clipboard": clipboard_data} if clipboard_data else {}),
+        "message": "WorldEdit applied." if changed else "No change.",
     }
 
 
@@ -2644,6 +3032,106 @@ def _iter_object_cells(anchor: Mapping[str, int], dimensions: Mapping[str, int])
     return cells
 
 
+def _extract_object_occupied_cells(
+    payload: Mapping[str, Any],
+    *,
+    anchor: Mapping[str, int],
+    dimensions: Mapping[str, int],
+) -> list[dict[str, int]]:
+    """Read an explicit semantic footprint occupancy or use the rectangular fallback."""
+    requested = payload.get("occupiedCells") or payload.get("occupied_cells")
+    if requested is None:
+        return _iter_object_cells(anchor, dimensions)
+    if not isinstance(requested, Sequence) or isinstance(requested, (str, bytes)):
+        raise ValueError("occupiedCells must be a JSON array.")
+    if len(requested) == 0:
+        raise ValueError("occupiedCells must contain at least one world cell.")
+    if len(requested) > _get_max_command_affected_cells():
+        raise ValueError(
+            f"Object affects {len(requested)} cells, but maximum is {_get_max_command_affected_cells()}."
+        )
+    cells: list[dict[str, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for index, value in enumerate(requested):
+        if not isinstance(value, Mapping):
+            raise ValueError(f"occupiedCells[{index}] must be a JSON object.")
+        cell = {
+            "x": _coerce_int(value.get("x"), field_name=f"occupiedCells[{index}].x"),
+            "y": _coerce_int(value.get("y"), field_name=f"occupiedCells[{index}].y"),
+            "z": _coerce_int(value.get("z"), field_name=f"occupiedCells[{index}].z"),
+        }
+        key = (cell["x"], cell["y"], cell["z"])
+        if key not in seen:
+            seen.add(key)
+            cells.append(cell)
+    return cells
+
+
+_PLACE_OBJECT_GEOMETRY_UPDATE_ATTRIBUTES = (
+    "object_source",
+    "object_kind",
+    "object_type_id",
+    "object_variant_id",
+    "anchor_mode",
+    "anchor_x",
+    "anchor_y",
+    "anchor_z",
+    "size_x",
+    "size_y",
+    "size_z",
+    "rotation_json",
+    "transform_json",
+    "bounds_json",
+    "footprint_json",
+    "occupied_cells_json",
+    "occupied_cell_count",
+    "touched_chunks_json",
+    "touched_chunk_count",
+    "primary_chunk_x",
+    "primary_chunk_y",
+    "primary_chunk_z",
+    "primary_chunk_key",
+    "metadata_json",
+)
+
+
+def _world_cell_coordinate_set(cells: Sequence[Any]) -> set[tuple[int, int, int]]:
+    return {
+        (
+            _coerce_int(cell.get("x"), fallback=0),
+            _coerce_int(cell.get("y"), fallback=0),
+            _coerce_int(cell.get("z"), fallback=0),
+        )
+        for cell in cells
+        if isinstance(cell, Mapping)
+    }
+
+
+def _apply_existing_object_geometry_update(
+    existing_object_instance: WorldObjectInstance,
+    candidate_object_instance: WorldObjectInstance,
+    *,
+    command_id: str,
+    user_id: Optional[str],
+    session_id: Optional[str],
+) -> WorldObjectInstance:
+    """Apply one idempotent remesh without changing the object's voxel identity."""
+    existing_cells = _world_cell_coordinate_set(existing_object_instance.occupied_cells_json or [])
+    requested_cells = _world_cell_coordinate_set(candidate_object_instance.occupied_cells_json or [])
+    if existing_cells != requested_cells:
+        raise ValueError(
+            "An existing PlaceObject may only update geometry while keeping the same occupiedCells."
+        )
+    for attribute in _PLACE_OBJECT_GEOMETRY_UPDATE_ATTRIBUTES:
+        setattr(existing_object_instance, attribute, getattr(candidate_object_instance, attribute))
+    existing_object_instance.updated_by_command_id = command_id
+    existing_object_instance.touch(
+        updated_by_user_id=user_id,
+        last_session_id=session_id,
+    )
+    return existing_object_instance
+
+
 def _group_world_cells_by_chunk(
     cells: Sequence[Mapping[str, int]],
     *,
@@ -2709,17 +3197,22 @@ def _execute_place_object(
     )
 
     fill_block_type_id = _get_payload_block_type_id(payload, required=True)
-    fill_block = _get_block_type(
+    fill_block = _get_or_register_library_block_type(
         world=world,
+        payload=payload,
         block_type_id=fill_block_type_id,
-        require_placeable=True,
+        user_id=user_id,
     )
 
-    occupied_world_cells = _iter_object_cells(anchor, dimensions)
+    occupied_world_cells = _extract_object_occupied_cells(
+        payload,
+        anchor=anchor,
+        dimensions=dimensions,
+    )
     grouped = _group_world_cells_by_chunk(occupied_world_cells, chunk_size=int(world.chunk_size or 16))
     touched_chunks = sorted(grouped.keys())
 
-    object_instance = WorldObjectInstance.create_for_world(
+    candidate_object_instance = WorldObjectInstance.create_for_world(
         world,
         object_instance_id=object_instance_id,
         object_type_id=object_type_id,
@@ -2734,6 +3227,7 @@ def _execute_place_object(
         object_kind=payload.get("objectKind") or payload.get("object_kind") or "block_composite",
         rotation_json=object_payload.get("rotation") if isinstance(object_payload.get("rotation"), Mapping) else None,
         transform_json=object_payload.get("transform") if isinstance(object_payload.get("transform"), Mapping) else None,
+        footprint_json=payload.get("footprint") if isinstance(payload.get("footprint"), Mapping) else None,
         occupied_cells_json=occupied_world_cells,
         touched_chunks_json=touched_chunks,
         primary_chunk_x=grouped[touched_chunks[0]]["chunkX"] if touched_chunks else None,
@@ -2747,11 +3241,48 @@ def _execute_place_object(
         metadata_json={
             "routeSource": ROUTE_SOURCE,
             "fillBlockTypeId": fill_block_type_id,
-            "phase": "rectangular-block-composite-v1",
+            "phase": "semantic-footprint-v1" if isinstance(payload.get("footprint"), Mapping) else "rectangular-block-composite-v1",
+            **(dict(payload.get("metadata")) if isinstance(payload.get("metadata"), Mapping) else {}),
         },
     )
-    db.session.add(object_instance)
+    existing_object_instance = None
+    if object_instance_id:
+        existing_query = WorldObjectInstance.query.filter(
+            WorldObjectInstance.world_db_id == world.id,
+            WorldObjectInstance.object_instance_id == object_instance_id,
+            WorldObjectInstance.deleted_at.is_(None),
+        )
+        existing_object_instance = _safe_one_or_none(
+            _query_without_relationships(existing_query),
+            entity_name="WorldObjectInstance",
+            lookup={"worldDbId": world.id, "objectInstanceId": object_instance_id},
+        )
+
+    updating_existing_object = existing_object_instance is not None
+    if existing_object_instance is not None:
+        # Parcel-grid remeshing is an idempotent geometry update. Reuse the
+        # logical object and its chunk refs instead of appending another object
+        # ref on every reload or grid change.
+        object_instance = _apply_existing_object_geometry_update(
+            existing_object_instance,
+            candidate_object_instance,
+            command_id=command_log.command_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    else:
+        object_instance = candidate_object_instance
+        db.session.add(object_instance)
     db.session.flush()
+
+    existing_refs_by_chunk: dict[str, WorldObjectChunkRef] = {}
+    if updating_existing_object:
+        refs_query = WorldObjectChunkRef.query.filter(
+            WorldObjectChunkRef.object_instance_db_id == object_instance.id,
+            WorldObjectChunkRef.deleted_at.is_(None),
+        )
+        for existing_ref in _query_without_relationships(refs_query).all():
+            existing_refs_by_chunk[str(existing_ref.chunk_key)] = existing_ref
 
     changed_chunks: list[str] = []
     dirty_chunks_set: set[str] = set()
@@ -2767,6 +3298,11 @@ def _execute_place_object(
         "anchor": anchor,
         "dimensions": dimensions,
         "fillBlockTypeId": fill_block_type_id,
+        "primaryChunkKey": object_instance.primary_chunk_key,
+        "objectKind": object_instance.object_kind,
+        "footprint": _make_json_safe(object_instance.footprint_json or {}, max_depth=20),
+        "occupiedCells": _make_json_safe(occupied_world_cells, max_depth=20),
+        "metadata": _make_json_safe(object_instance.metadata_json or {}, max_depth=20),
     }
 
     for chunk_key, group in grouped.items():
@@ -2830,6 +3366,8 @@ def _execute_place_object(
             for dirty_key in _dirty_chunk_keys_for_cell(cell, int(world.chunk_size or 16)):
                 dirty_chunks_set.add(dirty_key)
 
+        if updating_existing_object:
+            _remove_object_ref_from_content(content, object_instance.object_instance_id)
         _add_object_ref_to_content(content, object_ref)
 
         snapshot = _save_snapshot_after_mutation(
@@ -2844,22 +3382,34 @@ def _execute_place_object(
             session_id=session_id,
         )
 
-        ref_obj = WorldObjectChunkRef.create_for_object(
-            object_instance,
-            chunk_x=group["chunkX"],
-            chunk_y=group["chunkY"],
-            chunk_z=group["chunkZ"],
-            chunk_key=chunk_key,
-            ref_role="primary" if chunk_key == object_instance.primary_chunk_key else "occupied",
-            occupied_cells_json=group_affected_cells,
-            object_content_hash=snapshot.content_hash,
-            world_bounds_json=object_instance.bounds_json,
-            metadata_json={
+        ref_obj = existing_refs_by_chunk.get(chunk_key)
+        if ref_obj is None:
+            ref_obj = WorldObjectChunkRef.create_for_object(
+                object_instance,
+                chunk_x=group["chunkX"],
+                chunk_y=group["chunkY"],
+                chunk_z=group["chunkZ"],
+                chunk_key=chunk_key,
+                ref_role="primary" if chunk_key == object_instance.primary_chunk_key else "occupied",
+                occupied_cells_json=group_affected_cells,
+                object_content_hash=snapshot.content_hash,
+                world_bounds_json=object_instance.bounds_json,
+                metadata_json={
+                    "routeSource": ROUTE_SOURCE,
+                    "fillBlockTypeId": fill_block_type_id,
+                },
+            )
+            db.session.add(ref_obj)
+        else:
+            ref_obj.restore()
+            ref_obj.ref_role = "primary" if chunk_key == object_instance.primary_chunk_key else "occupied"
+            ref_obj.replace_occupied_cells(group_affected_cells)
+            ref_obj.world_bounds_json = _make_json_safe(object_instance.bounds_json or {}, max_depth=20)
+            ref_obj.object_content_hash = snapshot.content_hash
+            ref_obj.metadata_json = {
                 "routeSource": ROUTE_SOURCE,
                 "fillBlockTypeId": fill_block_type_id,
-            },
-        )
-        db.session.add(ref_obj)
+            }
         db.session.flush()
 
         event = _create_chunk_event(
@@ -2934,6 +3484,7 @@ def _execute_place_object(
         result_payload_json={
             "changed": True,
             "objectInstanceId": object_instance.object_instance_id,
+            "updatedExistingObject": updating_existing_object,
             "eventIds": event_ids,
             "snapshotIds": snapshot_ids,
             "changedChunks": changed_chunks,
@@ -2945,6 +3496,7 @@ def _execute_place_object(
         "changed": True,
         "commandType": "PlaceObject",
         "objectInstanceId": object_instance.object_instance_id,
+        "updatedExistingObject": updating_existing_object,
         "eventIds": event_ids,
         "changedChunks": sorted(changed_chunks),
         "dirtyChunks": dirty_chunks,
@@ -3282,6 +3834,16 @@ def _execute_command(
             user_id=user_id,
             session_id=session_id,
         )
+    elif command_type == "WorldEdit":
+        result = _execute_world_edit(
+            project=project,
+            universe=universe,
+            world=world,
+            payload=payload,
+            command_log=command_log,
+            user_id=user_id,
+            session_id=session_id,
+        )
     elif command_type == "PlaceObject":
         result = _execute_place_object(
             project=project,
@@ -3306,6 +3868,9 @@ def _execute_command(
         raise ValueError(f"Command type '{command_type}' is not implemented in this route.")
 
     db.session.add(command_log)
+    # Flush the event, snapshot update and final command state together.  This
+    # preserves database-generated serialization fields without paying one
+    # round-trip for each intermediate object.
     db.session.flush()
 
     return command_log, result
@@ -3629,6 +4194,7 @@ def get_commands_route_status():
                     "SetBlock",
                     "RemoveBlock",
                     "ReplaceBlock",
+                    "WorldEdit",
                     "PlaceObject",
                     "RemoveObject",
                 ],
