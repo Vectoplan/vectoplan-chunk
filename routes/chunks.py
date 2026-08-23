@@ -2150,8 +2150,17 @@ def _first_text(*values: Any) -> Optional[str]:
     return None
 
 
+_NESTED_SEMANTIC_VARIABLE_KEYS = frozenset({"roof.request", "roof.calculation"})
+_NESTED_SEMANTIC_VARIABLE_BYTE_LIMIT = 2_000_000
+
+
 def _compact_definition_values(value: Any, *, limit: int = 256) -> dict[str, Any]:
-    """Keep only the declarative scalar values needed by downstream geometry."""
+    """Keep compact declarative values needed by downstream geometry.
+
+    General Library definition values remain scalar-only. Parametric roofs are
+    the deliberate exception: CAD needs their versioned request and calculated
+    skin/structure geometry after a Chunk -> Core -> 2D roundtrip.
+    """
     if not isinstance(value, Mapping):
         return {}
     result: dict[str, Any] = {}
@@ -2159,9 +2168,21 @@ def _compact_definition_values(value: Any, *, limit: int = 256) -> dict[str, Any
         if len(result) >= limit:
             break
         key = str(raw_key or "").strip()[:240]
-        if not key or not isinstance(raw_value, (str, int, float, bool, type(None))):
+        if not key:
             continue
-        result[key] = raw_value
+        if isinstance(raw_value, (str, int, float, bool, type(None))):
+            result[key] = raw_value
+            continue
+        if key not in _NESTED_SEMANTIC_VARIABLE_KEYS or not isinstance(raw_value, Mapping):
+            continue
+        safe_value = _make_json_safe(raw_value, max_depth=35)
+        encoded = json.dumps(
+            safe_value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) <= _NESTED_SEMANTIC_VARIABLE_BYTE_LIMIT:
+            result[key] = safe_value
     return result
 
 

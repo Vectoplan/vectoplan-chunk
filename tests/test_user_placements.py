@@ -65,3 +65,41 @@ def test_compact_placement_semantics_keeps_library_identity_and_real_dimensions(
         command_source="editor",
         command_type="RemoveBlock",
     ) is False
+
+
+def test_compact_placement_semantics_keeps_only_versioned_nested_roof_geometry():
+    roof_request = {
+        "contract_version": "cad-roof-calculation-request/0.1",
+        "roof_type": "gable",
+        "footprint": {"outer_ring_mm": [[0, 0], [8000, 0], [8000, 6000], [0, 6000]]},
+    }
+    roof_calculation = {
+        "contract_version": "cad-roof-calculation-result/0.1",
+        "ok": True,
+        "roof_type": "gable",
+        "geometry": {"faces": [{"vertices_mm": [[0, 0, 3500], [8000, 0, 3500], [4000, 3000, 5900]]}]},
+        "structure": {"rafters": [{"start_mm": [0, 0, 3500], "end_mm": [4000, 3000, 5900]}]},
+    }
+    semantics = _compact_placement_semantics({
+        "blockTypeId": "system_terrain",
+        "metadata": {
+            "libraryPlacementContext": {
+                "familyId": "world-edit.roof",
+                "variantId": "gable",
+                "semanticProfile": {
+                    "role": "roof",
+                    "variables": {
+                        "semantic.role": "roof",
+                        "roof.request": roof_request,
+                        "roof.calculation": roof_calculation,
+                        "unrelated.nested": {"must": "not leak"},
+                    },
+                },
+            },
+        },
+    })
+
+    assert semantics["classification"]["role"] == "roof"
+    assert semantics["variables"]["roof.request"] == roof_request
+    assert semantics["variables"]["roof.calculation"] == roof_calculation
+    assert "unrelated.nested" not in semantics["variables"]

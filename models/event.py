@@ -64,6 +64,7 @@ CHUNK_EVENT_SCHEMA_VERSION = "chunk-event.schema.v1"
 COMMAND_TYPE_SET_BLOCK = "SetBlock"
 COMMAND_TYPE_REMOVE_BLOCK = "RemoveBlock"
 COMMAND_TYPE_REPLACE_BLOCK = "ReplaceBlock"
+COMMAND_TYPE_WORLD_EDIT = "WorldEdit"
 COMMAND_TYPE_APPLY_BLOCK_BATCH = "ApplyBlockBatch"
 COMMAND_TYPE_PLACE_OBJECT = "PlaceObject"
 COMMAND_TYPE_REMOVE_OBJECT = "RemoveObject"
@@ -79,6 +80,7 @@ VALID_COMMAND_TYPES = frozenset(
         COMMAND_TYPE_SET_BLOCK,
         COMMAND_TYPE_REMOVE_BLOCK,
         COMMAND_TYPE_REPLACE_BLOCK,
+        COMMAND_TYPE_WORLD_EDIT,
         COMMAND_TYPE_APPLY_BLOCK_BATCH,
         COMMAND_TYPE_PLACE_OBJECT,
         COMMAND_TYPE_REMOVE_OBJECT,
@@ -1018,7 +1020,7 @@ class WorldCommandLog(db.Model):
             name="ck_world_command_logs_command_id_not_empty",
         ),
         db.CheckConstraint(
-            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
+            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
             name="ck_world_command_logs_command_type_valid",
         ),
         db.CheckConstraint(
@@ -2057,7 +2059,7 @@ class ChunkEvent(db.Model):
             name="ck_chunk_events_event_status_valid",
         ),
         db.CheckConstraint(
-            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
+            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
             name="ck_chunk_events_command_type_valid",
         ),
         db.CheckConstraint(
