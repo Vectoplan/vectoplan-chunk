@@ -828,6 +828,9 @@ def attach_geodata_overlays(chunk: dict[str, Any], world: Any) -> bool:
             chunk_z=int(chunk.get("chunkZ") or 0),
             chunk_size=int(chunk.get("chunkSize") or getattr(world, "chunk_size", 16)),
         )
+        from src.geodata.lod2_buildings import append_building_overlay
+
+        append_building_overlay(contract, chunk=chunk, world=world, provider=provider)
     except Exception as exc:
         contract = {
             "schemaVersion": OVERLAY_SCHEMA_VERSION,

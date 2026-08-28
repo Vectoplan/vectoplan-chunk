@@ -81,7 +81,7 @@ ROUTE_SOURCE = "routes.chunks"
 CHUNK_RESPONSE_VERSION = "world-state-chunk-response.v1"
 CHUNK_BATCH_RESPONSE_VERSION = "world-state-chunk-batch-response.v1"
 CHUNK_INDEX_RESPONSE_VERSION = "world-state-chunk-index-response.v1"
-CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v2"
+CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v3"
 CHUNKS_STATUS_RESPONSE_VERSION = "chunks-route-status-response.v1"
 
 RUNTIME_CHUNK_CONTENT_VERSION = "runtime-chunk-content.v1"
@@ -2237,6 +2237,25 @@ def _compact_placement_semantics(
             placement_record_metadata.get("definition_values"),
         )
     )
+    model_context = {
+        key: value
+        for key, value in {
+            "source": _first_text(metadata.get("source"), command.get("source")),
+            "clientCommandId": _first_text(
+                metadata.get("clientCommandId"), metadata.get("client_command_id")
+            ),
+            "storeyId": _first_text(metadata.get("storeyId"), metadata.get("storey_id")),
+            "storeyName": _first_text(metadata.get("storeyName"), metadata.get("storey_name")),
+            "storeyBaseY": metadata.get("storeyBaseY", metadata.get("storey_base_y")),
+            "storeyHeightMm": metadata.get(
+                "storeyHeightMm", metadata.get("storey_height_mm")
+            ),
+            "placementPolicy": _first_text(
+                metadata.get("placementPolicy"), metadata.get("placement_policy")
+            ),
+        }.items()
+        if value not in (None, "")
+    }
     family_id = _first_text(
         context.get("familyId"),
         library_ref.get("familyId"),
@@ -2298,6 +2317,7 @@ def _compact_placement_semantics(
                 variables.get("semantic.role"),
             ),
         },
+        "model": model_context,
         "variables": variables,
     }
 

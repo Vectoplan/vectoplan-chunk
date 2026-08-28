@@ -32,6 +32,13 @@ def test_compact_placement_semantics_keeps_library_identity_and_real_dimensions(
         {
             "blockTypeId": "wall_runtime",
             "metadata": {
+                "source": "vectoplan-cad",
+                "clientCommandId": "cad-wall-1",
+                "storeyId": "upper_floor_2",
+                "storeyName": "2. Obergeschoss",
+                "storeyBaseY": 5,
+                "storeyHeightMm": 2645,
+                "placementPolicy": "above-supporting-surface",
                 "libraryPlacementContext": {
                     "source": "library",
                     "libraryItemId": "7",
@@ -58,6 +65,15 @@ def test_compact_placement_semantics_keeps_library_identity_and_real_dimensions(
     assert semantics["library"]["libraryItemId"] == "7"
     assert semantics["library"]["variantId"] == "dicke_365_mm"
     assert semantics["classification"]["role"] == "wall"
+    assert semantics["model"] == {
+        "source": "vectoplan-cad",
+        "clientCommandId": "cad-wall-1",
+        "storeyId": "upper_floor_2",
+        "storeyName": "2. Obergeschoss",
+        "storeyBaseY": 5,
+        "storeyHeightMm": 2645,
+        "placementPolicy": "above-supporting-surface",
+    }
     assert semantics["variables"]["dimensions.thickness_mm"] == 365
     assert "nested" not in semantics["variables"]
     assert _is_user_authored_event(
