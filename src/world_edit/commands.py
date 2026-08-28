@@ -107,6 +107,8 @@ def _normalize_operation(payload: Mapping[str, Any]) -> tuple[str, str]:
         "paint_brush": "paint",
         "sculpt-brush": "sculpt",
         "sculpt_brush": "sculpt",
+        "tentacle-brush": "tentacle",
+        "tentacle_brush": "tentacle",
         "selection-tool": "selection",
         "selection_tool": "selection",
         "remove": "clear",
@@ -115,7 +117,7 @@ def _normalize_operation(payload: Mapping[str, Any]) -> tuple[str, str]:
     }
     tool = aliases.get(tool, tool)
     operation = aliases.get(operation, operation)
-    supported_tools = {"selection", "paint", "sculpt", "clipboard"}
+    supported_tools = {"selection", "paint", "sculpt", "clipboard", "tentacle"}
     supported_operations = {"set", "wall", "fill", "replace", "clear", "copy", "cut", "paste"}
     if tool not in supported_tools:
         raise WorldEditValidationError(f"WorldEdit-Werkzeug '{tool}' wird nicht unterstuetzt.")
@@ -193,16 +195,15 @@ def _inside_inner_brush_shape(
     return _inside_brush_shape(shape, dx, dy, dz, inner_x, inner_y, inner_z)
 
 
-def _brush_candidates(payload: Mapping[str, Any]) -> Iterable[tuple[int, int, int]]:
-    center = _world_position(
-        payload.get("position") or payload.get("target"),
-        name="position",
-    )
+def _brush_candidates_at(
+    payload: Mapping[str, Any],
+    center: tuple[int, int, int],
+) -> Iterable[tuple[int, int, int]]:
     brush = _record(payload.get("brush") or payload.get("settings"))
     radius = _integer(brush.get("radius", 2), name="brush.radius", minimum=1, maximum=64)
-    rx = _integer(brush.get("radiusX", radius), name="brush.radiusX", minimum=1, maximum=64)
-    ry = _integer(brush.get("radiusY", radius), name="brush.radiusY", minimum=1, maximum=64)
-    rz = _integer(brush.get("radiusZ", radius), name="brush.radiusZ", minimum=1, maximum=64)
+    rx = _integer(brush.get("radiusX", radius), name="brush.radiusX", minimum=0, maximum=64)
+    ry = _integer(brush.get("radiusY", radius), name="brush.radiusY", minimum=0, maximum=64)
+    rz = _integer(brush.get("radiusZ", radius), name="brush.radiusZ", minimum=0, maximum=64)
     shape = _text(brush.get("shape"), "sphere").lower()
     if shape not in {"sphere", "box", "cylinder"}:
         raise WorldEditValidationError("brush.shape muss sphere, box oder cylinder sein.")
@@ -233,6 +234,25 @@ def _brush_candidates(payload: Mapping[str, Any]) -> Iterable[tuple[int, int, in
                 if density < 100 and _deterministic_density(x, y, z) >= density:
                     continue
                 yield x, y, z
+
+
+def _brush_candidates(payload: Mapping[str, Any]) -> Iterable[tuple[int, int, int]]:
+    center = _world_position(
+        payload.get("position") or payload.get("target"),
+        name="position",
+    )
+    yield from _brush_candidates_at(payload, center)
+
+
+def _tentacle_candidates(payload: Mapping[str, Any]) -> Iterable[tuple[int, int, int]]:
+    path = _items(payload.get("path") or payload.get("points"))
+    if len(path) < 2:
+        raise WorldEditValidationError("Tentacle-Pfad benoetigt mindestens zwei Punkte.")
+    if len(path) > 2_048:
+        raise WorldEditValidationError("Tentacle-Pfad darf hoechstens 2048 Punkte enthalten.")
+    for index, value in enumerate(path):
+        center = _world_position(value, name=f"path[{index}]")
+        yield from _brush_candidates_at(payload, center)
 
 
 def _clipboard_candidates(payload: Mapping[str, Any]) -> Iterable[tuple[int, int, int]]:
@@ -440,6 +460,8 @@ def build_world_edit_plan(
             if operation == "paste"
             else _selection_candidates(payload, operation=operation)
         )
+    elif tool == "tentacle":
+        candidates = _tentacle_candidates(payload)
     else:
         candidates = (
             _selection_candidates(payload, operation=operation)

@@ -3,12 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from models.event import VALID_COMMAND_TYPES, VALID_EVENT_TYPES
 from models.object import normalize_object_kind
 from src.world_edit.commands import WorldEditValidationError, build_world_edit_plan
 from routes.commands import (
     _PLACE_OBJECT_GEOMETRY_UPDATE_ATTRIBUTES,
     _apply_existing_object_geometry_update,
     _extract_object_occupied_cells,
+    _serialize_command_result,
+    WORLD_EDIT_EVENT_TYPE,
 )
 
 
@@ -315,3 +318,98 @@ def test_clipboard_paste_offsets_cells_from_target():
     })
 
     assert plan.positions == ((10, 20, 30), (12, 21, 29))
+
+
+def test_command_response_preserves_clipboard_capture():
+    project = SimpleNamespace(project_id="project")
+    universe = SimpleNamespace(universe_id="universe")
+    world = SimpleNamespace(
+        world_id="world",
+        template_id="earth",
+        provider_id="earth",
+        provider_world_id="earth",
+    )
+    command_log = SimpleNamespace(
+        command_id="command",
+        command_type="WorldEdit",
+        command_status="noop",
+    )
+    clipboard = [{"dx": 0, "dy": 0, "dz": 0, "blockTypeId": "stone"}]
+
+    result = _serialize_command_result(
+        project=project,
+        universe=universe,
+        world=world,
+        command_log=command_log,
+        result={
+            "changed": False,
+            "commandType": "WorldEdit",
+            "clipboard": clipboard,
+            "worldEdit": {"operation": "copy", "clipboardCellCount": 1},
+        },
+        include_command_log=False,
+    )
+
+    assert result["clipboard"] == clipboard
+    assert result["worldEdit"]["clipboardCellCount"] == 1
+
+
+def test_sculpt_accepts_a_single_horizontal_box_layer():
+    plan = build_world_edit_plan({
+        "tool": "sculpt",
+        "operation": "clear",
+        "position": {"x": 10, "y": 7, "z": 20},
+        "brush": {
+            "shape": "box",
+            "radius": 5,
+            "radiusX": 5,
+            "radiusY": 0,
+            "radiusZ": 5,
+        },
+        "parcelMask": {"enabled": False},
+    })
+
+    assert len(plan.positions) == 121
+    assert {position[1] for position in plan.positions} == {7}
+    assert (5, 7, 15) in plan.positions
+    assert (15, 7, 25) in plan.positions
+
+
+def test_tentacle_expands_a_deduplicated_brush_along_the_path():
+    plan = build_world_edit_plan({
+        "tool": "tentacle",
+        "operation": "clear",
+        "position": {"x": 0, "y": 0, "z": 0},
+        "path": [
+            {"x": 0, "y": 4, "z": 0},
+            {"x": 1, "y": 4, "z": 0},
+            {"x": 2, "y": 4, "z": 1},
+        ],
+        "brush": {"shape": "box", "radius": 1},
+        "parcelMask": {"enabled": False},
+    })
+
+    assert plan.tool == "tentacle"
+    assert len(plan.positions) == len(set(plan.positions))
+    assert (-1, 3, -1) in plan.positions
+    assert (3, 5, 2) in plan.positions
+
+
+def test_tentacle_rejects_an_incomplete_path():
+    with pytest.raises(WorldEditValidationError, match="mindestens zwei"):
+        build_world_edit_plan({
+            "tool": "tentacle",
+            "operation": "clear",
+            "path": [{"x": 0, "y": 0, "z": 0}],
+            "brush": {"shape": "sphere", "radius": 1},
+            "parcelMask": {"enabled": False},
+        })
+
+
+def test_world_edit_is_a_persistable_command_type():
+    assert "WorldEdit" in VALID_COMMAND_TYPES
+
+
+def test_world_edit_uses_a_persistable_region_event_type():
+    assert WORLD_EDIT_EVENT_TYPE == "region_change"
+    assert WORLD_EDIT_EVENT_TYPE in VALID_EVENT_TYPES

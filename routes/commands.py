@@ -102,6 +102,7 @@ AIR_CELL_VALUE = 0
 BLOCK_CELL_VALUE_RULE = "paletteIndex + 1"
 
 DEFAULT_MAX_COMMAND_AFFECTED_CELLS = 65536
+WORLD_EDIT_EVENT_TYPE = "region_change"
 DEFAULT_JSON_SAFE_MAX_DEPTH = 80
 
 ENV_ROUTE_INCLUDE_DEBUG_ERRORS = "VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS"
@@ -2843,7 +2844,12 @@ def _execute_world_edit(
             command_log=command_log,
             snapshot=snapshot,
             command_type="WorldEdit",
-            event_type="world_edit_change",
+            # WorldEdit mutates a bounded set of cells and therefore belongs
+            # to the persisted region-change event category.  Using an ad-hoc
+            # event type makes copy succeed (no event) while paste is rejected
+            # by ChunkEvent validation and the whole transaction is rolled
+            # back with HTTP 400.
+            event_type=WORLD_EDIT_EVENT_TYPE,
             chunk_x=chunk_x,
             chunk_y=chunk_y,
             chunk_z=chunk_z,
@@ -3947,6 +3953,16 @@ def _serialize_command_result(
 
     if result.get("message"):
         body["message"] = result.get("message")
+
+    # Clipboard capture is a read command whose useful result is not part of
+    # affectedCells.  Preserve the WorldEdit-specific response fields instead
+    # of dropping them in the generic command serializer; otherwise the editor
+    # receives an apparently successful copy with an empty clipboard.
+    if isinstance(result.get("worldEdit"), Mapping):
+        body["worldEdit"] = _make_json_safe(result.get("worldEdit"), max_depth=35)
+
+    if "clipboard" in result:
+        body["clipboard"] = _make_json_safe(list(result.get("clipboard") or []), max_depth=35)
 
     if include_command_log:
         body["commandLog"] = _serialize_command_log(

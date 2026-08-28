@@ -351,7 +351,8 @@ VECTOPLAN_CHUNK_TERRAIN_REGION_BATCH_POINTS=480
 ### Container und Health
 
 ```powershell
-docker compose -f docker-compose.yml ps vectoplan-editor vectoplan-chunk geoserver-orchestrator
+docker compose -f docker-compose.yml ps vectoplan-editor vectoplan-chunk
+docker compose -p vectoplan-bigdata -f ..\vectoplan-bigdata\docker-compose.yml ps geoserver-orchestrator
 curl.exe -fsS http://localhost:5110/health/ready
 curl.exe -fsS http://localhost:5102/projects/_status
 ```
@@ -430,8 +431,8 @@ Nach Frontendänderungen muss das Editor-Image neu gebaut und der Container neu 
 | feste Projektverknüpfungen | [`src/geodata/fixed_projects.py`](../src/geodata/fixed_projects.py) |
 | DGM, Releasewechsel und Cache | [`src/world/earth/terrain_pipeline.py`](../src/world/earth/terrain_pipeline.py) |
 | Chunk-, Batch- und Regionsrouten | [`routes/chunks.py`](../routes/chunks.py) |
-| Orchestrator-Freigabe und Serving | [`../../vectoplan-geoserver-orchestrator/src/publications/service.py`](../../vectoplan-geoserver-orchestrator/src/publications/service.py) |
-| Orchestrator-Adminrouten | [`../../vectoplan-geoserver-orchestrator/routes/admin.py`](../../vectoplan-geoserver-orchestrator/routes/admin.py) |
+| Orchestrator-Freigabe und Serving | [`../../../vectoplan-bigdata/services/vectoplan-geoserver-orchestrator/src/publications/service.py`](../../../vectoplan-bigdata/services/vectoplan-geoserver-orchestrator/src/publications/service.py) |
+| Orchestrator-Adminrouten | [`../../../vectoplan-bigdata/services/vectoplan-geoserver-orchestrator/routes/admin.py`](../../../vectoplan-bigdata/services/vectoplan-geoserver-orchestrator/routes/admin.py) |
 | Editor-Proxy | [`../../vectoplan-editor/routes/chunk.py`](../../vectoplan-editor/routes/chunk.py) |
 | RLE- und Batch-Normalisierung | [`../../vectoplan-editor/src/frontend/api/chunk_api_normalize.ts`](../../vectoplan-editor/src/frontend/api/chunk_api_normalize.ts) |
 | Sichtweite, Spawn und Meshing | [`../../vectoplan-editor/src/frontend/scene/scene_runtime.ts`](../../vectoplan-editor/src/frontend/scene/scene_runtime.ts) |

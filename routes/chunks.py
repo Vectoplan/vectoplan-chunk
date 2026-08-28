@@ -81,7 +81,7 @@ ROUTE_SOURCE = "routes.chunks"
 CHUNK_RESPONSE_VERSION = "world-state-chunk-response.v1"
 CHUNK_BATCH_RESPONSE_VERSION = "world-state-chunk-batch-response.v1"
 CHUNK_INDEX_RESPONSE_VERSION = "world-state-chunk-index-response.v1"
-CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v2"
+CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v3"
 CHUNKS_STATUS_RESPONSE_VERSION = "chunks-route-status-response.v1"
 
 RUNTIME_CHUNK_CONTENT_VERSION = "runtime-chunk-content.v1"
@@ -2150,8 +2150,17 @@ def _first_text(*values: Any) -> Optional[str]:
     return None
 
 
+_NESTED_SEMANTIC_VARIABLE_KEYS = frozenset({"roof.request", "roof.calculation"})
+_NESTED_SEMANTIC_VARIABLE_BYTE_LIMIT = 2_000_000
+
+
 def _compact_definition_values(value: Any, *, limit: int = 256) -> dict[str, Any]:
-    """Keep only the declarative scalar values needed by downstream geometry."""
+    """Keep compact declarative values needed by downstream geometry.
+
+    General Library definition values remain scalar-only. Parametric roofs are
+    the deliberate exception: CAD needs their versioned request and calculated
+    skin/structure geometry after a Chunk -> Core -> 2D roundtrip.
+    """
     if not isinstance(value, Mapping):
         return {}
     result: dict[str, Any] = {}
@@ -2159,9 +2168,21 @@ def _compact_definition_values(value: Any, *, limit: int = 256) -> dict[str, Any
         if len(result) >= limit:
             break
         key = str(raw_key or "").strip()[:240]
-        if not key or not isinstance(raw_value, (str, int, float, bool, type(None))):
+        if not key:
             continue
-        result[key] = raw_value
+        if isinstance(raw_value, (str, int, float, bool, type(None))):
+            result[key] = raw_value
+            continue
+        if key not in _NESTED_SEMANTIC_VARIABLE_KEYS or not isinstance(raw_value, Mapping):
+            continue
+        safe_value = _make_json_safe(raw_value, max_depth=35)
+        encoded = json.dumps(
+            safe_value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) <= _NESTED_SEMANTIC_VARIABLE_BYTE_LIMIT:
+            result[key] = safe_value
     return result
 
 
@@ -2216,6 +2237,25 @@ def _compact_placement_semantics(
             placement_record_metadata.get("definition_values"),
         )
     )
+    model_context = {
+        key: value
+        for key, value in {
+            "source": _first_text(metadata.get("source"), command.get("source")),
+            "clientCommandId": _first_text(
+                metadata.get("clientCommandId"), metadata.get("client_command_id")
+            ),
+            "storeyId": _first_text(metadata.get("storeyId"), metadata.get("storey_id")),
+            "storeyName": _first_text(metadata.get("storeyName"), metadata.get("storey_name")),
+            "storeyBaseY": metadata.get("storeyBaseY", metadata.get("storey_base_y")),
+            "storeyHeightMm": metadata.get(
+                "storeyHeightMm", metadata.get("storey_height_mm")
+            ),
+            "placementPolicy": _first_text(
+                metadata.get("placementPolicy"), metadata.get("placement_policy")
+            ),
+        }.items()
+        if value not in (None, "")
+    }
     family_id = _first_text(
         context.get("familyId"),
         library_ref.get("familyId"),
@@ -2277,6 +2317,7 @@ def _compact_placement_semantics(
                 variables.get("semantic.role"),
             ),
         },
+        "model": model_context,
         "variables": variables,
     }
 
