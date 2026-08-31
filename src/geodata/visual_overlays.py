@@ -72,6 +72,19 @@ class GeodataOverlayError(RuntimeError):
     """A recoverable overlay source or contract error."""
 
 
+def _remote_service_failure(error: BaseException) -> bool:
+    """Return True only for transport/service outages, not bad layer data."""
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (URLError, TimeoutError, ConnectionError, OSError)):
+            return True
+        current = current.__cause__ or current.__context__
+    message = _text(error).lower()
+    return "nicht erreichbar" in message or "timed out" in message or "timeout" in message
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = str(os.getenv(name, "")).strip().lower()
     if value in {"1", "true", "yes", "on", "enabled"}:
@@ -330,8 +343,8 @@ class OverlayPipelineConfig:
             ),
             request_timeout_seconds=_number(
                 os.getenv("VECTOPLAN_CHUNK_GEODATA_OVERLAY_TIMEOUT_SECONDS"),
-                20.0,
-                minimum=1.0,
+                1.5,
+                minimum=0.25,
                 maximum=120.0,
             ),
             version_cache_seconds=_number(
@@ -407,9 +420,18 @@ class OrchestratorOverlayClient:
             if cached and now - cached[0] <= self.config.version_cache_seconds:
                 return dict(cached[1])
             encoded = quote(dataset_id, safe="")
-            payload = self._request(
-                f"/admin/api/production-publications/{encoded}"
-            )
+            try:
+                payload = self._request(
+                    f"/admin/api/production-publications/{encoded}"
+                )
+            except GeodataOverlayError:
+                # An expired publication is still safer than making every
+                # editable chunk wait for an optional catalog service.
+                if cached:
+                    stale = dict(cached[1])
+                    stale["stale"] = True
+                    return stale
+                raise
             publication = payload.get("publication")
             if not isinstance(publication, Mapping):
                 raise GeodataOverlayError("Publikationsvertrag fehlt.")
@@ -612,7 +634,17 @@ class GeodataOverlayService:
         self.orchestrator = orchestrator or OrchestratorOverlayClient(config)
         self.wfs = wfs or GeoServerWfsClient(config)
         self._tiles: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self._unavailable: dict[tuple[str, str], tuple[float, str]] = {}
+        self._remote_failure_until = 0.0
+        self._remote_failure_message = ""
         self._lock = RLock()
+
+    def _trip_remote_circuit(self, error: BaseException) -> None:
+        if not _remote_service_failure(error):
+            return
+        with self._lock:
+            self._remote_failure_until = max(self._remote_failure_until, time.monotonic() + 30.0)
+            self._remote_failure_message = _text(error, "Optionaler Geodatendienst nicht erreichbar")[:500]
 
     def _tile_item(
         self,
@@ -667,7 +699,15 @@ class GeodataOverlayService:
         bbox = (
             min(longitudes), min(latitudes), max(longitudes), max(latitudes)
         )
-        feature_collection = self.wfs.feature_collection(definition, bbox)
+        try:
+            feature_collection = self.wfs.feature_collection(definition, bbox)
+        except Exception as exc:
+            self._trip_remote_circuit(exc)
+            if cached:
+                stale = dict(cached[1])
+                stale["source"] = {**dict(stale.get("source") or {}), "stale": True}
+                return stale
+            raise
 
         segments: list[list[list[float]]] = []
         seen: set[tuple[tuple[int, int], tuple[int, int]]] = set()
@@ -754,8 +794,15 @@ class GeodataOverlayService:
         definitions = effective_overlay_definitions(world)
         items: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
+        availability: list[dict[str, str]] = []
         for definition in definitions:
+            source_key = (definition.dataset_id, definition.type_name)
             try:
+                if self._remote_failure_until > time.monotonic():
+                    raise GeodataOverlayError(self._remote_failure_message or "Optionaler Geodatendienst nicht erreichbar")
+                unavailable = self._unavailable.get(source_key)
+                if unavailable and unavailable[0] > time.monotonic():
+                    raise GeodataOverlayError(unavailable[1])
                 publication = (
                     self.orchestrator.approved_publication(definition.dataset_id)
                     if definition.version_policy == "approved-release"
@@ -765,8 +812,7 @@ class GeodataOverlayService:
                         )
                     }
                 )
-                items.append(
-                    self._tile_item(
+                item = self._tile_item(
                         definition=definition,
                         publication=publication,
                         provider=provider,
@@ -774,8 +820,17 @@ class GeodataOverlayService:
                         chunk_z=chunk_z,
                         chunk_size=chunk_size,
                     )
-                )
+                availability.append({"id":definition.overlay_id,"kind":"vector","status":"available" if item["geometry"]["coordinates"] else "no-data"})
+                if item["geometry"]["coordinates"]:
+                    items.append(item)
+                self._unavailable.pop(source_key, None)
             except Exception as exc:
+                self._trip_remote_circuit(exc)
+                if not self._unavailable.get(source_key) or self._unavailable[source_key][0] <= time.monotonic():
+                    if len(self._unavailable)>=128:
+                        self._unavailable.pop(next(iter(self._unavailable)))
+                    self._unavailable[source_key] = (time.monotonic()+30, _text(exc)[:500])
+                availability.append({"id":definition.overlay_id,"kind":"vector","status":"unavailable"})
                 errors.append(
                     {
                         "id": definition.overlay_id,
@@ -792,6 +847,7 @@ class GeodataOverlayService:
             ),
             "items": items,
             "errors": errors,
+            "availability": availability,
         }
         earth_grid = earth_grid_frame_contract(provider)
         if earth_grid is not None:

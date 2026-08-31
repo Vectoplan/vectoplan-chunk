@@ -103,7 +103,9 @@ def test_world_transform_uses_same_terrain_height_and_retains_full_roof(tmp_path
     assert other_y == item  # frontend deduplicates complete buildings across Y levels
 
 
-def test_disabled_is_opt_in_and_missing_height_degrades_without_losing_parcels():
+def test_disabled_is_opt_in_and_missing_height_degrades_without_losing_parcels(tmp_path, monkeypatch):
+    database, *_ = imported(tmp_path)
+    monkeypatch.setenv("VECTOPLAN_CHUNK_LOD2_STORE", str(database))
     world = SimpleNamespace(metadata_json={}, surface_y=0)
     assert building_overlay_item(world=world, provider=None, chunk={}) is None
     world.metadata_json = {"lod2Buildings": {"enabled": True}}

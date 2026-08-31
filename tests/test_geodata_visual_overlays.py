@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
+from urllib.error import URLError
 
 from src.geodata.visual_overlays import (
     GeodataOverlayService,
@@ -93,6 +94,30 @@ def _service() -> GeodataOverlayService:
         orchestrator=_Orchestrator(),
         wfs=_Wfs(),
     )
+
+
+def test_unavailable_publication_is_negative_cached_but_other_layers_survive(monkeypatch):
+    monkeypatch.delenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', raising=False)
+    service = _service()
+    calls = []
+    class Missing:
+        def approved_publication(self, dataset_id):
+            calls.append(dataset_id)
+            raise RuntimeError('not released')
+    service.orchestrator = Missing()
+    world = _World({'geodataOverlays': [{'id':'unavailable','datasetId':'missing','workspace':'vectoplan','typeName':'missing',
+        'enabled':True,'renderMode':'surface-lines','versionPolicy':'approved-release'}]})
+    # Use the actual definition schema through the dedicated environment catalog.
+    import json
+    monkeypatch.setenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', json.dumps([
+        {'id':'live','datasetId':'flurstuecke','source':{'workspace':'vectoplan','typeName':'parcels','versionPolicy':'wfs-live'},'renderer':{'kind':'surface-lines'}},
+        {'id':'missing','datasetId':'missing','source':{'workspace':'vectoplan','typeName':'missing','versionPolicy':'approved-release'},'renderer':{'kind':'surface-lines'}}]))
+    world.metadata_json = {}
+    first = service.chunk_contract(world=world,provider=_Provider(),chunk_x=0,chunk_z=0,chunk_size=16)
+    second = service.chunk_contract(world=world,provider=_Provider(),chunk_x=1,chunk_z=0,chunk_size=16)
+    assert len(calls)==1
+    assert first['status']=='degraded' and second['status']=='degraded'
+    assert first['items'] and first['items'][0]['datasetId']=='flurstuecke'
 
 
 def test_default_parcel_overlay_is_clipped_live_and_deduplicated(monkeypatch):
@@ -252,3 +277,27 @@ def test_overlay_source_failure_does_not_fail_chunk_contract(monkeypatch):
     assert contract["items"] == []
     assert contract["errors"][0]["id"] == "parcel-boundaries"
     assert "wfs unavailable" in contract["errors"][0]["message"]
+
+
+def test_remote_outage_opens_one_global_circuit_for_all_optional_layers(monkeypatch):
+    monkeypatch.setenv(
+        "VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON",
+        '[{"id":"one","datasetId":"one","source":{"workspace":"public","typeName":"public:one"},"renderer":{"kind":"surface-lines"}},'
+        '{"id":"two","datasetId":"two","source":{"workspace":"public","typeName":"public:two"},"renderer":{"kind":"surface-lines"}}]',
+    )
+    calls = []
+
+    class _OfflineWfs:
+        def feature_collection(self, definition, bbox):
+            calls.append(definition.dataset_id)
+            raise URLError("connection refused")
+
+    service = _service()
+    service.wfs = _OfflineWfs()
+    first = service.chunk_contract(world=_World(), provider=_Provider(), chunk_x=0, chunk_z=0, chunk_size=16)
+    second = service.chunk_contract(world=_World(), provider=_Provider(), chunk_x=1, chunk_z=0, chunk_size=16)
+
+    assert calls == ["one"]
+    assert first["status"] == second["status"] == "degraded"
+    assert first["items"] == second["items"] == []
+    assert {item["id"] for item in first["availability"]} == {"one", "two"}

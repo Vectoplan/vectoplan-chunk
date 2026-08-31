@@ -111,13 +111,27 @@ def connect_store(path: Path) -> sqlite3.Connection:
 
 
 def import_zip(database: Path, source: Path, *, sha256: str,
-               source_url: str, storage_uri: str) -> dict:
+               source_url: str, storage_uri: str, source_crs: str = SOURCE_CRS,
+               horizontal_crs: str | None = None, vertical_crs: str | None = None) -> dict:
+    if source_crs != SOURCE_CRS and (not horizontal_crs or not vertical_crs):
+        raise ValueError("Non-default sources require explicit horizontal and vertical CRS")
+    horizontal_crs = horizontal_crs or "EPSG:25833"
+    vertical_crs = vertical_crs or "EPSG:7837"
+    from pyproj import CRS
+    CRS.from_user_input(horizontal_crs)
+    CRS.from_user_input(vertical_crs)
     with source.open("rb") as stream:
         actual = hashlib.file_digest(stream, "sha256").hexdigest()
     if actual != sha256:
         raise ValueError("Source ZIP SHA-256 mismatch")
     db = connect_store(database)
     try:
+        declared = dict(db.execute("SELECT key,value FROM metadata"))
+        for key, value in (("horizontalCrs", horizontal_crs), ("verticalCrs", vertical_crs), ("sourceCrs", source_crs)):
+            if declared.get(key, value) != value:
+                raise ValueError("Source CRS must remain consistent within one store")
+        if any(row[0] != source_crs for row in db.execute("SELECT DISTINCT crs FROM tiles")):
+            raise ValueError("Source CRS must remain consistent within one store")
         existing = db.execute("SELECT sha256, report FROM tiles WHERE name=?", (source.name,)).fetchone()
         if existing and existing[0] == actual:
             return {**json.loads(existing[1]), "cache": "already-imported"}
@@ -125,12 +139,14 @@ def import_zip(database: Path, source: Path, *, sha256: str,
                   "buildingPartCount": 0, "polygonCount": 0, "emptyBuildingCount": 0}
         # On any CRC/XML/CRS/geometry error, rollback leaves the prior tile intact.
         with db, zipfile.ZipFile(source) as archive:
+            db.executemany("INSERT OR REPLACE INTO metadata VALUES (?,?)", (
+                ("horizontalCrs", horizontal_crs), ("verticalCrs", vertical_crs), ("sourceCrs", source_crs)))
             members = [m for m in archive.infolist() if not m.is_dir()]
             if not members or sum(m.file_size for m in members) > 2_147_483_648:
                 raise ValueError("Empty or oversized CityGML ZIP")
             db.execute("DELETE FROM buildings WHERE tile=?", (source.name,))
             db.execute("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?)",
-                       (source.name, actual, source_url, storage_uri, SOURCE_CRS, "{}"))
+                       (source.name, actual, source_url, storage_uri, source_crs, "{}"))
             for member in members:
                 path = PurePosixPath(member.filename.replace("\\", "/"))
                 if path.is_absolute() or ".." in path.parts or path.suffix.lower() not in {".xml", ".gml"}:
@@ -147,7 +163,7 @@ def import_zip(database: Path, source: Path, *, sha256: str,
                                     raise ValueError("Unsupported CityModel")
                             srs = element.get("srsName")
                             if srs:
-                                if srs != SOURCE_CRS:
+                                if srs != source_crs:
                                     raise ValueError(f"Unsupported source CRS: {srs}")
                                 crs_seen = True
                             continue
@@ -216,6 +232,10 @@ if __name__ == "__main__":
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--storage-uri", required=True)
+    parser.add_argument("--source-crs", default=SOURCE_CRS)
+    parser.add_argument("--horizontal-crs")
+    parser.add_argument("--vertical-crs")
     args = parser.parse_args()
     print(json.dumps(import_zip(args.database, args.zip, sha256=args.sha256,
-                                source_url=args.source_url, storage_uri=args.storage_uri)))
+                                source_url=args.source_url, storage_uri=args.storage_uri, source_crs=args.source_crs,
+                                horizontal_crs=args.horizontal_crs, vertical_crs=args.vertical_crs)))
