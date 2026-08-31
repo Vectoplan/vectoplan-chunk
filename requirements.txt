@@ -81,3 +81,6 @@ pytest-cov>=5.0,<8.0
 
 # CRS parsing and coordinate transformations backed by PROJ.
 pyproj>=3.7,<4.0
+
+# Bounded LoD2 wall rasterization and roof triangulation (including courtyards).
+shapely==2.1.2

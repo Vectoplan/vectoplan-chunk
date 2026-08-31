@@ -44,6 +44,7 @@ import importlib
 import hashlib
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
@@ -53,10 +54,11 @@ from typing import Any, Optional
 from flask import Blueprint, current_app, jsonify, request
 
 try:
-    from sqlalchemy import and_, or_
+    from sqlalchemy import and_, func, or_
     from sqlalchemy.orm import noload
 except Exception:  # pragma: no cover - defensive fallback for unusual test envs
     and_ = None  # type: ignore[assignment]
+    func = None  # type: ignore[assignment]
     or_ = None  # type: ignore[assignment]
     noload = None  # type: ignore[assignment]
 
@@ -81,7 +83,8 @@ ROUTE_SOURCE = "routes.chunks"
 CHUNK_RESPONSE_VERSION = "world-state-chunk-response.v1"
 CHUNK_BATCH_RESPONSE_VERSION = "world-state-chunk-batch-response.v1"
 CHUNK_INDEX_RESPONSE_VERSION = "world-state-chunk-index-response.v1"
-CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v3"
+CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v4"
+MAP_STRUCTURES_RESPONSE_VERSION = "vectoplan-map-structures-response.v1"
 CHUNKS_STATUS_RESPONSE_VERSION = "chunks-route-status-response.v1"
 
 RUNTIME_CHUNK_CONTENT_VERSION = "runtime-chunk-content.v1"
@@ -92,6 +95,16 @@ BLOCK_CELL_VALUE_RULE = "paletteIndex + 1"
 
 DEFAULT_MAX_BATCH_CHUNKS = 256
 DEFAULT_JSON_SAFE_MAX_DEPTH = 80
+
+# A projection client reads current placements page by page.  Rebuilding the
+# complete latest-event index for every page made a 60k-cell LoD2 building do
+# the same expansion roughly sixty times, starving ordinary chunk loads and
+# even the health endpoint.  The event stream is append-only; count + maximum
+# active id therefore provide a cheap invalidation signature for a bounded
+# in-process index.  Gunicorn workers keep independent copies by design.
+_USER_PLACEMENT_INDEX_CACHE_MAX_WORLDS = 8
+_user_placement_index_cache: dict[tuple[int, bool], dict[str, Any]] = {}
+_user_placement_index_cache_lock = threading.RLock()
 
 ENV_ROUTE_INCLUDE_DEBUG_ERRORS = "VECTOPLAN_CHUNK_ROUTE_DEBUG_ERRORS"
 ENV_ROUTE_DEBUG_CHECKPOINTS = "VECTOPLAN_CHUNK_ROUTE_DEBUG_CHECKPOINTS"
@@ -1878,10 +1891,19 @@ def _serialize_chunk_load_result(
     include_route_hints: bool = True,
     compact_cells: bool = False,
     api_prefix: str = "",
+    structure_hints: Optional[Mapping[Any, Any]] = None,
 ) -> dict[str, Any]:
     """Serialize one chunk load result."""
     chunk = _make_json_safe(result.get("chunk") or {}, max_depth=60)
     snapshot = result.get("snapshot")
+
+    from src.geodata.structure_streaming import structure_streaming_hints
+
+    if structure_hints is None:
+        structure_hints = structure_streaming_hints(world, [chunk])
+    hint = structure_hints.get((chunk.get("chunkX"), chunk.get("chunkZ")))
+    if hint:
+        chunk["metadata"] = {**(chunk.get("metadata") or {}), "structureStreaming": hint}
 
     body: dict[str, Any] = {
         "projectId": project.project_id,
@@ -2099,6 +2121,7 @@ def _event_authorship_kind(
     *,
     command_source: Any = "",
     command_type: Any = "",
+    include_system_structures: bool = False,
 ) -> str:
     user_id = str(value or "").strip().lower()
     if user_id and user_id not in {
@@ -2113,6 +2136,8 @@ def _event_authorship_kind(
         and str(command_type or "").strip() in _LEGACY_EDITOR_PLACEMENT_COMMANDS
     ):
         return "legacy-editor-placement"
+    if include_system_structures and user_id == "system_lod2_import":
+        return "system-lod2-structure"
     return ""
 
 
@@ -2237,6 +2262,27 @@ def _compact_placement_semantics(
             placement_record_metadata.get("definition_values"),
         )
     )
+    roof_parameters = _first_mapping(
+        metadata.get("roofParameters"), metadata.get("roof_parameters")
+    )
+    roof_calculation = _first_mapping(
+        metadata.get("roofCalculation"), metadata.get("roof_calculation")
+    )
+    if roof_parameters or roof_calculation:
+        variables = {
+            **variables,
+            **_compact_definition_values({
+                "roof.type": _first_text(
+                    metadata.get("roofType"),
+                    metadata.get("roof_type"),
+                    roof_parameters.get("roofType"),
+                    roof_parameters.get("roof_type"),
+                    roof_calculation.get("roof_type"),
+                ),
+                "roof.request": roof_parameters,
+                "roof.calculation": roof_calculation,
+            }),
+        }
     model_context = {
         key: value
         for key, value in {
@@ -2322,37 +2368,102 @@ def _compact_placement_semantics(
     }
 
 
-@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks/user-placements")
-def get_project_world_user_placements(project_id: str, world_id: str):
-    """Return only current cells whose latest mutation was authored by a user."""
-    try:
-        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
-        include_deleted = _get_query_bool("includeDeleted", "include_deleted", fallback=False)
-        summary_only = _get_query_bool("summaryOnly", "summary_only", fallback=False)
-        offset = max(0, _get_query_int("offset", fallback=0, field_name="offset"))
-        limit = min(2000, max(1, _get_query_int("limit", fallback=1000, field_name="limit")))
-        project, universe, world = _resolve_project_world_context(
-            project_id,
-            world_id,
-            universe_id=universe_id,
-            include_deleted=include_deleted,
+def _event_placement_mutations(row: Any) -> list[dict[str, Any]]:
+    """Expand one persisted event into the cells it made current.
+
+    WorldEdit stores one event per affected chunk, with all changed cells in
+    affected_cells_json. Treating only the event anchor as a placement drops
+    almost the complete LoD2 wall import. Semantic PlaceObject events stay one
+    logical placement because their footprint/object id is the geometry truth.
+    """
+    object_instance_id = getattr(row, "object_instance_id", None)
+    affected = getattr(row, "affected_cells_json", None)
+    candidates = (
+        affected
+        if not object_instance_id
+        and isinstance(affected, list)
+        and affected
+        else []
+    )
+    result: list[dict[str, Any]] = []
+    for cell in candidates:
+        if not isinstance(cell, Mapping) or not all(axis in cell for axis in ("x", "y", "z")):
+            continue
+        after_block = (
+            cell.get("afterBlockTypeId")
+            if "afterBlockTypeId" in cell
+            else cell.get("after_block_type_id", getattr(row, "block_after_type_id", None))
         )
-        coordinate_frame = None
-        try:
-            coordinate_frame = earth_grid_frame_contract(world.build_earth_provider())
-        except (AttributeError, TypeError, ValueError):
-            coordinate_frame = None
-        latest_event_ids = (
-            db.session.query(db.func.max(ChunkEvent.id).label("event_id"))
-            .filter(ChunkEvent.world_db_id == world.id)
+        chunk_x = int(cell.get("chunkX", cell.get("chunk_x", getattr(row, "chunk_x", 0))))
+        chunk_y = int(cell.get("chunkY", cell.get("chunk_y", getattr(row, "chunk_y", 0))))
+        chunk_z = int(cell.get("chunkZ", cell.get("chunk_z", getattr(row, "chunk_z", 0))))
+        result.append(
+            {
+                "position": (int(cell["x"]), int(cell["y"]), int(cell["z"])),
+                "chunk": (chunk_x, chunk_y, chunk_z),
+                "chunkKey": str(
+                    cell.get("chunkKey")
+                    or cell.get("chunk_key")
+                    or f"{chunk_x}:{chunk_y}:{chunk_z}"
+                ),
+                "blockTypeId": after_block,
+            }
+        )
+    if result:
+        return result
+    position = (
+        getattr(row, "position_x", None),
+        getattr(row, "position_y", None),
+        getattr(row, "position_z", None),
+    )
+    if any(value is None for value in position):
+        return []
+    chunk = (
+        int(getattr(row, "chunk_x", 0)),
+        int(getattr(row, "chunk_y", 0)),
+        int(getattr(row, "chunk_z", 0)),
+    )
+    return [
+        {
+            "position": tuple(int(value) for value in position),
+            "chunk": chunk,
+            "chunkKey": str(getattr(row, "chunk_key", "") or ":".join(map(str, chunk))),
+            "blockTypeId": getattr(row, "block_after_type_id", None),
+        }
+    ]
+
+
+def _current_user_placement_index(
+    *,
+    world_db_id: int,
+    include_system_structures: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    """Build current placement state once per append-only event revision.
+
+    Page responses deliberately retain their own small payload lookup, while
+    this cache stores only compact scalar event references.  In particular it
+    does not retain the very large ``affected_cells_json`` arrays used by LoD2
+    WorldEdit imports.
+    """
+    key = (int(world_db_id), bool(include_system_structures))
+    with _user_placement_index_cache_lock:
+        signature_row = (
+            db.session.query(func.count(ChunkEvent.id), func.max(ChunkEvent.id))
+            .filter(ChunkEvent.world_db_id == world_db_id)
             .filter(ChunkEvent.event_status == "active")
             .filter(ChunkEvent.position_x.isnot(None))
             .filter(ChunkEvent.position_y.isnot(None))
             .filter(ChunkEvent.position_z.isnot(None))
-            .group_by(ChunkEvent.position_x, ChunkEvent.position_y, ChunkEvent.position_z)
-            .subquery()
+            .one()
         )
+        signature = (int(signature_row[0] or 0), int(signature_row[1] or 0))
+        cached = _user_placement_index_cache.get(key)
+        if cached is not None and cached.get("signature") == signature:
+            cached["lastUsed"] = time.monotonic()
+            return cached["entries"], str(cached["fingerprint"])
+
         columns = [
+            ChunkEvent.id.label("event_db_id"),
             ChunkEvent.event_id,
             ChunkEvent.command_id,
             ChunkEvent.command_type,
@@ -2366,94 +2477,187 @@ def get_project_world_user_placements(project_id: str, world_id: str):
             ChunkEvent.position_z,
             ChunkEvent.block_after_type_id,
             ChunkEvent.chunk_revision_after,
+            ChunkEvent.affected_cells_json,
+            ChunkEvent.object_type_id,
+            ChunkEvent.object_variant_id,
+            ChunkEvent.object_instance_id,
             WorldCommandLog.command_source,
         ]
-        if not summary_only:
-            columns.extend(
-                [
-                    ChunkEvent.object_type_id,
-                    ChunkEvent.object_variant_id,
-                    ChunkEvent.object_instance_id,
-                    ChunkEvent.object_footprint_json,
-                    ChunkEvent.payload_json,
-                    WorldCommandLog.request_payload_json,
-                ]
-            )
         rows = (
             db.session.query(*columns)
-            .join(latest_event_ids, ChunkEvent.id == latest_event_ids.c.event_id)
             .outerjoin(WorldCommandLog, ChunkEvent.command_log_db_id == WorldCommandLog.id)
-            .filter(ChunkEvent.block_after_type_id.isnot(None))
-            .order_by(
-                ChunkEvent.position_x.asc(),
-                ChunkEvent.position_y.asc(),
-                ChunkEvent.position_z.asc(),
-            )
+            .filter(ChunkEvent.world_db_id == world_db_id)
+            .filter(ChunkEvent.event_status == "active")
+            .filter(ChunkEvent.position_x.isnot(None))
+            .filter(ChunkEvent.position_y.isnot(None))
+            .filter(ChunkEvent.position_z.isnot(None))
+            .order_by(ChunkEvent.id.asc())
             .all()
         )
-        entries = []
-        fingerprint_source = []
+        latest_by_position: dict[tuple[int, int, int], tuple[Any, dict[str, Any]]] = {}
         for row in rows:
+            for mutation in _event_placement_mutations(row):
+                latest_by_position[mutation["position"]] = (row, mutation)
+
+        entries: list[dict[str, Any]] = []
+        fingerprint_source = []
+        for position in sorted(latest_by_position):
+            row, mutation = latest_by_position[position]
+            block_type_id = mutation["blockTypeId"]
+            if block_type_id in (None, ""):
+                continue
             authorship = _event_authorship_kind(
                 row.user_id,
                 command_source=row.command_source,
                 command_type=row.command_type,
+                include_system_structures=include_system_structures,
             )
             if not authorship:
                 continue
             fingerprint_source.append(
                 [
-                    int(row.position_x),
-                    int(row.position_y),
-                    int(row.position_z),
-                    str(row.block_after_type_id),
+                    *position,
+                    str(block_type_id),
                     str(row.event_id),
                     int(row.chunk_revision_after or 0),
                     authorship,
                 ]
             )
-            if summary_only:
-                continue
-            semantics = _compact_placement_semantics(
-                row.payload_json,
-                row.request_payload_json,
-                block_type_id=row.block_after_type_id,
-                object_type_id=row.object_type_id,
-                object_variant_id=row.object_variant_id,
-            )
             entries.append(
                 {
-                    "position": {
-                        "x": int(row.position_x),
-                        "y": int(row.position_y),
-                        "z": int(row.position_z),
-                    },
-                    "chunk": {
-                        "chunkX": int(row.chunk_x),
-                        "chunkY": int(row.chunk_y),
-                        "chunkZ": int(row.chunk_z),
-                        "chunkKey": str(row.chunk_key),
-                    },
-                    "blockTypeId": str(row.block_after_type_id),
+                    "position": position,
+                    "mutation": mutation,
+                    "blockTypeId": block_type_id,
+                    "authorship": authorship,
+                    "eventDbId": int(row.event_db_id),
                     "eventId": str(row.event_id),
                     "commandId": str(row.command_id),
                     "commandType": str(row.command_type),
                     "chunkRevision": int(row.chunk_revision_after or 0),
-                    "authoredByUser": True,
-                    "authorship": authorship,
-                    "semantics": semantics,
-                    "semanticGeometry": {
-                        "schemaVersion": "vectoplan-semantic-placement-geometry.v1",
-                        "objectInstanceId": row.object_instance_id,
-                        "objectTypeId": row.object_type_id,
-                        "footprint": _make_json_safe(row.object_footprint_json or {}, max_depth=20),
-                    } if row.object_footprint_json else None,
+                    "objectTypeId": row.object_type_id,
+                    "objectVariantId": row.object_variant_id,
+                    "objectInstanceId": row.object_instance_id,
                 }
             )
         fingerprint = hashlib.sha256(
             json.dumps(fingerprint_source, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         ).hexdigest()
-        page = [] if summary_only else entries[offset : offset + limit]
+        if key not in _user_placement_index_cache:
+            while len(_user_placement_index_cache) >= _USER_PLACEMENT_INDEX_CACHE_MAX_WORLDS:
+                oldest_key = min(
+                    _user_placement_index_cache,
+                    key=lambda candidate: float(
+                        _user_placement_index_cache[candidate].get("lastUsed", 0)
+                    ),
+                )
+                _user_placement_index_cache.pop(oldest_key, None)
+        _user_placement_index_cache[key] = {
+            "signature": signature,
+            "entries": entries,
+            "fingerprint": fingerprint,
+            "lastUsed": time.monotonic(),
+        }
+        return entries, fingerprint
+
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks/user-placements")
+def get_project_world_user_placements(project_id: str, world_id: str):
+    """Return only current cells whose latest mutation was authored by a user."""
+    try:
+        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
+        include_deleted = _get_query_bool("includeDeleted", "include_deleted", fallback=False)
+        summary_only = _get_query_bool("summaryOnly", "summary_only", fallback=False)
+        include_system_structures = _get_query_bool(
+            "includeSystemStructures", "include_system_structures", fallback=False
+        )
+        offset = max(0, _get_query_int("offset", fallback=0, field_name="offset"))
+        limit = min(2000, max(1, _get_query_int("limit", fallback=1000, field_name="limit")))
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+            include_deleted=include_deleted,
+        )
+        coordinate_frame = None
+        try:
+            coordinate_frame = earth_grid_frame_contract(world.build_earth_provider())
+        except (AttributeError, TypeError, ValueError):
+            coordinate_frame = None
+        current_entries, fingerprint = _current_user_placement_index(
+            world_db_id=world.id,
+            include_system_structures=include_system_structures,
+        )
+        page_entries = [] if summary_only else current_entries[offset : offset + limit]
+        payload_by_event_id: dict[int, tuple[Any, Any, Any]] = {}
+        page_event_ids = sorted({int(entry["eventDbId"]) for entry in page_entries})
+        for batch_start in range(0, len(page_event_ids), 500):
+            payload_rows = (
+                db.session.query(
+                    ChunkEvent.id,
+                    ChunkEvent.payload_json,
+                    ChunkEvent.object_footprint_json,
+                    WorldCommandLog.request_payload_json,
+                )
+                .outerjoin(WorldCommandLog, ChunkEvent.command_log_db_id == WorldCommandLog.id)
+                .filter(ChunkEvent.id.in_(page_event_ids[batch_start : batch_start + 500]))
+                .all()
+            )
+            payload_by_event_id.update({
+                int(payload_row.id): (
+                    payload_row.payload_json,
+                    payload_row.request_payload_json,
+                    payload_row.object_footprint_json,
+                )
+                for payload_row in payload_rows
+            })
+
+        entries = []
+        for entry in page_entries:
+            position = entry["position"]
+            mutation = entry["mutation"]
+            block_type_id = entry["blockTypeId"]
+            authorship = entry["authorship"]
+            event_payload, request_payload, object_footprint = payload_by_event_id.get(
+                int(entry["eventDbId"]), ({}, {}, {})
+            )
+            semantics = _compact_placement_semantics(
+                event_payload,
+                request_payload,
+                block_type_id=block_type_id,
+                object_type_id=entry["objectTypeId"],
+                object_variant_id=entry["objectVariantId"],
+            )
+            entries.append(
+                {
+                    "position": {
+                        "x": position[0],
+                        "y": position[1],
+                        "z": position[2],
+                    },
+                    "chunk": {
+                        "chunkX": mutation["chunk"][0],
+                        "chunkY": mutation["chunk"][1],
+                        "chunkZ": mutation["chunk"][2],
+                        "chunkKey": mutation["chunkKey"],
+                    },
+                    "blockTypeId": str(block_type_id),
+                    "eventId": entry["eventId"],
+                    "commandId": entry["commandId"],
+                    "commandType": entry["commandType"],
+                    "chunkRevision": entry["chunkRevision"],
+                    "authoredByUser": authorship != "system-lod2-structure",
+                    "projectionStructure": authorship == "system-lod2-structure",
+                    "authorship": authorship,
+                    "semantics": semantics,
+                    "semanticGeometry": {
+                        "schemaVersion": "vectoplan-semantic-placement-geometry.v1",
+                        "objectInstanceId": entry["objectInstanceId"],
+                        "objectTypeId": entry["objectTypeId"],
+                        "footprint": _make_json_safe(object_footprint or {}, max_depth=20),
+                    } if object_footprint else None,
+                }
+            )
+        page = entries
         return _json_response(
             _ok_response(
                 response_version=CHUNK_USER_PLACEMENTS_RESPONSE_VERSION,
@@ -2464,10 +2668,10 @@ def get_project_world_user_placements(project_id: str, world_id: str):
                     "coordinateFrame": coordinate_frame,
                     "placements": page,
                     "fingerprint": fingerprint,
-                    "total": len(fingerprint_source),
+                    "total": len(current_entries),
                     "offset": 0 if summary_only else offset,
                     "limit": 0 if summary_only else limit,
-                    "hasMore": False if summary_only else offset + len(page) < len(entries),
+                    "hasMore": False if summary_only else offset + len(page) < len(current_entries),
                     "summaryOnly": summary_only,
                 },
                 metadata={
@@ -2475,8 +2679,10 @@ def get_project_world_user_placements(project_id: str, world_id: str):
                     "projectScoped": True,
                     "dbBacked": True,
                     "currentStateOnly": True,
-                    "userAuthoredOnly": True,
+                    "userAuthoredOnly": not include_system_structures,
+                    "systemStructuresIncluded": include_system_structures,
                     "systemTerrainExcluded": True,
+                    "batchedEventsExpanded": True,
                     "summaryOnly": summary_only,
                 },
             ),
@@ -2695,6 +2901,52 @@ def get_project_world_terrain_region(project_id: str, world_id: str):
         return _error_response(exc, code="terrain_region_failed", status_code=500)
 
 
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/map/structures")
+def get_project_world_map_structures(project_id: str, world_id: str):
+    """Return lightweight roof geometry for the complete project map."""
+    try:
+        universe_id = _get_query_string(
+            "universeId",
+            "universe_id",
+            fallback="",
+        ) or None
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+            include_deleted=False,
+        )
+        from src.geodata.structure_streaming import map_structure_preview
+
+        preview = map_structure_preview(world)
+        return _json_response(
+            _ok_response(
+                response_version=MAP_STRUCTURES_RESPONSE_VERSION,
+                payload={
+                    "projectId": project.project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "mapStructures": preview,
+                },
+                metadata={
+                    "projectScoped": True,
+                    "dbBacked": True,
+                    "readOnlyProjection": True,
+                },
+            ),
+            200,
+        )
+    except LookupError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="map_structures_not_found", status_code=404)
+    except ValueError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="invalid_map_structures_request", status_code=400)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc, code="map_structures_failed", status_code=500)
+
+
 @chunks_bp.post("/projects/<project_id>/worlds/<world_id>/chunks/batch")
 def post_project_world_chunks_batch(project_id: str, world_id: str):
     """
@@ -2762,6 +3014,9 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
             chunk_items=chunk_items,
             include_deleted=include_deleted,
         ) if prefer_snapshot else {}
+
+        from src.geodata.structure_streaming import structure_streaming_hints
+        structure_hints = structure_streaming_hints(world, chunk_items)
 
         parallel_outcomes: Optional[dict[int, Any]] = None
         parallel_generation = bool(
@@ -2885,6 +3140,7 @@ def post_project_world_chunks_batch(project_id: str, world_id: str):
                         universe=universe,
                         world=world,
                         result=result,
+                        structure_hints=structure_hints,
                         include_context=include_context,
                         include_snapshot_metadata=include_snapshot_metadata,
                         include_route_hints=include_route_hints,

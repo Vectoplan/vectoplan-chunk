@@ -1121,15 +1121,24 @@ def _normalize_palette(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+class _MutableCellBuffer(list):
+    """Request-local validated buffer; serializes as an ordinary JSON array."""
+
+
 def _ensure_cells(content: dict[str, Any], *, chunk_size: int) -> list[int]:
     """Ensure runtime content has a full mutable cells list."""
     expected_count = int(chunk_size) ** 3
-    cells = _normalize_cells(content.get("cells"))
+    current = content.get("cells")
+    if isinstance(current, _MutableCellBuffer) and len(current) == expected_count:
+        return current
+    # Bulk wall imports touch thousands of cells. Revalidating and copying the
+    # complete chunk on every get/set made this path quadratic in chunk volume.
+    cells = _MutableCellBuffer(_normalize_cells(current))
 
     if len(cells) < expected_count:
         cells.extend([AIR_CELL_VALUE] * (expected_count - len(cells)))
     elif len(cells) > expected_count:
-        cells = cells[:expected_count]
+        del cells[expected_count:]
 
     content["cells"] = cells
     content["cellCount"] = expected_count
@@ -2479,6 +2488,8 @@ def _execute_set_or_remove_block(
             if not isinstance(ref, Mapping):
                 continue
             ref_metadata = ref.get("metadata") if isinstance(ref.get("metadata"), Mapping) else {}
+            if ref_metadata.get("voxelOccupancy") == "none":
+                continue  # An imported roof's routing anchor is not a wall cell.
             ref_kind = ref.get("objectKind")
             is_parametric_library_object = (
                 ref_kind == "vplib_parametric"
@@ -2831,7 +2842,9 @@ def _execute_world_edit(
             world=world,
             existing_snapshot=existing_snapshot,
             content=content,
-            materialized_reason=f"world_edit_{plan.tool}_{plan.operation}",
+            # The snapshot model accepts a bounded enum, not arbitrary tool
+            # names. The full tool/operation is retained in the command/event.
+            materialized_reason="batch_command",
             command_log=command_log,
             user_id=user_id,
             session_id=session_id,
@@ -3122,6 +3135,9 @@ def _apply_existing_object_geometry_update(
     session_id: Optional[str],
 ) -> WorldObjectInstance:
     """Apply one idempotent remesh without changing the object's voxel identity."""
+    if (existing_object_instance.object_type_id == "building_roof"
+            and candidate_object_instance.object_type_id != "building_roof"):
+        raise ValueError("A roof cannot be converted by a parcel-grid geometry migration.")
     existing_cells = _world_cell_coordinate_set(existing_object_instance.occupied_cells_json or [])
     requested_cells = _world_cell_coordinate_set(candidate_object_instance.occupied_cells_json or [])
     if existing_cells != requested_cells:
@@ -3310,6 +3326,8 @@ def _execute_place_object(
         "occupiedCells": _make_json_safe(occupied_world_cells, max_depth=20),
         "metadata": _make_json_safe(object_instance.metadata_json or {}, max_depth=20),
     }
+    metadata_only = (object_instance.object_type_id == "building_roof"
+                     and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none")
 
     for chunk_key, group in grouped.items():
         existing_snapshot, content = _load_chunk_for_mutation(
@@ -3339,6 +3357,12 @@ def _execute_place_object(
             )
             before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
 
+            if metadata_only:
+                # Retain the anchor for routing/update identity, but never occupy
+                # or erase the underlying voxel for a source-surface roof.
+                for dirty_key in _dirty_chunk_keys_for_cell(cell, int(world.chunk_size or 16)):
+                    dirty_chunks_set.add(dirty_key)
+                continue
             if int(before_cell_value) != int(after_cell_value):
                 _set_cell_value(
                     content,
@@ -3586,7 +3610,12 @@ def _execute_remove_object(
         before_version = existing_snapshot.chunk_version if existing_snapshot else "generated"
         before_hash = existing_snapshot.content_hash if existing_snapshot else content.get("contentHash")
 
+        metadata_only = (object_instance.object_type_id == "building_roof"
+                         and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none")
         group_cells = ref.occupied_cells_json if isinstance(ref.occupied_cells_json, list) else []
+        if metadata_only:
+            group_cells = []
+            dirty_chunks_set.add(ref.chunk_key)
         group_affected_cells: list[dict[str, Any]] = []
         chunk_changed = False
 
@@ -3805,6 +3834,12 @@ def _execute_command(
     payload: Mapping[str, Any],
 ) -> tuple[WorldCommandLog, dict[str, Any]]:
     """Create command log and execute command."""
+    # The bounded LoD2 importer takes the same row lock before inspecting edits.
+    # Serialize mutations in these opted-in worlds so import cannot race a user
+    # command and restore an intentionally removed cell. No lock on other worlds.
+    if (world.metadata_json or {}).get("lod2Buildings", {}).get("enabled") is True:
+        from sqlalchemy import select
+        db.session.execute(select(WorldInstance.id).where(WorldInstance.id == world.id).with_for_update()).one()
     command_type = _normalize_command_type(
         payload.get("type")
         or payload.get("commandType")
