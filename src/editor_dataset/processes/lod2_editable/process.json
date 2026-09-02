@@ -1,0 +1,6 @@
+{
+  "id": "lod2-editable",
+  "version": "lod2-editable-process.v1",
+  "dependencies": [],
+  "outputLayer": "editableBuildings"
+}

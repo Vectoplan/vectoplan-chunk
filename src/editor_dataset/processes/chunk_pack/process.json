@@ -1,0 +1,6 @@
+{
+  "id": "chunk-pack",
+  "version": "chunk-pack-process.v1",
+  "dependencies": ["lod2-editable", "parcel-grid", "road-network"],
+  "outputLayer": "editorChunks"
+}

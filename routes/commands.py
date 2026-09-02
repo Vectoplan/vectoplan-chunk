@@ -15,6 +15,7 @@ Supported command types in this slice:
 - WorldEdit
 - PlaceObject
 - RemoveObject
+- ObjectBatch (atomic PlaceObject / RemoveObject sequence)
 
 Important persistence rules:
 - ChunkSnapshot is the current load-truth for materialized chunks.
@@ -102,6 +103,8 @@ AIR_CELL_VALUE = 0
 BLOCK_CELL_VALUE_RULE = "paletteIndex + 1"
 
 DEFAULT_MAX_COMMAND_AFFECTED_CELLS = 65536
+DEFAULT_MAX_OBJECT_BATCH_COMMANDS = 512
+DEFAULT_MAX_OBJECT_BATCH_AFFECTED_CELLS = 1048576
 WORLD_EDIT_EVENT_TYPE = "region_change"
 DEFAULT_JSON_SAFE_MAX_DEPTH = 80
 
@@ -173,6 +176,11 @@ _COMMAND_TYPE_ALIASES = {
     "remove_object": "RemoveObject",
     "remove-object": "RemoveObject",
     "RemoveObject": "RemoveObject",
+
+    "objectbatch": "ObjectBatch",
+    "object_batch": "ObjectBatch",
+    "object-batch": "ObjectBatch",
+    "ObjectBatch": "ObjectBatch",
 }
 
 
@@ -637,6 +645,26 @@ def _get_max_command_affected_cells() -> int:
         _get_config_int(
             "VECTOPLAN_CHUNK_MAX_COMMAND_AFFECTED_CELLS",
             DEFAULT_MAX_COMMAND_AFFECTED_CELLS,
+        ),
+    )
+
+
+def _get_max_object_batch_commands() -> int:
+    return max(
+        1,
+        _get_config_int(
+            "VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_COMMANDS",
+            DEFAULT_MAX_OBJECT_BATCH_COMMANDS,
+        ),
+    )
+
+
+def _get_max_object_batch_affected_cells() -> int:
+    return max(
+        1,
+        _get_config_int(
+            "VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_AFFECTED_CELLS",
+            DEFAULT_MAX_OBJECT_BATCH_AFFECTED_CELLS,
         ),
     )
 
@@ -1336,6 +1364,263 @@ def _remove_object_ref_from_content(content: dict[str, Any], object_instance_id:
         for ref in refs
         if not isinstance(ref, Mapping) or ref.get("objectInstanceId") != object_instance_id
     ]
+
+
+OBJECT_CELL_OWNERSHIP_POLICY = "last-writer-wins-v1"
+
+
+def _optional_mapping_int(mapping: Mapping[str, Any], *keys: str) -> Optional[int]:
+    """Return the first usable integer from ``mapping`` without raising."""
+    for key in keys:
+        if key not in mapping:
+            continue
+        try:
+            return int(mapping.get(key))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _object_ref_cell_matches(
+    candidate: Mapping[str, Any],
+    *,
+    world_x: int,
+    world_y: int,
+    world_z: int,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    local_x: int,
+    local_y: int,
+    local_z: int,
+) -> bool:
+    """Match both current and legacy occupied-cell representations."""
+    candidate_world = (
+        _optional_mapping_int(candidate, "x", "worldX", "world_x"),
+        _optional_mapping_int(candidate, "y", "worldY", "world_y"),
+        _optional_mapping_int(candidate, "z", "worldZ", "world_z"),
+    )
+    if all(value is not None for value in candidate_world):
+        return candidate_world == (world_x, world_y, world_z)
+
+    candidate_local = (
+        _optional_mapping_int(candidate, "localX", "local_x"),
+        _optional_mapping_int(candidate, "localY", "local_y"),
+        _optional_mapping_int(candidate, "localZ", "local_z"),
+    )
+    if not all(value is not None for value in candidate_local):
+        return False
+
+    candidate_chunk = (
+        _optional_mapping_int(candidate, "chunkX", "chunk_x"),
+        _optional_mapping_int(candidate, "chunkY", "chunk_y"),
+        _optional_mapping_int(candidate, "chunkZ", "chunk_z"),
+    )
+    if all(value is not None for value in candidate_chunk):
+        return candidate_local == (local_x, local_y, local_z) and candidate_chunk == (
+            chunk_x,
+            chunk_y,
+            chunk_z,
+        )
+
+    # WorldObjectChunkRef.occupied_cells_json is scoped to one known chunk, so
+    # old rows may legitimately contain local coordinates only.
+    return candidate_local == (local_x, local_y, local_z)
+
+
+def _object_ref_is_metadata_only(ref: Mapping[str, Any]) -> bool:
+    """Return whether a runtime ref deliberately owns no voxel cells."""
+    metadata = ref.get("metadata") if isinstance(ref.get("metadata"), Mapping) else {}
+    return metadata.get("voxelOccupancy") == "none" or ref.get("refRole") == "metadata_only"
+
+
+def _runtime_object_cell_owner(
+    content: Mapping[str, Any],
+    *,
+    world_x: int,
+    world_y: int,
+    world_z: int,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    local_x: int,
+    local_y: int,
+    local_z: int,
+    include_metadata_object_instance_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve the last runtime object ref that still owns one voxel.
+
+    ``objectRefs`` are appended on placement/update.  Walking them backwards
+    therefore gives legacy snapshots the same last-writer-wins ownership rule
+    as snapshots written with the explicit ownership metadata below.
+    """
+    refs = content.get("objectRefs")
+    for ref in reversed(refs if isinstance(refs, list) else []):
+        if not isinstance(ref, Mapping):
+            continue
+        object_instance_id = _coerce_string(ref.get("objectInstanceId"))
+        if not object_instance_id:
+            continue
+        if (
+            _object_ref_is_metadata_only(ref)
+            and object_instance_id != include_metadata_object_instance_id
+        ):
+            continue
+        occupied_cells = ref.get("occupiedCells")
+        for occupied_cell in occupied_cells if isinstance(occupied_cells, list) else []:
+            if not isinstance(occupied_cell, Mapping):
+                continue
+            if not _object_ref_cell_matches(
+                occupied_cell,
+                world_x=world_x,
+                world_y=world_y,
+                world_z=world_z,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_z=chunk_z,
+                local_x=local_x,
+                local_y=local_y,
+                local_z=local_z,
+            ):
+                continue
+            metadata = ref.get("metadata") if isinstance(ref.get("metadata"), Mapping) else {}
+            expected_block_type_id = _coerce_string(
+                occupied_cell.get("ownedBlockTypeId")
+                or occupied_cell.get("afterBlockTypeId")
+                or ref.get("fillBlockTypeId")
+                or metadata.get("fillBlockTypeId")
+            )
+            return {
+                "objectInstanceId": object_instance_id,
+                "expectedBlockTypeId": expected_block_type_id or None,
+                "ownershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
+            }
+    return None
+
+
+def _filter_detached_cells(
+    occupied_cells: Any,
+    *,
+    target_cells: Sequence[Mapping[str, int]],
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+) -> tuple[list[Any], int]:
+    """Remove target coordinates from one occupied-cell list."""
+    original = occupied_cells if isinstance(occupied_cells, list) else []
+    retained: list[Any] = []
+    detached_count = 0
+    for candidate in original:
+        matches = False
+        if isinstance(candidate, Mapping):
+            for target in target_cells:
+                if _object_ref_cell_matches(
+                    candidate,
+                    world_x=int(target["worldX"]),
+                    world_y=int(target["worldY"]),
+                    world_z=int(target["worldZ"]),
+                    chunk_x=chunk_x,
+                    chunk_y=chunk_y,
+                    chunk_z=chunk_z,
+                    local_x=int(target["localX"]),
+                    local_y=int(target["localY"]),
+                    local_z=int(target["localZ"]),
+                ):
+                    matches = True
+                    break
+        if matches:
+            detached_count += 1
+        else:
+            retained.append(candidate)
+    return retained, detached_count
+
+
+def _detach_cells_from_runtime_object_refs(
+    content: dict[str, Any],
+    *,
+    target_cells: Sequence[Mapping[str, int]],
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    exclude_object_instance_ids: Optional[set[str]] = None,
+) -> set[str]:
+    """Detach overwritten voxels from runtime refs while retaining the object."""
+    excluded = exclude_object_instance_ids or set()
+    refs = content.get("objectRefs")
+    if not isinstance(refs, list):
+        return set()
+
+    detached_object_ids: set[str] = set()
+    updated_refs: list[Any] = []
+    for ref in refs:
+        if not isinstance(ref, Mapping) or _object_ref_is_metadata_only(ref):
+            updated_refs.append(ref)
+            continue
+        object_instance_id = _coerce_string(ref.get("objectInstanceId"))
+        if not object_instance_id or object_instance_id in excluded:
+            updated_refs.append(ref)
+            continue
+        retained, detached_count = _filter_detached_cells(
+            ref.get("occupiedCells"),
+            target_cells=target_cells,
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            chunk_z=chunk_z,
+        )
+        if detached_count == 0:
+            updated_refs.append(ref)
+            continue
+        updated_ref = dict(ref)
+        updated_ref["occupiedCells"] = retained
+        metadata = dict(ref.get("metadata")) if isinstance(ref.get("metadata"), Mapping) else {}
+        metadata["cellOwnershipPolicy"] = OBJECT_CELL_OWNERSHIP_POLICY
+        updated_ref["metadata"] = metadata
+        updated_refs.append(updated_ref)
+        detached_object_ids.add(object_instance_id)
+
+    content["objectRefs"] = updated_refs
+    return detached_object_ids
+
+
+def _detach_cells_from_persisted_object_refs(
+    *,
+    world: WorldInstance,
+    target_cells: Sequence[Mapping[str, int]],
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    exclude_object_instance_ids: Optional[set[str]] = None,
+) -> set[str]:
+    """Keep durable chunk refs aligned with runtime last-writer ownership."""
+    excluded = exclude_object_instance_ids or set()
+    query = WorldObjectChunkRef.query.filter(
+        WorldObjectChunkRef.world_db_id == world.id,
+        WorldObjectChunkRef.chunk_x == chunk_x,
+        WorldObjectChunkRef.chunk_y == chunk_y,
+        WorldObjectChunkRef.chunk_z == chunk_z,
+        WorldObjectChunkRef.deleted_at.is_(None),
+    )
+    detached_object_ids: set[str] = set()
+    for ref in _query_without_relationships(query).all():
+        object_instance_id = _coerce_string(ref.object_instance_id)
+        if not object_instance_id or object_instance_id in excluded:
+            continue
+        retained, detached_count = _filter_detached_cells(
+            ref.occupied_cells_json,
+            target_cells=target_cells,
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            chunk_z=chunk_z,
+        )
+        if detached_count == 0:
+            continue
+        ref.replace_occupied_cells(retained)
+        metadata = dict(ref.metadata_json) if isinstance(ref.metadata_json, Mapping) else {}
+        metadata["cellOwnershipPolicy"] = OBJECT_CELL_OWNERSHIP_POLICY
+        ref.metadata_json = metadata
+        db.session.add(ref)
+        detached_object_ids.add(object_instance_id)
+    return detached_object_ids
 
 
 # -----------------------------------------------------------------------------
@@ -2442,7 +2727,30 @@ def _execute_set_or_remove_block(
 
     dirty_chunks = _dirty_chunk_keys_for_cell(cell, chunk_size)
 
-    if not changed:
+    # An explicit SetBlock/ReplaceBlock also becomes the latest writer when it
+    # writes the same block type.  Treat that as an ownership-only mutation;
+    # otherwise a later RemoveObject could erase the user's explicit write.
+    detached_runtime_object_ids: set[str] = set()
+    detached_persisted_object_ids: set[str] = set()
+    if not changed and command_type in {"SetBlock", "ReplaceBlock"}:
+        detached_runtime_object_ids = _detach_cells_from_runtime_object_refs(
+            content,
+            target_cells=[cell],
+            chunk_x=cell["chunkX"],
+            chunk_y=cell["chunkY"],
+            chunk_z=cell["chunkZ"],
+        )
+        detached_persisted_object_ids = _detach_cells_from_persisted_object_refs(
+            world=world,
+            target_cells=[cell],
+            chunk_x=cell["chunkX"],
+            chunk_y=cell["chunkY"],
+            chunk_z=cell["chunkZ"],
+        )
+
+    if not changed and not (
+        detached_runtime_object_ids or detached_persisted_object_ids
+    ):
         _mark_command_applied(
             command_log,
             changed=False,
@@ -2514,6 +2822,30 @@ def _execute_set_or_remove_block(
                 removed_semantic_object_ids.append(object_instance_id)
                 _remove_object_ref_from_content(content, object_instance_id)
 
+    # Any explicit cell mutation is a newer writer than a previously placed
+    # block-composite object.  Detach the target from both runtime and durable
+    # refs so a later RemoveObject cannot erase this newly written cell.
+    target_cells = [cell]
+    detached_runtime_object_ids |= _detach_cells_from_runtime_object_refs(
+        content,
+        target_cells=target_cells,
+        chunk_x=cell["chunkX"],
+        chunk_y=cell["chunkY"],
+        chunk_z=cell["chunkZ"],
+    )
+    detached_persisted_object_ids |= _detach_cells_from_persisted_object_refs(
+        world=world,
+        target_cells=target_cells,
+        chunk_x=cell["chunkX"],
+        chunk_y=cell["chunkY"],
+        chunk_z=cell["chunkZ"],
+    )
+    detached_object_ids = sorted(
+        detached_runtime_object_ids | detached_persisted_object_ids
+    )
+    if detached_object_ids:
+        affected_cell["detachedObjectInstanceIds"] = detached_object_ids
+
     snapshot = _save_snapshot_after_mutation(
         project=project,
         universe=universe,
@@ -2575,6 +2907,7 @@ def _execute_set_or_remove_block(
             "changedChunks": [cell["chunkKey"]],
             "dirtyChunks": dirty_chunks,
             "removedSemanticObjectIds": removed_semantic_object_ids,
+            "detachedObjectInstanceIds": detached_object_ids,
         },
     )
 
@@ -2585,6 +2918,7 @@ def _execute_set_or_remove_block(
         "changedChunks": [cell["chunkKey"]],
         "dirtyChunks": dirty_chunks,
         "removedSemanticObjectIds": removed_semantic_object_ids,
+        "detachedObjectInstanceIds": detached_object_ids,
         "affectedCells": [affected_cell],
         "snapshotIds": [snapshot.snapshot_id],
         "chunkVersions": {
@@ -3134,13 +3468,25 @@ def _apply_existing_object_geometry_update(
     user_id: Optional[str],
     session_id: Optional[str],
 ) -> WorldObjectInstance:
-    """Apply one idempotent remesh without changing the object's voxel identity."""
+    """Apply one idempotent remesh without stealing owned voxel cells.
+
+    Metadata-only roofs and planning areas use ``occupiedCells`` exclusively as
+    routing anchors.  They may therefore move between chunks without changing
+    any physical voxel.  Voxel-owning objects retain the strict identity rule.
+    """
     if (existing_object_instance.object_type_id == "building_roof"
             and candidate_object_instance.object_type_id != "building_roof"):
         raise ValueError("A roof cannot be converted by a parcel-grid geometry migration.")
     existing_cells = _world_cell_coordinate_set(existing_object_instance.occupied_cells_json or [])
     requested_cells = _world_cell_coordinate_set(candidate_object_instance.occupied_cells_json or [])
-    if existing_cells != requested_cells:
+    metadata_only_types = {"building_roof", "planning_build_area"}
+    metadata_only_reroute = (
+        existing_object_instance.object_type_id in metadata_only_types
+        and candidate_object_instance.object_type_id == existing_object_instance.object_type_id
+        and (existing_object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
+        and (candidate_object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
+    )
+    if existing_cells != requested_cells and not metadata_only_reroute:
         raise ValueError(
             "An existing PlaceObject may only update geometry while keeping the same occupiedCells."
         )
@@ -3179,6 +3525,137 @@ def _group_world_cells_by_chunk(
         group["cells"].append(cell)
 
     return groups
+
+
+def _clear_legacy_metadata_only_ref_voxels(
+    *,
+    content: dict[str, Any],
+    ref: WorldObjectChunkRef,
+    object_instance: WorldObjectInstance,
+    chunk_size: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Safely clear voxels left by a pre-metadata-only object placement.
+
+    Early planning-area rows may already carry ``voxelOccupancy=none`` while
+    their durable chunk ref still records a physically written anchor.  During
+    the first reroute we remove such an anchor only when the runtime ref still
+    makes this object the last writer and the current block type is the one the
+    legacy ref wrote.  Any ambiguous/newer cell is preserved.
+    """
+    cleared: list[dict[str, Any]] = []
+    preserved: list[dict[str, Any]] = []
+    cells = ref.occupied_cells_json if isinstance(ref.occupied_cells_json, list) else []
+
+    for stored_cell in cells:
+        if not isinstance(stored_cell, Mapping):
+            continue
+        world_x = _optional_mapping_int(stored_cell, "x", "worldX", "world_x")
+        world_y = _optional_mapping_int(stored_cell, "y", "worldY", "world_y")
+        world_z = _optional_mapping_int(stored_cell, "z", "worldZ", "world_z")
+        local_x = _optional_mapping_int(stored_cell, "localX", "local_x")
+        local_y = _optional_mapping_int(stored_cell, "localY", "local_y")
+        local_z = _optional_mapping_int(stored_cell, "localZ", "local_z")
+
+        if world_x is not None and world_y is not None and world_z is not None:
+            routed = _world_position_to_chunk_cell(
+                {"x": world_x, "y": world_y, "z": world_z}, chunk_size
+            )
+            if (
+                routed["chunkX"],
+                routed["chunkY"],
+                routed["chunkZ"],
+            ) != (int(ref.chunk_x), int(ref.chunk_y), int(ref.chunk_z)):
+                continue
+            local_x, local_y, local_z = (
+                routed["localX"],
+                routed["localY"],
+                routed["localZ"],
+            )
+        elif local_x is not None and local_y is not None and local_z is not None:
+            world_x = int(ref.chunk_x) * chunk_size + local_x
+            world_y = int(ref.chunk_y) * chunk_size + local_y
+            world_z = int(ref.chunk_z) * chunk_size + local_z
+        else:
+            continue
+
+        before_cell_value = _get_cell_value(
+            content,
+            local_x=local_x,
+            local_y=local_y,
+            local_z=local_z,
+            chunk_size=chunk_size,
+        )
+        before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
+        runtime_owner = _runtime_object_cell_owner(
+            content,
+            world_x=world_x,
+            world_y=world_y,
+            world_z=world_z,
+            chunk_x=int(ref.chunk_x),
+            chunk_y=int(ref.chunk_y),
+            chunk_z=int(ref.chunk_z),
+            local_x=local_x,
+            local_y=local_y,
+            local_z=local_z,
+            include_metadata_object_instance_id=object_instance.object_instance_id,
+        )
+        expected_block_type_id = _coerce_string(
+            stored_cell.get("ownedBlockTypeId")
+            or stored_cell.get("afterBlockTypeId")
+            or (ref.metadata_json or {}).get("fillBlockTypeId")
+            or (object_instance.metadata_json or {}).get("fillBlockTypeId")
+        ) or None
+        if runtime_owner and runtime_owner.get("expectedBlockTypeId"):
+            expected_block_type_id = _coerce_string(runtime_owner["expectedBlockTypeId"])
+
+        preservation_reason: Optional[str] = None
+        if int(before_cell_value) == AIR_CELL_VALUE:
+            preservation_reason = "cell_already_air"
+        elif runtime_owner is None:
+            preservation_reason = "runtime_ownership_missing"
+        elif runtime_owner.get("objectInstanceId") != object_instance.object_instance_id:
+            preservation_reason = "owned_by_newer_object"
+        elif not expected_block_type_id:
+            preservation_reason = "expected_block_type_unknown"
+        elif before_block_type_id != expected_block_type_id:
+            preservation_reason = "cell_replaced_after_object_placement"
+
+        record = {
+            "x": world_x,
+            "y": world_y,
+            "z": world_z,
+            "chunkX": int(ref.chunk_x),
+            "chunkY": int(ref.chunk_y),
+            "chunkZ": int(ref.chunk_z),
+            "localX": local_x,
+            "localY": local_y,
+            "localZ": local_z,
+            "beforeCellValue": before_cell_value,
+            "afterCellValue": AIR_CELL_VALUE,
+            "beforeBlockTypeId": before_block_type_id,
+            "afterBlockTypeId": None,
+            "objectInstanceId": object_instance.object_instance_id,
+            "expectedBlockTypeId": expected_block_type_id,
+            "ownershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
+            "legacyMetadataOnlyCleanup": True,
+        }
+        if preservation_reason is None:
+            _set_cell_value(
+                content,
+                local_x=local_x,
+                local_y=local_y,
+                local_z=local_z,
+                chunk_size=chunk_size,
+                cell_value=AIR_CELL_VALUE,
+            )
+            cleared.append(record)
+        else:
+            record["afterCellValue"] = before_cell_value
+            record["afterBlockTypeId"] = before_block_type_id
+            record["preservationReason"] = preservation_reason
+            preserved.append(record)
+
+    return cleared, preserved
 
 
 def _execute_place_object(
@@ -3298,20 +3775,35 @@ def _execute_place_object(
     db.session.flush()
 
     existing_refs_by_chunk: dict[str, WorldObjectChunkRef] = {}
+    active_existing_chunk_keys: set[str] = set()
     if updating_existing_object:
         refs_query = WorldObjectChunkRef.query.filter(
             WorldObjectChunkRef.object_instance_db_id == object_instance.id,
-            WorldObjectChunkRef.deleted_at.is_(None),
         )
         for existing_ref in _query_without_relationships(refs_query).all():
             existing_refs_by_chunk[str(existing_ref.chunk_key)] = existing_ref
+            if existing_ref.is_active:
+                active_existing_chunk_keys.add(str(existing_ref.chunk_key))
 
     changed_chunks: list[str] = []
     dirty_chunks_set: set[str] = set()
     affected_cells_all: list[dict[str, Any]] = []
+    preserved_cells_all: list[dict[str, Any]] = []
     event_ids: list[str] = []
     snapshot_ids: list[str] = []
     chunk_versions: dict[str, str] = {}
+    displaced_object_ids_all: set[str] = set()
+
+    runtime_occupied_world_cells = [
+        {
+            **dict(cell),
+            "ownerObjectInstanceId": object_instance.object_instance_id,
+            "ownedBlockTypeId": fill_block_type_id,
+        }
+        for cell in occupied_world_cells
+    ]
+    object_ref_metadata = dict(object_instance.metadata_json or {})
+    object_ref_metadata["cellOwnershipPolicy"] = OBJECT_CELL_OWNERSHIP_POLICY
 
     object_ref = {
         "objectInstanceId": object_instance.object_instance_id,
@@ -3323,11 +3815,13 @@ def _execute_place_object(
         "primaryChunkKey": object_instance.primary_chunk_key,
         "objectKind": object_instance.object_kind,
         "footprint": _make_json_safe(object_instance.footprint_json or {}, max_depth=20),
-        "occupiedCells": _make_json_safe(occupied_world_cells, max_depth=20),
-        "metadata": _make_json_safe(object_instance.metadata_json or {}, max_depth=20),
+        "occupiedCells": _make_json_safe(runtime_occupied_world_cells, max_depth=20),
+        "metadata": _make_json_safe(object_ref_metadata, max_depth=20),
     }
-    metadata_only = (object_instance.object_type_id == "building_roof"
-                     and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none")
+    metadata_only = (
+        object_instance.object_type_id in {"building_roof", "planning_build_area"}
+        and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
+    )
 
     for chunk_key, group in grouped.items():
         existing_snapshot, content = _load_chunk_for_mutation(
@@ -3345,7 +3839,61 @@ def _execute_place_object(
 
         after_cell_value = _cell_value_for_block_type(content, fill_block)
         group_affected_cells: list[dict[str, Any]] = []
+        legacy_cleanup_cells: list[dict[str, Any]] = []
         chunk_changed = False
+
+        existing_ref_for_chunk = existing_refs_by_chunk.get(chunk_key)
+        if (
+            metadata_only
+            and existing_ref_for_chunk is not None
+            and existing_ref_for_chunk.is_active
+            and existing_ref_for_chunk.occupied_cell_count > 0
+        ):
+            legacy_cleanup_cells, legacy_preserved_cells = (
+                _clear_legacy_metadata_only_ref_voxels(
+                    content=content,
+                    ref=existing_ref_for_chunk,
+                    object_instance=object_instance,
+                    chunk_size=int(world.chunk_size or 16),
+                )
+            )
+            affected_cells_all.extend(legacy_cleanup_cells)
+            preserved_cells_all.extend(legacy_preserved_cells)
+            chunk_changed = bool(legacy_cleanup_cells)
+            for cleared_cell in legacy_cleanup_cells:
+                for dirty_key in _dirty_chunk_keys_for_cell(
+                    {
+                        "chunkX": cleared_cell["chunkX"],
+                        "chunkY": cleared_cell["chunkY"],
+                        "chunkZ": cleared_cell["chunkZ"],
+                        "localX": cleared_cell["localX"],
+                        "localY": cleared_cell["localY"],
+                        "localZ": cleared_cell["localZ"],
+                    },
+                    int(world.chunk_size or 16),
+                ):
+                    dirty_chunks_set.add(dirty_key)
+
+        displaced_object_ids: set[str] = set()
+        if not metadata_only:
+            excluded_ids = {object_instance.object_instance_id}
+            displaced_object_ids |= _detach_cells_from_runtime_object_refs(
+                content,
+                target_cells=group["cells"],
+                chunk_x=group["chunkX"],
+                chunk_y=group["chunkY"],
+                chunk_z=group["chunkZ"],
+                exclude_object_instance_ids=excluded_ids,
+            )
+            displaced_object_ids |= _detach_cells_from_persisted_object_refs(
+                world=world,
+                target_cells=group["cells"],
+                chunk_x=group["chunkX"],
+                chunk_y=group["chunkY"],
+                chunk_z=group["chunkZ"],
+                exclude_object_instance_ids=excluded_ids,
+            )
+            displaced_object_ids_all.update(displaced_object_ids)
 
         for cell in group["cells"]:
             before_cell_value = _get_cell_value(
@@ -3389,7 +3937,11 @@ def _execute_place_object(
                 "beforeBlockTypeId": before_block_type_id,
                 "afterBlockTypeId": fill_block_type_id,
                 "objectInstanceId": object_instance.object_instance_id,
+                "ownerObjectInstanceId": object_instance.object_instance_id,
+                "ownershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
             }
+            if displaced_object_ids:
+                affected_cell["displacedObjectInstanceIds"] = sorted(displaced_object_ids)
             group_affected_cells.append(affected_cell)
             affected_cells_all.append(affected_cell)
 
@@ -3427,6 +3979,7 @@ def _execute_place_object(
                 metadata_json={
                     "routeSource": ROUTE_SOURCE,
                     "fillBlockTypeId": fill_block_type_id,
+                    "cellOwnershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
                 },
             )
             db.session.add(ref_obj)
@@ -3439,6 +3992,7 @@ def _execute_place_object(
             ref_obj.metadata_json = {
                 "routeSource": ROUTE_SOURCE,
                 "fillBlockTypeId": fill_block_type_id,
+                "cellOwnershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
             }
         db.session.flush()
 
@@ -3466,7 +4020,7 @@ def _execute_place_object(
             chunk_revision_before=before_revision,
             chunk_version_before=before_version,
             content_hash_before=before_hash,
-            affected_cells=group_affected_cells,
+            affected_cells=[*legacy_cleanup_cells, *group_affected_cells],
             dirty_chunks=sorted(dirty_chunks_set),
             object_instance_id=object_instance.object_instance_id,
             object_type_id=object_instance.object_type_id,
@@ -3492,6 +4046,106 @@ def _execute_place_object(
         if chunk_changed or chunk_key not in changed_chunks:
             changed_chunks.append(chunk_key)
 
+    # A metadata-only geometry update may move its routing anchors to entirely
+    # different chunks.  Remove the old runtime ref and soft-delete the durable
+    # ref.  Querying deleted refs above lets a later move back restore the same
+    # unique (object, chunk) row instead of attempting a conflicting insert.
+    stale_chunk_keys = sorted(active_existing_chunk_keys - set(grouped))
+    for stale_chunk_key in stale_chunk_keys:
+        stale_ref = existing_refs_by_chunk[stale_chunk_key]
+        existing_snapshot, content = _load_chunk_for_mutation(
+            project=project,
+            universe=universe,
+            world=world,
+            chunk_x=stale_ref.chunk_x,
+            chunk_y=stale_ref.chunk_y,
+            chunk_z=stale_ref.chunk_z,
+        )
+        before_revision = existing_snapshot.chunk_revision if existing_snapshot else None
+        before_version = existing_snapshot.chunk_version if existing_snapshot else "generated"
+        before_hash = existing_snapshot.content_hash if existing_snapshot else content.get("contentHash")
+
+        stale_cleanup_cells: list[dict[str, Any]] = []
+        if metadata_only and stale_ref.occupied_cell_count > 0:
+            stale_cleanup_cells, stale_preserved_cells = (
+                _clear_legacy_metadata_only_ref_voxels(
+                    content=content,
+                    ref=stale_ref,
+                    object_instance=object_instance,
+                    chunk_size=int(world.chunk_size or 16),
+                )
+            )
+            affected_cells_all.extend(stale_cleanup_cells)
+            preserved_cells_all.extend(stale_preserved_cells)
+            for cleared_cell in stale_cleanup_cells:
+                for dirty_key in _dirty_chunk_keys_for_cell(
+                    {
+                        "chunkX": cleared_cell["chunkX"],
+                        "chunkY": cleared_cell["chunkY"],
+                        "chunkZ": cleared_cell["chunkZ"],
+                        "localX": cleared_cell["localX"],
+                        "localY": cleared_cell["localY"],
+                        "localZ": cleared_cell["localZ"],
+                    },
+                    int(world.chunk_size or 16),
+                ):
+                    dirty_chunks_set.add(dirty_key)
+
+        _remove_object_ref_from_content(content, object_instance.object_instance_id)
+        dirty_chunks_set.add(stale_chunk_key)
+        snapshot = _save_snapshot_after_mutation(
+            project=project,
+            universe=universe,
+            world=world,
+            existing_snapshot=existing_snapshot,
+            content=content,
+            materialized_reason="object_placement",
+            command_log=command_log,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        event = _create_chunk_event(
+            project=project,
+            universe=universe,
+            world=world,
+            command_log=command_log,
+            snapshot=snapshot,
+            command_type="PlaceObject",
+            event_type="object_change",
+            chunk_x=int(stale_ref.chunk_x),
+            chunk_y=int(stale_ref.chunk_y),
+            chunk_z=int(stale_ref.chunk_z),
+            user_id=user_id,
+            session_id=session_id,
+            position=anchor,
+            before_block_type_id=None,
+            after_block_type_id=None,
+            before_cell_value=None,
+            after_cell_value=None,
+            target_face=_get_payload_target_face(payload),
+            tool=_get_payload_tool(payload),
+            chunk_revision_before=before_revision,
+            chunk_version_before=before_version,
+            content_hash_before=before_hash,
+            affected_cells=stale_cleanup_cells,
+            dirty_chunks=[stale_chunk_key],
+            object_instance_id=object_instance.object_instance_id,
+            object_type_id=object_instance.object_type_id,
+            object_variant_id=object_instance.object_variant_id,
+            object_footprint_json=object_instance.footprint_json,
+            affected_bounds_json=object_instance.bounds_json,
+            payload_json=dict(payload),
+        )
+        _attach_event_to_snapshot(snapshot, event, user_id=user_id, session_id=session_id)
+        stale_ref.replace_occupied_cells([])
+        stale_ref.soft_delete()
+        db.session.add(stale_ref)
+        event_ids.append(event.event_id)
+        snapshot_ids.append(snapshot.snapshot_id)
+        chunk_versions[stale_chunk_key] = snapshot.chunk_version
+        if stale_chunk_key not in changed_chunks:
+            changed_chunks.append(stale_chunk_key)
+
     dirty_chunks = sorted(dirty_chunks_set)
 
     try:
@@ -3508,7 +4162,7 @@ def _execute_place_object(
     _mark_command_applied(
         command_log,
         changed=True,
-        affected_chunks_json=touched_chunks,
+        affected_chunks_json=sorted(changed_chunks),
         affected_cells_json=affected_cells_all,
         event_count=len(event_ids),
         result_payload_json={
@@ -3519,6 +4173,8 @@ def _execute_place_object(
             "snapshotIds": snapshot_ids,
             "changedChunks": changed_chunks,
             "dirtyChunks": dirty_chunks,
+            "displacedObjectInstanceIds": sorted(displaced_object_ids_all),
+            "preservedCells": preserved_cells_all,
         },
     )
 
@@ -3530,6 +4186,8 @@ def _execute_place_object(
         "eventIds": event_ids,
         "changedChunks": sorted(changed_chunks),
         "dirtyChunks": dirty_chunks,
+        "displacedObjectInstanceIds": sorted(displaced_object_ids_all),
+        "preservedCells": preserved_cells_all,
         "affectedCells": affected_cells_all,
         "snapshotIds": snapshot_ids,
         "chunkVersions": chunk_versions,
@@ -3592,6 +4250,7 @@ def _execute_remove_object(
     changed_chunks: list[str] = []
     dirty_chunks_set: set[str] = set()
     affected_cells_all: list[dict[str, Any]] = []
+    preserved_cells_all: list[dict[str, Any]] = []
     event_ids: list[str] = []
     snapshot_ids: list[str] = []
     chunk_versions: dict[str, str] = {}
@@ -3610,8 +4269,10 @@ def _execute_remove_object(
         before_version = existing_snapshot.chunk_version if existing_snapshot else "generated"
         before_hash = existing_snapshot.content_hash if existing_snapshot else content.get("contentHash")
 
-        metadata_only = (object_instance.object_type_id == "building_roof"
-                         and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none")
+        metadata_only = (
+            object_instance.object_type_id in {"building_roof", "planning_build_area"}
+            and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
+        )
         group_cells = ref.occupied_cells_json if isinstance(ref.occupied_cells_json, list) else []
         if metadata_only:
             group_cells = []
@@ -3635,17 +4296,6 @@ def _execute_remove_object(
                 chunk_size=int(world.chunk_size or 16),
             )
             before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
-
-            if before_cell_value != AIR_CELL_VALUE:
-                _set_cell_value(
-                    content,
-                    local_x=local_x,
-                    local_y=local_y,
-                    local_z=local_z,
-                    chunk_size=int(world.chunk_size or 16),
-                    cell_value=AIR_CELL_VALUE,
-                )
-                chunk_changed = True
 
             world_x = _coerce_int(
                 cell.get("x"),
@@ -3676,6 +4326,50 @@ def _execute_remove_object(
                 "chunkKey": ref.chunk_key,
             }
 
+            runtime_owner = _runtime_object_cell_owner(
+                content,
+                world_x=world_x,
+                world_y=world_y,
+                world_z=world_z,
+                chunk_x=int(ref.chunk_x),
+                chunk_y=int(ref.chunk_y),
+                chunk_z=int(ref.chunk_z),
+                local_x=local_x,
+                local_y=local_y,
+                local_z=local_z,
+            )
+            expected_block_type_id = _coerce_string(
+                cell.get("ownedBlockTypeId")
+                or cell.get("afterBlockTypeId")
+                or (ref.metadata_json or {}).get("fillBlockTypeId")
+                or (object_instance.metadata_json or {}).get("fillBlockTypeId")
+            ) or None
+            if runtime_owner and runtime_owner.get("expectedBlockTypeId"):
+                expected_block_type_id = _coerce_string(runtime_owner["expectedBlockTypeId"])
+
+            preservation_reason: Optional[str] = None
+            if int(before_cell_value) == AIR_CELL_VALUE:
+                preservation_reason = "cell_already_air"
+            elif runtime_owner is None:
+                preservation_reason = "runtime_ownership_missing"
+            elif runtime_owner.get("objectInstanceId") != object_instance.object_instance_id:
+                preservation_reason = "owned_by_newer_object"
+            elif not expected_block_type_id:
+                preservation_reason = "expected_block_type_unknown"
+            elif before_block_type_id != expected_block_type_id:
+                preservation_reason = "cell_replaced_after_object_placement"
+
+            if preservation_reason is None:
+                _set_cell_value(
+                    content,
+                    local_x=local_x,
+                    local_y=local_y,
+                    local_z=local_z,
+                    chunk_size=int(world.chunk_size or 16),
+                    cell_value=AIR_CELL_VALUE,
+                )
+                chunk_changed = True
+
             affected_cell = {
                 "x": world_x,
                 "y": world_y,
@@ -3691,14 +4385,27 @@ def _execute_remove_object(
                 "beforeBlockTypeId": before_block_type_id,
                 "afterBlockTypeId": None,
                 "objectInstanceId": object_instance.object_instance_id,
+                "ownerObjectInstanceId": (
+                    runtime_owner.get("objectInstanceId") if runtime_owner else None
+                ),
+                "expectedBlockTypeId": expected_block_type_id,
+                "ownershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
             }
-            group_affected_cells.append(affected_cell)
-            affected_cells_all.append(affected_cell)
-
-            for dirty_key in _dirty_chunk_keys_for_cell(cell_context, int(world.chunk_size or 16)):
-                dirty_chunks_set.add(dirty_key)
+            if preservation_reason is None:
+                group_affected_cells.append(affected_cell)
+                affected_cells_all.append(affected_cell)
+                for dirty_key in _dirty_chunk_keys_for_cell(cell_context, int(world.chunk_size or 16)):
+                    dirty_chunks_set.add(dirty_key)
+            else:
+                affected_cell["afterCellValue"] = before_cell_value
+                affected_cell["afterBlockTypeId"] = before_block_type_id
+                affected_cell["preservationReason"] = preservation_reason
+                preserved_cells_all.append(affected_cell)
 
         _remove_object_ref_from_content(content, object_instance.object_instance_id)
+        # Removing the ref changes the semantic chunk even when every physical
+        # cell was preserved because another writer owns it now.
+        dirty_chunks_set.add(ref.chunk_key)
 
         snapshot = _save_snapshot_after_mutation(
             project=project,
@@ -3810,6 +4517,9 @@ def _execute_remove_object(
             "snapshotIds": snapshot_ids,
             "changedChunks": sorted(changed_chunks),
             "dirtyChunks": dirty_chunks,
+            "clearedCellCount": len(affected_cells_all),
+            "preservedCellCount": len(preserved_cells_all),
+            "preservedCells": preserved_cells_all,
         },
     )
 
@@ -3821,8 +4531,294 @@ def _execute_remove_object(
         "changedChunks": sorted(changed_chunks),
         "dirtyChunks": dirty_chunks,
         "affectedCells": affected_cells_all,
+        "clearedCellCount": len(affected_cells_all),
+        "preservedCellCount": len(preserved_cells_all),
+        "preservedCells": preserved_cells_all,
         "snapshotIds": snapshot_ids,
         "chunkVersions": chunk_versions,
+    }
+
+
+OBJECT_BATCH_CHILD_COMMAND_TYPES = frozenset({"PlaceObject", "RemoveObject"})
+
+
+def _normalize_object_batch_commands(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate and canonicalize one bounded atomic object-command batch.
+
+    Structural validation and the aggregate placement-cell limit run before
+    the first child mutates a snapshot.  This keeps malformed/oversized
+    requests cheap and makes the request transaction the only atomicity
+    boundary needed by the executor.
+    """
+    _get_payload_position(payload, required=True)
+    requested_commands = payload.get("commands")
+    if not isinstance(requested_commands, Sequence) or isinstance(
+        requested_commands,
+        (str, bytes, bytearray),
+    ):
+        raise ValueError("commands must be a JSON array for ObjectBatch.")
+
+    command_count = len(requested_commands)
+    max_commands = _get_max_object_batch_commands()
+    if command_count == 0:
+        raise ValueError("commands must contain at least one child command for ObjectBatch.")
+    if command_count > max_commands:
+        raise ValueError(
+            f"ObjectBatch contains {command_count} child commands, but maximum is {max_commands}."
+        )
+
+    normalized_commands: list[dict[str, Any]] = []
+    placement_cell_count = 0
+    max_affected_cells = _get_max_object_batch_affected_cells()
+    removed_object_instance_ids: set[str] = set()
+    for index, requested_child in enumerate(requested_commands):
+        if not isinstance(requested_child, Mapping):
+            raise ValueError(f"commands[{index}] must be a JSON object.")
+        child = dict(requested_child)
+        try:
+            child_type = _normalize_command_type(
+                child.get("type")
+                or child.get("commandType")
+                or child.get("command_type")
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid ObjectBatch commands[{index}]: {exc}") from exc
+        if child_type not in OBJECT_BATCH_CHILD_COMMAND_TYPES:
+            allowed = ", ".join(sorted(OBJECT_BATCH_CHILD_COMMAND_TYPES))
+            raise ValueError(
+                f"ObjectBatch commands[{index}] has unsupported type '{child_type}'. "
+                f"Allowed child command types: {allowed}."
+            )
+
+        child["type"] = child_type
+        if child_type == "PlaceObject":
+            child_object = _extract_object_payload(child)
+            child_object_instance_id = _coerce_string(
+                child.get("objectInstanceId")
+                or child.get("object_instance_id")
+                or child_object.get("objectInstanceId")
+                or child_object.get("object_instance_id")
+            )
+            if child_object_instance_id in removed_object_instance_ids:
+                raise ValueError(
+                    f"ObjectBatch commands[{index}] cannot PlaceObject "
+                    f"'{child_object_instance_id}' after removing the same identity. "
+                    "Use a new objectInstanceId for the replacement generation."
+                )
+            try:
+                anchor = _get_payload_position(child, required=True)
+                dimensions = _extract_object_dimensions(child)
+                occupied_cells = _extract_object_occupied_cells(
+                    child,
+                    anchor=anchor,
+                    dimensions=dimensions,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid ObjectBatch commands[{index}] (PlaceObject): {exc}"
+                ) from exc
+            placement_cell_count += len(occupied_cells)
+            if placement_cell_count > max_affected_cells:
+                raise ValueError(
+                    "ObjectBatch PlaceObject children affect "
+                    f"{placement_cell_count} cells in total, but maximum is "
+                    f"{max_affected_cells}."
+                )
+        else:
+            child_object = _extract_object_payload(child)
+            child_object_instance_id = _coerce_string(
+                child.get("objectInstanceId")
+                or child.get("object_instance_id")
+                or child_object.get("objectInstanceId")
+                or child_object.get("object_instance_id")
+            )
+            if not child_object_instance_id:
+                raise ValueError(
+                    f"ObjectBatch commands[{index}] (RemoveObject) requires objectInstanceId."
+                )
+            if child_object_instance_id in removed_object_instance_ids:
+                raise ValueError(
+                    f"ObjectBatch commands[{index}] removes objectInstanceId "
+                    f"'{child_object_instance_id}' more than once."
+                )
+            removed_object_instance_ids.add(child_object_instance_id)
+
+        normalized_commands.append(child)
+
+    return normalized_commands
+
+
+def _execute_object_batch(
+    *,
+    project: Project,
+    universe: Universe,
+    world: WorldInstance,
+    payload: Mapping[str, Any],
+    command_log: WorldCommandLog,
+    user_id: Optional[str],
+    session_id: Optional[str],
+) -> dict[str, Any]:
+    """Execute ordered PlaceObject/RemoveObject children as one transaction.
+
+    Child executors intentionally share the parent command log.  They may
+    flush snapshots, refs and events, but none commits; the route performs the
+    sole commit after this function returns.  Any exception therefore reaches
+    the route rollback and removes every partial child mutation.
+    """
+    children = _normalize_object_batch_commands(payload)
+
+    event_ids: list[str] = []
+    changed_chunks: set[str] = set()
+    dirty_chunks: set[str] = set()
+    affected_cells: list[dict[str, Any]] = []
+    snapshot_ids: list[str] = []
+    seen_snapshot_ids: set[str] = set()
+    chunk_versions: dict[str, str] = {}
+    child_results: list[dict[str, Any]] = []
+    object_instance_ids: list[str] = []
+    seen_object_instance_ids: set[str] = set()
+    displaced_object_instance_ids: set[str] = set()
+    preserved_cells: list[dict[str, Any]] = []
+    changed_command_count = 0
+
+    for index, child in enumerate(children):
+        child_type = str(child["type"])
+        try:
+            if child_type == "PlaceObject":
+                child_result = _execute_place_object(
+                    project=project,
+                    universe=universe,
+                    world=world,
+                    payload=child,
+                    command_log=command_log,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            else:
+                child_result = _execute_remove_object(
+                    project=project,
+                    universe=universe,
+                    world=world,
+                    payload=child,
+                    command_log=command_log,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+        except LookupError as exc:
+            raise LookupError(
+                f"ObjectBatch commands[{index}] ({child_type}) failed: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise ValueError(
+                f"ObjectBatch commands[{index}] ({child_type}) failed: {exc}"
+            ) from exc
+
+        child_changed = bool(child_result.get("changed"))
+        changed_command_count += int(child_changed)
+        event_ids.extend(str(value) for value in child_result.get("eventIds") or [])
+        changed_chunks.update(str(value) for value in child_result.get("changedChunks") or [])
+        dirty_chunks.update(str(value) for value in child_result.get("dirtyChunks") or [])
+        affected_cells.extend(
+            dict(value)
+            for value in child_result.get("affectedCells") or []
+            if isinstance(value, Mapping)
+        )
+        for snapshot_id in child_result.get("snapshotIds") or []:
+            normalized_snapshot_id = str(snapshot_id)
+            if normalized_snapshot_id not in seen_snapshot_ids:
+                seen_snapshot_ids.add(normalized_snapshot_id)
+                snapshot_ids.append(normalized_snapshot_id)
+        chunk_versions.update(
+            {
+                str(chunk_key): str(chunk_version)
+                for chunk_key, chunk_version in dict(
+                    child_result.get("chunkVersions") or {}
+                ).items()
+            }
+        )
+        displaced_object_instance_ids.update(
+            str(value)
+            for value in child_result.get("displacedObjectInstanceIds") or []
+        )
+        preserved_cells.extend(
+            dict(value)
+            for value in child_result.get("preservedCells") or []
+            if isinstance(value, Mapping)
+        )
+
+        object_instance_id = _coerce_string(child_result.get("objectInstanceId"))
+        if object_instance_id and object_instance_id not in seen_object_instance_ids:
+            seen_object_instance_ids.add(object_instance_id)
+            object_instance_ids.append(object_instance_id)
+
+        child_results.append(
+            {
+                "index": index,
+                "commandType": child_type,
+                "changed": child_changed,
+                "objectInstanceId": object_instance_id or None,
+                "eventIds": list(child_result.get("eventIds") or []),
+                "changedChunks": list(child_result.get("changedChunks") or []),
+                "dirtyChunks": list(child_result.get("dirtyChunks") or []),
+                "affectedCellCount": len(child_result.get("affectedCells") or []),
+                "snapshotIds": list(child_result.get("snapshotIds") or []),
+            }
+        )
+
+    changed = changed_command_count > 0
+    changed_chunks_list = sorted(changed_chunks)
+    dirty_chunks_list = sorted(dirty_chunks)
+    batch_summary = {
+        "commandCount": len(children),
+        "changedCommandCount": changed_command_count,
+        "objectInstanceIds": object_instance_ids,
+        "results": child_results,
+    }
+
+    # Child executors populate scalar object fields for their standalone log.
+    # They would describe only the last child on a plural batch, so explicitly
+    # clear them before persisting the aggregate parent result.
+    command_log.object_instance_id = None
+    command_log.object_type_id = None
+    command_log.object_variant_id = None
+    command_log.object_size_x = None
+    command_log.object_size_y = None
+    command_log.object_size_z = None
+    command_log.object_rotation_json = {}
+    command_log.affected_bounds_json = {}
+
+    _mark_command_applied(
+        command_log,
+        changed=changed,
+        affected_chunks_json=changed_chunks_list,
+        affected_cells_json=affected_cells,
+        affected_bounds_json={},
+        event_count=len(event_ids),
+        result_payload_json={
+            "changed": changed,
+            "eventIds": event_ids,
+            "snapshotIds": snapshot_ids,
+            "changedChunks": changed_chunks_list,
+            "dirtyChunks": dirty_chunks_list,
+            "chunkVersions": chunk_versions,
+            "objectBatch": batch_summary,
+            "displacedObjectInstanceIds": sorted(displaced_object_instance_ids),
+            "preservedCells": preserved_cells,
+        },
+    )
+
+    return {
+        "changed": changed,
+        "commandType": "ObjectBatch",
+        "eventIds": event_ids,
+        "changedChunks": changed_chunks_list,
+        "dirtyChunks": dirty_chunks_list,
+        "affectedCells": affected_cells,
+        "snapshotIds": snapshot_ids,
+        "chunkVersions": chunk_versions,
+        "objectBatch": batch_summary,
+        "displacedObjectInstanceIds": sorted(displaced_object_instance_ids),
+        "preservedCells": preserved_cells,
     }
 
 
@@ -3905,6 +4901,16 @@ def _execute_command(
             user_id=user_id,
             session_id=session_id,
         )
+    elif command_type == "ObjectBatch":
+        result = _execute_object_batch(
+            project=project,
+            universe=universe,
+            world=world,
+            payload=payload,
+            command_log=command_log,
+            user_id=user_id,
+            session_id=session_id,
+        )
     else:
         raise ValueError(f"Command type '{command_type}' is not implemented in this route.")
 
@@ -3969,7 +4975,12 @@ def _serialize_command_result(
             "projectScoped": True,
             "snapshotWritten": bool(result.get("snapshotIds")),
             "eventsWritten": bool(result.get("eventIds")),
-            "objectCommand": command_log.command_type in {"PlaceObject", "RemoveObject", "ReplaceObject"},
+            "objectCommand": command_log.command_type in {
+                "PlaceObject",
+                "RemoveObject",
+                "ReplaceObject",
+                "ObjectBatch",
+            },
         },
         "route": {
             "source": ROUTE_SOURCE,
@@ -3995,6 +5006,9 @@ def _serialize_command_result(
     # receives an apparently successful copy with an empty clipboard.
     if isinstance(result.get("worldEdit"), Mapping):
         body["worldEdit"] = _make_json_safe(result.get("worldEdit"), max_depth=35)
+
+    if isinstance(result.get("objectBatch"), Mapping):
+        body["objectBatch"] = _make_json_safe(result.get("objectBatch"), max_depth=35)
 
     if "clipboard" in result:
         body["clipboard"] = _make_json_safe(list(result.get("clipboard") or []), max_depth=35)
@@ -4236,6 +5250,8 @@ def get_commands_route_status():
                 "defaultUniverseId": _get_default_universe_id(),
                 "defaultWorldId": _get_default_world_id(),
                 "maxCommandAffectedCells": _get_max_command_affected_cells(),
+                "maxObjectBatchCommands": _get_max_object_batch_commands(),
+                "maxObjectBatchAffectedCells": _get_max_object_batch_affected_cells(),
                 "maxObjectSize": {
                     "x": _get_max_object_size_x(),
                     "y": _get_max_object_size_y(),
@@ -4248,6 +5264,7 @@ def get_commands_route_status():
                     "WorldEdit",
                     "PlaceObject",
                     "RemoveObject",
+                    "ObjectBatch",
                 ],
                 "cellEncoding": {
                     "version": CELL_ENCODING_VERSION,

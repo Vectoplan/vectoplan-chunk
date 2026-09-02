@@ -36,6 +36,7 @@ from src.georeferencing.frame_contract import earth_grid_frame_contract
 
 OVERLAY_SCHEMA_VERSION = "geodata-overlays.v1"
 SUPPORTED_RENDER_MODE = "surface-lines"
+SUPPORTED_RENDER_MODES = frozenset((SUPPORTED_RENDER_MODE, "surface-ribbons"))
 DEFAULT_OVERLAY_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "id": "parcel-boundaries",
@@ -63,6 +64,36 @@ DEFAULT_OVERLAY_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "semantics": {
             "role": "parcel-boundary",
             "classificationSource": False,
+        },
+    },
+    {
+        "id": "street-network",
+        "datasetId": "strassendaten",
+        "label": "Strassen- und Wegenetz",
+        "enabled": True,
+        "source": {
+            "kind": "geoserver-wfs",
+            "workspace": "public",
+            "typeName": "public:strassendaten",
+            "srsName": "EPSG:4326",
+            "geometryMode": "line-centerlines",
+            "versionPolicy": "wfs-live",
+            "maxFeatures": 10_000,
+        },
+        "renderer": {
+            "kind": "surface-ribbons",
+            "style": {
+                "color": "#fbfcfd",
+                "opacity": 1.0,
+                "lineWidth": 1.0,
+                "surfaceWidth": 6.0,
+                "verticalOffset": 0.03,
+                "sampleStep": 0.5,
+            },
+        },
+        "semantics": {
+            "role": "street-network",
+            "classificationSource": True,
         },
     },
 )
@@ -215,6 +246,7 @@ class OverlayDefinition:
     color: str
     opacity: float
     line_width: float
+    surface_width: float
     vertical_offset: float
     sample_step: float
     max_features: int
@@ -270,6 +302,9 @@ class OverlayDefinition:
             line_width=_number(
                 style.get("lineWidth"), 1.5, minimum=0.1, maximum=20.0
             ),
+            surface_width=_number(
+                style.get("surfaceWidth"), 0.0, minimum=0.0, maximum=64.0
+            ),
             vertical_offset=_number(
                 style.get("verticalOffset"),
                 0.015,
@@ -297,6 +332,7 @@ class OverlayDefinition:
                 "color": self.color,
                 "opacity": self.opacity,
                 "lineWidth": self.line_width,
+                "surfaceWidth": self.surface_width,
                 "verticalOffset": self.vertical_offset,
                 "sampleStep": self.sample_step,
             },
@@ -309,7 +345,7 @@ def effective_overlay_definitions(world: Any) -> tuple[OverlayDefinition, ...]:
         if not bool(raw.get("enabled", True)):
             continue
         definition = OverlayDefinition.from_mapping(raw)
-        if definition.render_mode != SUPPORTED_RENDER_MODE:
+        if definition.render_mode not in SUPPORTED_RENDER_MODES:
             continue
         definitions.append(definition)
     return tuple(definitions)
@@ -672,6 +708,7 @@ class GeodataOverlayService:
             definition.color,
             definition.opacity,
             definition.line_width,
+            definition.surface_width,
             definition.vertical_offset,
             definition.sample_step,
             definition.max_features,
@@ -900,6 +937,12 @@ def attach_geodata_overlays(chunk: dict[str, Any], world: Any) -> bool:
                 }
             ],
         }
+    # Selection metadata is deliberately computed after every optional source.
+    # The photorealistic candidate is fail-closed and contributes no asset URL;
+    # a locked or absent high-priority layer therefore cannot blank LoD2.
+    from src.geodata.visual_layer_resolution import attach_visual_layer_resolution
+
+    attach_visual_layer_resolution(contract)
     metadata = chunk.get("metadata")
     if not isinstance(metadata, Mapping):
         metadata = {}
@@ -924,6 +967,7 @@ __all__ = (
     "OrchestratorOverlayClient",
     "OverlayDefinition",
     "OverlayPipelineConfig",
+    "SUPPORTED_RENDER_MODES",
     "attach_geodata_overlays",
     "clear_geodata_overlay_caches",
     "effective_overlay_definitions",

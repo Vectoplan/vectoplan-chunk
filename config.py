@@ -1708,6 +1708,20 @@ class BaseConfig:
         minimum=1,
     )
 
+    VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_COMMANDS = _read_int_env(
+        "VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_COMMANDS",
+        default=512,
+        minimum=1,
+        maximum=4096,
+    )
+
+    VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_AFFECTED_CELLS = _read_int_env(
+        "VECTOPLAN_CHUNK_MAX_OBJECT_BATCH_AFFECTED_CELLS",
+        default=1048576,
+        minimum=1,
+        maximum=4194304,
+    )
+
     VECTOPLAN_CHUNK_MAX_OBJECT_SIZE_X = _read_int_env(
         "VECTOPLAN_CHUNK_MAX_OBJECT_SIZE_X",
         default=256,

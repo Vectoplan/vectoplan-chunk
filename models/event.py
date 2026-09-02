@@ -69,6 +69,7 @@ COMMAND_TYPE_APPLY_BLOCK_BATCH = "ApplyBlockBatch"
 COMMAND_TYPE_PLACE_OBJECT = "PlaceObject"
 COMMAND_TYPE_REMOVE_OBJECT = "RemoveObject"
 COMMAND_TYPE_REPLACE_OBJECT = "ReplaceObject"
+COMMAND_TYPE_OBJECT_BATCH = "ObjectBatch"
 COMMAND_TYPE_FILL_REGION = "FillRegion"
 COMMAND_TYPE_CLEAR_REGION = "ClearRegion"
 COMMAND_TYPE_REPLACE_REGION = "ReplaceRegion"
@@ -85,6 +86,7 @@ VALID_COMMAND_TYPES = frozenset(
         COMMAND_TYPE_PLACE_OBJECT,
         COMMAND_TYPE_REMOVE_OBJECT,
         COMMAND_TYPE_REPLACE_OBJECT,
+        COMMAND_TYPE_OBJECT_BATCH,
         COMMAND_TYPE_FILL_REGION,
         COMMAND_TYPE_CLEAR_REGION,
         COMMAND_TYPE_REPLACE_REGION,
@@ -673,6 +675,7 @@ def derive_event_type_from_command_type(command_type: str) -> str:
         COMMAND_TYPE_PLACE_OBJECT,
         COMMAND_TYPE_REMOVE_OBJECT,
         COMMAND_TYPE_REPLACE_OBJECT,
+        COMMAND_TYPE_OBJECT_BATCH,
     }:
         return EVENT_TYPE_OBJECT_CHANGE
 
@@ -1020,7 +1023,7 @@ class WorldCommandLog(db.Model):
             name="ck_world_command_logs_command_id_not_empty",
         ),
         db.CheckConstraint(
-            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
+            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'ObjectBatch', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
             name="ck_world_command_logs_command_type_valid",
         ),
         db.CheckConstraint(
@@ -2059,7 +2062,7 @@ class ChunkEvent(db.Model):
             name="ck_chunk_events_event_status_valid",
         ),
         db.CheckConstraint(
-            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
+            "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', 'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'ObjectBatch', 'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')",
             name="ck_chunk_events_command_type_valid",
         ),
         db.CheckConstraint(

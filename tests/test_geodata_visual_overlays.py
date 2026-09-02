@@ -145,9 +145,9 @@ def test_default_parcel_overlay_is_clipped_live_and_deduplicated(monkeypatch):
         "centralMeridianDegrees": 0.0,
         "storageOrigin": {"x": 1_440_000, "y": 0, "z": 5_776_000},
     }
-    assert len(contract["items"]) == 1
+    assert len(contract["items"]) == 2
 
-    parcel = contract["items"][0]
+    parcel = next(item for item in contract["items"] if item["id"] == "parcel-boundaries")
     assert parcel["id"] == "parcel-boundaries"
     assert parcel["datasetId"] == "flurstuecke"
     assert parcel["releaseKey"] == "live:public:public:flurstuecke"
@@ -158,6 +158,15 @@ def test_default_parcel_overlay_is_clipped_live_and_deduplicated(monkeypatch):
     assert parcel["stats"]["featureCount"] == 2
     assert parcel["stats"]["sourceSegmentCount"] == 8
     assert parcel["stats"]["emittedSegmentCount"] == 4
+
+    street = next(item for item in contract["items"] if item["id"] == "street-network")
+    assert street["datasetId"] == "strassendaten"
+    assert street["releaseKey"] == "live:public:public:strassendaten"
+    assert street["renderMode"] == "surface-ribbons"
+    assert street["semanticRole"] == "street-network"
+    assert street["classificationSource"] is True
+    assert street["style"]["surfaceWidth"] == 6.0
+    assert street["style"]["color"] == "#fbfcfd"
 
 
 def test_approved_release_policy_uses_orchestrator_version(monkeypatch):

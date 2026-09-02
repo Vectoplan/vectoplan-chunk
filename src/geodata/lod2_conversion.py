@@ -15,12 +15,17 @@ from shapely import constrained_delaunay_triangles, make_valid, union_all
 from shapely.geometry import LineString, Point, Polygon, box
 from src.geodata.roof_topology import roof_components, unique_roof_faces
 
-CONVERSION_VERSION = "lod2-editable-buildings.v3"
+CONVERSION_VERSION = "lod2-editable-buildings.v4"
+CONSTRUCTION_GRID_VERSION = "vectoplan-lod2-construction-grid.v1"
+CONSTRUCTION_GRID_ALGORITHM_VERSION = "dominant-exterior-facade-medoid.v1"
 WALL_BLOCK_ID = "lod2_exterior_wall"
 MAX_WALL_CELLS = 100_000
 MAX_FACE_CANDIDATES = 250_000
 MAX_ROOF_FACES = 8192
 EPSILON = 1e-7
+FACADE_FAMILY_TOLERANCE_RAD = math.radians(2.5)
+FACADE_ANCHOR_TOLERANCE_RAD = math.radians(.35)
+MINIMUM_STRUCTURAL_FACADE_M = .35
 
 
 def digest(value):
@@ -827,7 +832,255 @@ def ground_footprints(polygons):
     return result
 
 
-def roof_objects(feature, *, building_facades=None, building_ground_footprints=None):
+def _modulo_half_turn(angle):
+    return angle % math.pi
+
+
+def _line_angle_distance(first, second):
+    difference = abs(_modulo_half_turn(first) - _modulo_half_turn(second))
+    return min(difference, math.pi - difference)
+
+
+def _canonical_axis(angle):
+    axis = [math.cos(angle), math.sin(angle)]
+    if axis[0] < -EPSILON or (abs(axis[0]) <= EPSILON and axis[1] < 0):
+        axis = [-axis[0], -axis[1]]
+    return axis
+
+
+def _dominant_facade_family(candidates):
+    """Select an actually measured direction, never an invented mean angle."""
+    if not candidates:
+        return None
+
+    def support(candidate):
+        return sum(item["length"] for item in candidates
+                   if _line_angle_distance(item["angle"], candidate["angle"])
+                   <= FACADE_FAMILY_TOLERANCE_RAD)
+
+    seed = min(candidates, key=lambda item: (
+        -support(item), -item["length"], item["angle"], item["key"],
+    ))
+    inliers = [item for item in candidates
+               if _line_angle_distance(item["angle"], seed["angle"])
+               <= FACADE_FAMILY_TOLERANCE_RAD]
+
+    def weighted_error(candidate):
+        return sum(_line_angle_distance(item["angle"], candidate["angle"]) * item["length"]
+                   for item in inliers)
+
+    return min(inliers, key=lambda item: (
+        weighted_error(item), -item["length"], item["angle"], item["key"],
+    ))
+
+
+def _basis_coordinates(point, axis_u, axis_v):
+    determinant = axis_u[0] * axis_v[1] - axis_u[1] * axis_v[0]
+    if abs(determinant) < .5:
+        raise ValueError("LoD2 construction-grid basis is degenerate")
+    return [
+        (point[0] * axis_v[1] - point[1] * axis_v[0]) / determinant,
+        (axis_u[0] * point[1] - axis_u[1] * point[0]) / determinant,
+    ]
+
+
+def _clustered_axis_coordinates(values, tolerance=.02):
+    clusters = []
+    for value in sorted(value for value in values if math.isfinite(value)):
+        if not clusters or value - sum(clusters[-1]) / len(clusters[-1]) > tolerance:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+    # An observed coordinate, rather than a floating average, remains the
+    # authoritative support line.  The lower median is deterministic for an
+    # even cluster and agrees with the client-side construction-grid policy.
+    return [cluster[(len(cluster) - 1) // 2] for cluster in clusters]
+
+
+def _round_half_up(value):
+    return math.floor(value + .5)
+
+
+def _construction_footprint_geometry(footprints):
+    polygons = []
+    for footprint in footprints:
+        if not footprint or len(footprint[0]) < 4:
+            continue
+        polygon = make_valid(Polygon(footprint[0], footprint[1:]))
+        parts = list(polygon.geoms) if polygon.geom_type == "MultiPolygon" else [polygon]
+        polygons.extend(part for part in parts if part.geom_type == "Polygon" and part.area > EPSILON)
+    if not polygons:
+        return None
+    return make_valid(union_all(polygons, grid_size=.001))
+
+
+def _canonical_footprint_coordinates(footprints):
+    def ring_key(ring):
+        points = [tuple(round(value, 6) for value in point) for point in ring]
+        if len(points) > 1 and points[0] == points[-1]:
+            points.pop()
+        if not points:
+            return ()
+        variants = []
+        for values in (points, list(reversed(points))):
+            minimum = min(range(len(values)), key=lambda index: values[index])
+            variants.append(tuple(values[minimum:] + values[:minimum]))
+        return min(variants)
+
+    return sorted(
+        [key for ring in footprint if (key := ring_key(ring))]
+        for footprint in footprints
+    )
+
+
+def construction_grid_contract(feature, *, building_facades=None, building_ground_footprints=None):
+    """Derive the local construction grid for an existing LoD2 building.
+
+    The immutable Earth/chunk voxel frame is not rotated.  This contract owns a
+    separate architectural grid: real exterior WallSurface directions select
+    its axes, every measured facade support line is retained as an anchor, and
+    each facade is divided into complete block columns.  A parcel consumer can
+    continue those anchors with near-one-metre whole cells and clip only the
+    final cells at the parcel boundary.  With no existing building this
+    function deliberately returns ``None`` so the established parcel-boundary
+    grid remains authoritative.
+    """
+    facades = (facade_segments(feature["polygons"])
+               if building_facades is None else building_facades)
+    footprints = (ground_footprints(feature["polygons"])
+                  if building_ground_footprints is None else building_ground_footprints)
+    exterior = [segment for segment in facades
+                if segment.get("facadeRole") == "exterior"
+                and math.dist(segment["start"], segment["end"]) >= MINIMUM_STRUCTURAL_FACADE_M]
+    footprint_geometry = _construction_footprint_geometry(footprints)
+    if not exterior or footprint_geometry is None or footprint_geometry.is_empty:
+        return None
+
+    candidates = []
+    for segment in exterior:
+        start, end = segment["start"], segment["end"]
+        length = math.dist(start, end)
+        angle = _modulo_half_turn(math.atan2(end[1] - start[1], end[0] - start[0]))
+        key = ":".join(f"{value:.6f}" for point in sorted((start, end)) for value in point)
+        candidates.append({"segment": segment, "length": length, "angle": angle, "key": key})
+    primary = _dominant_facade_family(candidates)
+    if primary is None:
+        return None
+    secondary = _dominant_facade_family([
+        candidate for candidate in candidates
+        if _line_angle_distance(candidate["angle"], primary["angle"]) >= math.radians(60)
+    ])
+    axis_u = _canonical_axis(primary["angle"])
+    axis_v = (_canonical_axis(secondary["angle"])
+              if secondary is not None else [-axis_u[1], axis_u[0]])
+    determinant = axis_u[0] * axis_v[1] - axis_u[1] * axis_v[0]
+    if determinant < 0:
+        axis_v = [-axis_v[0], -axis_v[1]]
+        determinant = -determinant
+    if determinant < .5:
+        axis_v = [-axis_u[1], axis_u[0]]
+
+    plan_points = [point for footprint in footprints for ring in footprint for point in ring[:-1]]
+    if not plan_points:
+        return None
+    projected = [_basis_coordinates(point, axis_u, axis_v) for point in plan_points]
+    minimum_u, maximum_u = min(point[0] for point in projected), max(point[0] for point in projected)
+    minimum_v, maximum_v = min(point[1] for point in projected), max(point[1] for point in projected)
+    width, depth = maximum_u - minimum_u, maximum_v - minimum_v
+    if width < .25 or depth < .25:
+        return None
+    columns, rows = max(1, _round_half_up(width)), max(1, _round_half_up(depth))
+    origin = [
+        axis_u[0] * minimum_u + axis_v[0] * minimum_v,
+        axis_u[1] * minimum_u + axis_v[1] * minimum_v,
+    ]
+
+    centroid = footprint_geometry.centroid
+    facade_contracts, u_anchors, v_anchors = [], [minimum_u, maximum_u], [minimum_v, maximum_v]
+    for candidate in sorted(candidates, key=lambda item: item["key"]):
+        segment = candidate["segment"]
+        start, end = [*segment["start"]], [*segment["end"]]
+        if tuple(start) > tuple(end):
+            start, end = end, start
+        length = math.dist(start, end)
+        tangent = [(end[0] - start[0]) / length, (end[1] - start[1]) / length]
+        inward = [-tangent[1], tangent[0]]
+        midpoint = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2]
+        positive = Point(midpoint[0] + inward[0] * .04, midpoint[1] + inward[1] * .04)
+        negative = Point(midpoint[0] - inward[0] * .04, midpoint[1] - inward[1] * .04)
+        positive_inside = footprint_geometry.covers(positive)
+        negative_inside = footprint_geometry.covers(negative)
+        if ((not positive_inside and negative_inside)
+                or (positive_inside == negative_inside
+                    and (centroid.x - midpoint[0]) * inward[0]
+                    + (centroid.y - midpoint[1]) * inward[1] < 0)):
+            inward = [-inward[0], -inward[1]]
+        division_count = max(1, _round_half_up(length))
+        facade_id = digest([start, end])[:20]
+        facade_contracts.append({
+            "id": facade_id,
+            "start": [round(value, 6) for value in start],
+            "end": [round(value, 6) for value in end],
+            "inward": [round(value, 9) for value in inward],
+            "lengthM": round(length, 6),
+            "columnCount": division_count,
+            "columnWidthM": round(length / division_count, 9),
+            "wallCellOwnership": "one-complete-block-per-column-and-height-layer",
+        })
+        basis = _basis_coordinates(midpoint, axis_u, axis_v)
+        alignment_u = abs(tangent[0] * axis_u[0] + tangent[1] * axis_u[1])
+        alignment_v = abs(tangent[0] * axis_v[0] + tangent[1] * axis_v[1])
+        if alignment_u >= math.cos(FACADE_ANCHOR_TOLERANCE_RAD):
+            v_anchors.append(basis[1])
+        elif alignment_v >= math.cos(FACADE_ANCHOR_TOLERANCE_RAD):
+            u_anchors.append(basis[0])
+
+    u_anchors = _clustered_axis_coordinates(u_anchors)
+    v_anchors = _clustered_axis_coordinates(v_anchors)
+    rotation = math.degrees(math.atan2(axis_u[1], axis_u[0])) % 180
+    contract = {
+        "schemaVersion": CONSTRUCTION_GRID_VERSION,
+        "algorithmVersion": CONSTRUCTION_GRID_ALGORITHM_VERSION,
+        "referenceMode": "lod2-existing-building",
+        "buildingId": feature["id"],
+        "coordinateSpace": "world-cell-xz",
+        "origin": [round(value, 6) for value in origin],
+        "axisU": [round(value, 12) for value in axis_u],
+        "axisV": [round(value, 12) for value in axis_v],
+        "rotationDegrees": round(rotation, 9),
+        "widthM": round(width, 6),
+        "depthM": round(depth, 6),
+        "columns": columns,
+        "rows": rows,
+        "stepU": round(width / columns, 9),
+        "stepV": round(depth / rows, 9),
+        "uAnchors": [round(value, 7) for value in u_anchors],
+        "vAnchors": [round(value, 7) for value in v_anchors],
+        "facades": facade_contracts,
+        "partitionPolicy": {
+            "algorithm": "anchored-axis-lines.v1",
+            "targetCellSizeM": 1,
+            "buildingFacadeCells": "complete-block-columns",
+            "betweenFacadeAnchors": "equal-near-metre-whole-cells",
+            "parcelBoundaryCells": "adapted-clipped-cells",
+            "buildingFootprint": "excluded-from-buildable-remainder",
+            "emptyParcelFallback": "existing-parcel-boundary-oriented-grid",
+        },
+        "provenance": {
+            "conversionVersion": CONVERSION_VERSION,
+            "sourceTile": feature["sourceTile"],
+            "sourceSha256": feature["sourceSha256"],
+            "sourceGeometry": ["GroundSurface", "WallSurface"],
+            "groundFootprintFingerprint": digest(_canonical_footprint_coordinates(footprints)),
+            "facadeFingerprint": digest(facade_contracts),
+        },
+    }
+    contract["fingerprint"] = digest(contract)
+    return contract
+
+
+def roof_objects(feature, *, building_facades=None, building_ground_footprints=None,
+                 building_construction_grid=None):
     """One editable zone per 3D-connected roof, preserving separate height levels.
 
     Triangulation is constrained, so concave rings and holes are not bridged.
@@ -837,6 +1090,11 @@ def roof_objects(feature, *, building_facades=None, building_ground_footprints=N
     building_facades = facade_segments(feature["polygons"]) if building_facades is None else building_facades
     building_ground_footprints = (ground_footprints(feature["polygons"])
                                   if building_ground_footprints is None else building_ground_footprints)
+    building_construction_grid = (construction_grid_contract(
+        feature,
+        building_facades=building_facades,
+        building_ground_footprints=building_ground_footprints,
+    ) if building_construction_grid is None else building_construction_grid)
     projected = []
     for surface in roof_surfaces:
         polygon, dropped, _, lift = planar_polygon(surface["rings"])
@@ -929,6 +1187,8 @@ def roof_objects(feature, *, building_facades=None, building_ground_footprints=N
                   "referencePitchDeg": 35 if top-base > .001 else 0,
                   "groundFootprints": building_ground_footprints,
                   "facadeGeometryMode": "ground-normalized-v1"}
+        if building_construction_grid is not None:
+            source["constructionGrid"] = building_construction_grid
         source["facadeSegments"] = [segment for segment in building_facades
             if zone.boundary.distance(LineString([segment["start"], segment["end"]])) <= 2.0
             and segment["maximumY"] >= base - 2.0]
@@ -964,6 +1224,8 @@ def roof_objects(feature, *, building_facades=None, building_ground_footprints=N
                                     "source": "vectoplan-chunk.lod2-import", "familyRef": "world-edit.roof",
                                     "variantRef": "imported", "roofType": "imported", "mergeKey": roof_id,
                                     "lod2BuildingId": feature["id"], "roofParameters": parameters,
+                                    **({"constructionGridVersion": CONSTRUCTION_GRID_VERSION}
+                                       if building_construction_grid is not None else {}),
                                     "roofCalculation": calculation}})
     return result
 
@@ -971,9 +1233,21 @@ def roof_objects(feature, *, building_facades=None, building_ground_footprints=N
 def convert_building(feature):
     facades = facade_segments(feature["polygons"])
     footprints = ground_footprints(feature["polygons"])
+    construction_grid = construction_grid_contract(
+        feature,
+        building_facades=facades,
+        building_ground_footprints=footprints,
+    )
     cells = wall_cells(feature["polygons"], segments=facades)
-    roofs = roof_objects(feature, building_facades=facades, building_ground_footprints=footprints)
+    roofs = roof_objects(
+        feature,
+        building_facades=facades,
+        building_ground_footprints=footprints,
+        building_construction_grid=construction_grid,
+    )
     if not cells or not roofs:
         raise ValueError("Building needs classified walls and roofs for complete conversion")
     return {"buildingId": feature["id"], "sourceTile": feature["sourceTile"],
-            "sourceSha256": feature["sourceSha256"], "wallCells": cells, "roofs": roofs}
+            "sourceSha256": feature["sourceSha256"], "wallCells": cells, "roofs": roofs,
+            "facadeSegments": facades, "groundFootprints": footprints,
+            "constructionGrid": construction_grid}
