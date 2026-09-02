@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import noload
 
 from extensions import db
-from models.block import BlockType
+from models.block import BLOCK_STATUS_ACTIVE, BlockType
 from models.chunk import ChunkSnapshot
 from models.event import WorldCommandLog
 from models.object import WorldObjectInstance
@@ -27,14 +27,45 @@ from src.geodata.lod2_buildings import building_overlay_item, world_lod2_config
 from src.geodata.lod2_sources import sources_for_world
 from src.geodata.lod2_conversion import (
     CONVERSION_VERSION,
+    CONSTRUCTION_GRID_VERSION,
     WALL_BLOCK_ID,
+    construction_grid_contract,
     convert_building,
     facade_segments,
     ground_footprints,
 )
 from src.world.earth.terrain_pipeline import generate_earth_terrain_chunk
 
-FACADE_GRID_VERSION = "lod2-facade-grid.v3"
+FACADE_GRID_VERSION = "lod2-facade-grid.v4"
+LOD2_EXISTING_WALL_COLOR = "#f1f3f5"
+LOD2_WALL_MATERIAL_ID = "lod2_exterior_wall"
+LOD2_WALL_METADATA = {
+    "semanticRole": "wall",
+    "color": LOD2_EXISTING_WALL_COLOR,
+    "source": "lod2",
+    "thicknessAssumed": True,
+    "constructionGridVersion": CONSTRUCTION_GRID_VERSION,
+    "cellPolicy": "whole-breakable-voxel",
+}
+LOD2_WALL_CANONICAL_PROPERTIES = {
+    "status": BLOCK_STATUS_ACTIVE,
+    "deleted_at": None,
+    "deprecated_at": None,
+    "solid": True,
+    "opaque": True,
+    "placeable": True,
+    "breakable": True,
+    "selectable": True,
+    "collidable": True,
+    "emits_light": False,
+    "light_level": 0,
+    "render_mode": "cube",
+    "shape_type": "cube",
+    "material_id": LOD2_WALL_MATERIAL_ID,
+    # Old textured prototypes must not override the neutral stock-building
+    # material after the registry row has been upgraded.
+    "texture_id": None,
+}
 
 
 def prepare_import(world, *, radius=128, center_x=0, center_z=0):
@@ -76,10 +107,16 @@ def prepare_import(world, *, radius=128, center_x=0, center_z=0):
             if receipt.get("facadeGridVersion") != FACADE_GRID_VERSION:
                 segments = facade_segments(feature["polygons"])
                 if segments:
+                    footprints = ground_footprints(feature["polygons"])
                     metadata_repairs.append({
                         "buildingId": feature["id"],
                         "facadeSegments": segments,
-                        "groundFootprints": ground_footprints(feature["polygons"]),
+                        "groundFootprints": footprints,
+                        "constructionGrid": construction_grid_contract(
+                            feature,
+                            building_facades=segments,
+                            building_ground_footprints=footprints,
+                        ),
                     })
             continue
         try:
@@ -113,7 +150,10 @@ def summary(plan):
         "roofCount": sum(len(b["roofs"]) for b in plan["buildings"]),
         "buildings": [{"buildingId": b["buildingId"], "sourceTile": b["sourceTile"],
                        "sourceSha256": b["sourceSha256"], "wallCellCount": len(b["wallCells"]),
-                       "roofIds": [r["objectInstanceId"] for r in b["roofs"]]} for b in plan["buildings"]]}
+                       "roofIds": [r["objectInstanceId"] for r in b["roofs"]],
+                       "constructionGridVersion": ((b.get("constructionGrid") or {}).get("schemaVersion")),
+                       "constructionGridFingerprint": ((b.get("constructionGrid") or {}).get("fingerprint"))}
+                      for b in plan["buildings"]]}
 
 
 def apply_facade_metadata_repairs(world, repairs):
@@ -126,6 +166,7 @@ def apply_facade_metadata_repairs(world, repairs):
         str(item.get("buildingId")): {
             "facadeSegments": copy.deepcopy(item.get("facadeSegments") or []),
             "groundFootprints": copy.deepcopy(item.get("groundFootprints") or []),
+            "constructionGrid": copy.deepcopy(item.get("constructionGrid")),
         }
         for item in repairs
         if item.get("buildingId") and item.get("facadeSegments")
@@ -152,9 +193,13 @@ def apply_facade_metadata_repairs(world, repairs):
         imported_source["facadeSegments"] = copy.deepcopy(repair["facadeSegments"])
         imported_source["groundFootprints"] = copy.deepcopy(repair["groundFootprints"])
         imported_source["facadeGridVersion"] = FACADE_GRID_VERSION
+        if repair["constructionGrid"] is not None:
+            imported_source["constructionGrid"] = copy.deepcopy(repair["constructionGrid"])
         parameters["importedSource"] = imported_source
         metadata["roofParameters"] = parameters
         metadata["facadeGridVersion"] = FACADE_GRID_VERSION
+        if repair["constructionGrid"] is not None:
+            metadata["constructionGridVersion"] = CONSTRUCTION_GRID_VERSION
         object_instance.replace_metadata(metadata, updated_by_user_id="system_lod2_import")
         metadata_by_object_id[str(object_instance.object_instance_id)] = metadata
         repaired_buildings.add(building_id)
@@ -198,14 +243,23 @@ def apply_only_facade_metadata_repairs(world, plan):
     config = dict(world_lod2_config(world) or {})
     if not config or world.build_earth_provider().reference_fingerprint != plan["referenceFingerprint"]:
         raise ValueError("Project configuration changed while preparing facade repair")
+    # The repair command is also the maintenance/bootstrap path for worlds that
+    # were materialized before LoD2 walls became individually editable.
+    register_wall(world)
     ledger = dict(config.get("materializedBuildings", {}))
     repairs = [item for item in plan.get("metadataRepairs", []) if item.get("buildingId") in ledger]
     result = apply_facade_metadata_repairs(world, repairs)
     repaired_at = datetime.now(timezone.utc).isoformat()
     for item in repairs:
         building_id = item.get("buildingId")
-        ledger[building_id] = {**ledger[building_id], "facadeGridVersion": FACADE_GRID_VERSION,
-                               "facadeGridRepairedAt": repaired_at}
+        grid = item.get("constructionGrid") or {}
+        ledger[building_id] = {
+            **ledger[building_id],
+            "facadeGridVersion": FACADE_GRID_VERSION,
+            "constructionGridVersion": grid.get("schemaVersion"),
+            "constructionGridFingerprint": grid.get("fingerprint"),
+            "facadeGridRepairedAt": repaired_at,
+        }
     world.metadata_json = {**world.metadata_json, "lod2Buildings": {
         **config, "materializedBuildings": ledger,
     }}
@@ -213,19 +267,38 @@ def apply_only_facade_metadata_repairs(world, plan):
     return {**result, "ignoredNewBuildings": len(plan.get("buildings", []))}
 
 
+def _reconcile_lod2_wall_type(wall):
+    """Upgrade only an already-resolved reserved LoD2 wall row in place."""
+    changed = False
+    for attribute, canonical_value in LOD2_WALL_CANONICAL_PROPERTIES.items():
+        if getattr(wall, attribute) != canonical_value:
+            setattr(wall, attribute, canonical_value)
+            changed = True
+    current_metadata = dict(wall.metadata_json or {})
+    metadata = {**current_metadata, **LOD2_WALL_METADATA}
+    if metadata != current_metadata:
+        wall.metadata_json = metadata
+        changed = True
+    if changed:
+        wall.touch(updated_by_user_id="system_lod2_import")
+    return changed
+
+
 def register_wall(world):
     registry = commands._get_registry_for_world(world)
     existing = BlockType.query.options(noload("*")).filter_by(registry_db_id=registry.id, block_type_id=WALL_BLOCK_ID).one_or_none()
     if existing:
-        if not (existing.breakable and existing.collidable and existing.solid and existing.is_active):
-            raise ValueError("Existing LoD2 wall block definition is incompatible")
+        # Reconcile only the reserved LoD2 wall id in this world's registry.
+        # Historic snapshots keep referencing the same row, so replacing it or
+        # creating an alias would leave those cells permanently unbreakable.
+        if _reconcile_lod2_wall_type(existing):
+            db.session.flush()
         return existing
     wall = BlockType.create_for_registry(
         registry, block_type_id=WALL_BLOCK_ID, label="LoD2 Außenwand", category="structure",
         description="Abbaubare LoD2-Außenhülle im 1-m-Raster; keine gemessene Wandstärke.",
         solid=True, opaque=True, placeable=True, breakable=True, selectable=True, collidable=True,
-        material_id="lod2_exterior_wall", metadata_json={"semanticRole": "wall", "color": "#e2d9c7",
-                                                        "source": "lod2", "thicknessAssumed": True})
+        material_id=LOD2_WALL_MATERIAL_ID, metadata_json=LOD2_WALL_METADATA)
     db.session.add(wall)
     db.session.flush()
     return wall
@@ -240,19 +313,27 @@ def apply_import(world, plan, *, progress=None):
     ledger = dict(config.get("materializedBuildings", {}))
     buildings = [b for b in plan["buildings"] if b["buildingId"] not in ledger]
     repairs = [item for item in plan.get("metadataRepairs", []) if item.get("buildingId") in ledger]
+    # Explicit re-imports and editor-dataset bootstrap runs must heal legacy
+    # registries even when every building already has a materialization receipt.
+    register_wall(world)
     if not buildings and not repairs:
         return {"importedBuildings": 0, "writtenWallCells": 0, "roofCount": 0, "commandIds": [],
                 "repairedBuildings": 0, "repairedRoofObjects": 0, "repairedSnapshots": 0}
     project = db.session.get(Project, world.project_db_id, options=[noload("*")])
     universe = db.session.get(Universe, world.universe_db_id, options=[noload("*")])
-    register_wall(world)
     repair_result = apply_facade_metadata_repairs(world, repairs)
     for item in repairs:
         building_id = item.get("buildingId")
         if building_id not in ledger:
             continue
-        ledger[building_id] = {**ledger[building_id], "facadeGridVersion": FACADE_GRID_VERSION,
-                               "facadeGridRepairedAt": datetime.now(timezone.utc).isoformat()}
+        grid = item.get("constructionGrid") or {}
+        ledger[building_id] = {
+            **ledger[building_id],
+            "facadeGridVersion": FACADE_GRID_VERSION,
+            "constructionGridVersion": grid.get("schemaVersion"),
+            "constructionGridFingerprint": grid.get("fingerprint"),
+            "facadeGridRepairedAt": datetime.now(timezone.utc).isoformat(),
+        }
     # Protect all explicitly edited cells, including air after removal, not just
     # currently occupied cells. Only scalar JSON columns, never eager relationships.
     protected = set()
@@ -287,7 +368,11 @@ def apply_import(world, plan, *, progress=None):
             continue
         payload = {"type": "WorldEdit", "tool": "clipboard", "operation": "paste",
                    "position": {"x": 0, "y": 0, "z": 0}, "commandSource": "importer",
-                   "userId": "system_lod2_import", "metadata": {"source": CONVERSION_VERSION},
+                   "userId": "system_lod2_import", "metadata": {
+                       "source": CONVERSION_VERSION,
+                       "constructionGridVersion": CONSTRUCTION_GRID_VERSION,
+                       "wallCellPolicy": "whole-breakable-voxel",
+                   },
                    "clipboard": [{"dx": x, "dy": y, "dz": z, "blockTypeId": WALL_BLOCK_ID} for x, y, z in safe]}
         log, result = commands._execute_command(project=project, universe=universe, world=world, payload=payload)
         written += len(result["affectedCells"])
@@ -301,6 +386,8 @@ def apply_import(world, plan, *, progress=None):
                                          "sourceTile": building["sourceTile"],
                                          "roofIds": [r["objectInstanceId"] for r in building["roofs"]],
                                          "facadeGridVersion": FACADE_GRID_VERSION,
+                                         "constructionGridVersion": ((building.get("constructionGrid") or {}).get("schemaVersion")),
+                                         "constructionGridFingerprint": ((building.get("constructionGrid") or {}).get("fingerprint")),
                                          "heightReference": plan["heightReference"],
                                          "importedAt": datetime.now(timezone.utc).isoformat()}
     world.metadata_json = {**world.metadata_json, "lod2Buildings": {**config, "referenceFingerprint":plan["referenceFingerprint"], "materializedBuildings": ledger}}

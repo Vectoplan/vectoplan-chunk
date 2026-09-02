@@ -86,6 +86,8 @@ CHUNK_INDEX_RESPONSE_VERSION = "world-state-chunk-index-response.v1"
 CHUNK_USER_PLACEMENTS_RESPONSE_VERSION = "world-state-user-placements-response.v4"
 MAP_STRUCTURES_RESPONSE_VERSION = "vectoplan-map-structures-response.v1"
 CHUNKS_STATUS_RESPONSE_VERSION = "chunks-route-status-response.v1"
+EDITOR_DATASET_ACTIVE_RESPONSE_VERSION = "vectoplan-editor-dataset-active-response.v1"
+EDITOR_DATASET_CHUNK_RESPONSE_VERSION = "vectoplan-editor-dataset-chunk-response.v1"
 
 RUNTIME_CHUNK_CONTENT_VERSION = "runtime-chunk-content.v1"
 CELL_ENCODING_VERSION = "cell-encoding.palette-index-plus-one.v1"
@@ -1943,6 +1945,25 @@ def _serialize_chunk_load_result(
             error=_safe_exception_message(exc),
         )
 
+    # An activated editor dataset reuses the same semantic object-ref and
+    # geodata-overlay contracts as live chunks.  It is response-only: writable
+    # wall cells still enter snapshots exclusively through WorldEdit commands.
+    # Any invalid/missing bundle is isolated from the canonical live fallback.
+    try:
+        from src.editor_dataset.runtime import attach_active_editor_dataset
+
+        attach_active_editor_dataset(
+            body["chunk"],
+            project=project,
+            world=world,
+        )
+    except Exception as exc:
+        _log_checkpoint(
+            "attach_editor_dataset_failed",
+            chunkKey=result.get("chunkKey"),
+            error=_safe_exception_message(exc),
+        )
+
     if compact_cells or 'vectoplan-editor' in request.headers.get('User-Agent', '').lower():
         _compact_chunk_cells(body['chunk'])
 
@@ -1984,6 +2005,8 @@ def _serialize_chunk_load_result(
             "chunk": f"{prefix}/projects/{project.project_id}/worlds/{world.world_id}/chunks",
             "chunksBatch": f"{prefix}/projects/{project.project_id}/worlds/{world.world_id}/chunks/batch",
             "commands": f"{prefix}/projects/{project.project_id}/worlds/{world.world_id}/commands",
+            "editorDatasetActive": f"{prefix}/projects/{project.project_id}/worlds/{world.world_id}/editor-datasets/active",
+            "editorDatasetChunk": f"{prefix}/projects/{project.project_id}/worlds/{world.world_id}/editor-datasets/active/chunks",
         }
 
     body["route"] = {
@@ -2004,6 +2027,114 @@ def _serialize_chunk_load_result(
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
+
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/editor-datasets/active")
+def get_project_world_active_editor_dataset(project_id: str, world_id: str):
+    """Return the validated, project-bound active v1 dataset summary."""
+    try:
+        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+        )
+        from src.editor_dataset.runtime import load_active_editor_dataset
+
+        active = load_active_editor_dataset(
+            project.project_id,
+            world.world_id,
+            external_project_id=project.external_app_project_id,
+        )
+        if active is None:
+            return _error_response(
+                LookupError("No active Editor dataset is selected for this project world."),
+                code="editor_dataset_not_active",
+                status_code=404,
+            )
+        if int(active.manifest.get("chunkSize") or 0) != int(world.chunk_size or 0):
+            raise ValueError("The active Editor dataset chunk size does not match the project world.")
+        try:
+            reference_fingerprint = str(world.build_earth_provider().reference_fingerprint or "")
+        except Exception:
+            reference_fingerprint = ""
+        if reference_fingerprint and active.reference_fingerprint != reference_fingerprint:
+            raise ValueError("The active Editor dataset uses another Earth reference frame.")
+        return _json_response(
+            _ok_response(
+                response_version=EDITOR_DATASET_ACTIVE_RESPONSE_VERSION,
+                payload={
+                    "projectId": project.project_id,
+                    "externalAppProjectId": project.external_app_project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "activeDataset": active.public_summary(),
+                },
+                metadata={"projectScoped": True, "immutable": True},
+            ),
+            200,
+        )
+    except ValueError as exc:
+        return _error_response(exc, code="editor_dataset_scope_mismatch", status_code=409)
+    except Exception as exc:
+        code = getattr(exc, "code", "editor_dataset_load_failed")
+        return _error_response(exc, code=code, status_code=409)
+
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/editor-datasets/active/chunks")
+def get_project_world_active_editor_dataset_chunk(project_id: str, world_id: str):
+    """Inspect one fingerprint-validated packed contribution of the active dataset."""
+    try:
+        chunk_x = _get_query_int("chunkX", "chunk_x", "x", field_name="chunkX")
+        chunk_y = _get_query_int("chunkY", "chunk_y", "y", field_name="chunkY")
+        chunk_z = _get_query_int("chunkZ", "chunk_z", "z", field_name="chunkZ")
+        universe_id = _get_query_string("universeId", "universe_id", fallback="") or None
+        project, universe, world = _resolve_project_world_context(
+            project_id,
+            world_id,
+            universe_id=universe_id,
+        )
+        from src.editor_dataset.runtime import load_active_editor_dataset, load_editor_dataset_chunk
+
+        active = load_active_editor_dataset(
+            project.project_id,
+            world.world_id,
+            external_project_id=project.external_app_project_id,
+        )
+        if active is None:
+            return _error_response(
+                LookupError("No active Editor dataset is selected for this project world."),
+                code="editor_dataset_not_active",
+                status_code=404,
+            )
+        chunk_key = _build_chunk_key(chunk_x, chunk_y, chunk_z)
+        artifact = load_editor_dataset_chunk(active, chunk_key)
+        if artifact is None:
+            return _error_response(
+                LookupError(f"The active Editor dataset has no contribution for chunk {chunk_key}."),
+                code="editor_dataset_chunk_not_found",
+                status_code=404,
+            )
+        return _json_response(
+            _ok_response(
+                response_version=EDITOR_DATASET_CHUNK_RESPONSE_VERSION,
+                payload={
+                    "projectId": project.project_id,
+                    "universeId": universe.universe_id,
+                    "worldId": world.world_id,
+                    "datasetId": active.dataset_id,
+                    "datasetFingerprint": active.content_fingerprint,
+                    "chunk": artifact,
+                },
+                metadata={"projectScoped": True, "immutable": True},
+            ),
+            200,
+        )
+    except ValueError as exc:
+        return _error_response(exc, code="invalid_editor_dataset_chunk_request", status_code=400)
+    except Exception as exc:
+        code = getattr(exc, "code", "editor_dataset_chunk_load_failed")
+        return _error_response(exc, code=code, status_code=409)
 
 
 @chunks_bp.get("/projects/<project_id>/worlds/<world_id>/chunks/index")

@@ -61,6 +61,10 @@ def test_import_preserves_edits_and_supports_break_roof_edit_delete_and_idempote
             result = apply_import(world, plan)
             assert result["writtenWallCells"] == 1
             assert result["protectedEditedCells"] == 2
+            wall_type = commands._get_block_type(
+                world=world, block_type_id=WALL_BLOCK_ID, require_breakable=True,
+            )
+            assert wall_type.metadata_json["color"] == "#f1f3f5"
             reload_context()
             assert cell(0, 60) is None and cell(1, 60) == "system_terrain"
             assert cell(2, 60) == WALL_BLOCK_ID and cell(0, 62) == "system_terrain"

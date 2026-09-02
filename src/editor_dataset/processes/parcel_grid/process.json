@@ -1,0 +1,6 @@
+{
+  "id": "parcel-grid",
+  "version": "parcel-grid-process.v1",
+  "dependencies": ["lod2-editable"],
+  "outputLayer": "parcelGrids"
+}

@@ -1169,21 +1169,22 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
                         connection.execute(text(add_sql))
                         result["executed"] = True
 
-            # WorldEdit is a first-class persisted command. Older databases
-            # predate that command type, and db.create_all() cannot widen their
-            # existing CHECK constraints. Repair both the command log and its
-            # emitted chunk events in the explicit init transaction.
-            world_edit_constraints = (
+            # WorldEdit and ObjectBatch are first-class persisted commands.
+            # Older databases predate those command types, and db.create_all()
+            # cannot widen their existing CHECK constraints. Repair both the
+            # command log and its emitted chunk events in the explicit init
+            # transaction.
+            command_type_constraints = (
                 ("world_command_logs", "ck_world_command_logs_command_type_valid"),
                 ("chunk_events", "ck_chunk_events_command_type_valid"),
             )
             command_type_check = (
                 "command_type IN ('SetBlock', 'RemoveBlock', 'ReplaceBlock', 'WorldEdit', "
-                "'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', "
+                "'ApplyBlockBatch', 'PlaceObject', 'RemoveObject', 'ReplaceObject', 'ObjectBatch', "
                 "'FillRegion', 'ClearRegion', 'ReplaceRegion', 'Import', 'System')"
             )
             if dialect.name == "postgresql":
-                for constraint_table, constraint_name in world_edit_constraints:
+                for constraint_table, constraint_name in command_type_constraints:
                     if constraint_table not in existing_tables:
                         continue
                     constraints = inspector.get_check_constraints(constraint_table)
@@ -1192,7 +1193,7 @@ def _repair_missing_columns_inner(*, dry_run: bool = False) -> dict[str, Any]:
                         None,
                     )
                     current_sql = str((current or {}).get("sqltext") or "")
-                    if "WorldEdit" in current_sql:
+                    if "WorldEdit" in current_sql and "ObjectBatch" in current_sql:
                         continue
                     quoted_table = _quote_identifier(dialect, constraint_table)
                     quoted_constraint = _quote_identifier(dialect, constraint_name)

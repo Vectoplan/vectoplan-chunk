@@ -19,6 +19,24 @@ Overlay neu auf. Die x/z-Geometrie bleibt gleich; nur ihre y-Hoehe wird aus den
 aktuell sichtbaren Blockzellen abgeleitet. Overlays veraendern weder Zellen,
 Kollisionen noch Platzierungs- oder Abbauregeln.
 
+## Visuelle 3D-Prioritaet und Lizenz-Gate
+
+Jeder serialisierte Earth-Chunk erhaelt zusaetzlich
+`geodataOverlays.visualLayerResolution` mit dem Schema
+`geodata-visual-layer-resolution.v1`. Die feste Reihenfolge lautet
+`photorealistic -> lod3 -> lod2`; ausgewaehlt wird nur eine aktivierte Ebene
+mit `status: ready`, die im selben Chunk-Vertrag durch `itemIds` belegt ist.
+Status und Provenienz sind Diagnosemetadaten, keine Downloadanweisung.
+
+Das Berliner fotorealistische Mesh ist standardmaessig doppelt gesperrt:
+`enabled: false` und `status: license_required`. Der Vertrag enthaelt dafuer
+keine Asset- oder Anbieter-URL. Erst eine separat dokumentierte Lizenzfreigabe,
+eine explizite serverseitige Aktivierung und ein spaeterer, eigener
+Asset-Adapter duerfen diese Ebene auf `ready` setzen. Bis dahin bleibt LoD2
+die sichtbare, unter `dl-de-zero-2.0` nutzbare Rueckfallebene. LoD2-Geometrie
+bleibt weiterhin response-only; eine explizite editierbare Materialisierung
+nutzt unveraendert die normale Chunk-/WorldEdit-Persistenz.
+
 Wichtig für Flurstücke: Dieses gelbe `surface-lines`-Overlay ist nur der
 allgemeine Katasterkontext. Sobald Flurstücke ausgewählt sind, erzeugt der
 Editor zusätzlich eine transparente Auswahlfläche, eine blaue verbindliche
@@ -29,13 +47,20 @@ steht in
 
 ## Standard
 
-Ohne weitere Konfiguration ist ein Layer aktiv:
+Ohne weitere Konfiguration sind zwei Layer aktiv:
 
 - Overlay-ID: `parcel-boundaries`
 - Orchestrator-Datensatz: `flurstuecke`
 - WFS-Typ: `public:flurstuecke`
 - Renderer: `surface-lines`
 - semantische Rolle: `parcel-boundary`
+
+- Overlay-ID: `street-network`
+- Orchestrator-Datensatz: `strassendaten`
+- WFS-Typ: `public:strassendaten`
+- Renderer: `surface-ribbons`
+- nominale MVP-Breite: 6 m
+- semantische Rolle: `street-network`
 
 Standardmaessig wird der bereits in GeoServer importierte WFS-Layer direkt
 gelesen (`versionPolicy: "wfs-live"`). Dadurch blockiert ein langsamer
@@ -89,10 +114,16 @@ meldet `degraded`.
 }
 ```
 
-Dieselbe Struktur kann später einen Strassen-Layer mit
-`role: "street-network"` und `classificationSource: true` deklarieren. Die
-heutige Ausbaustufe bewahrt diese Semantik im Renderobjekt, wertet sie aber noch
-nicht für Strassenblöcke oder die Creative Library aus.
+Der Straßen-Layer ist eine räumlich begrenzte, helle Planungsdarstellung. Jede
+Mittellinie hat eine Nennbreite von 6,0 m. Der Editor begrenzt das symmetrische
+Band auf die nächste sichtbare Flurstücksgrenze; ein Editor-Dataset kann die
+bereits vorberechnete effektive Breite zusätzlich über
+`geometry.surfaceWidths` liefern. Damit ragt das Band auch bei einer nicht
+perfekt mittigen Quelllinie nicht über die verfügbare Straßenfläche hinaus. Es
+wird pro sichtbarem Chunk auf der Terrainoberfläche drapiert und verändert
+weder Zellen noch Kollision. `classificationSource: true` kennzeichnet ihn
+zugleich als Quelle für die spätere Straßenflurstück-Erkennung; autorisierte
+Straßenänderungen laufen getrennt über Tentacle-/WorldEdit-Befehle.
 
 Globale Defaults lassen sich als JSON-Array über
 `VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON` ersetzen. Neue Renderer wie Raster,
