@@ -1402,6 +1402,10 @@ def _runtime_content_from_generated(
     if isinstance(terrain, Mapping):
         runtime['terrain'] = _make_json_safe(dict(terrain), max_depth=20)
 
+    generated_metadata = candidate.get('metadata') or wrapper.get('metadata')
+    if isinstance(generated_metadata, Mapping):
+        runtime['metadata'] = _make_json_safe(dict(generated_metadata), max_depth=20)
+
     if isinstance(surface_y_by_column, Sequence) and not isinstance(
         surface_y_by_column,
         (str, bytes, bytearray),
@@ -1610,6 +1614,8 @@ def _runtime_content_from_snapshot(
         }
     )
 
+    from src.world.earth.terrain_snapshot_upgrade import upgrade_legacy_terrain_snapshot
+    runtime = upgrade_legacy_terrain_snapshot(snapshot=snapshot, content=runtime, world=world)
     return _make_json_safe(runtime, max_depth=60)
 
 

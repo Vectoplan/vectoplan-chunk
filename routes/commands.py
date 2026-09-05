@@ -1200,6 +1200,14 @@ def _set_cell_value(
     cells = _ensure_cells(content, chunk_size=chunk_size)
     index = _flatten_cell_index(local_x, local_y, local_z, chunk_size)
     cells[index] = int(cell_value)
+    metadata = content.get('metadata')
+    shape = metadata.get('terrainSurface') if isinstance(metadata, dict) else None
+    if isinstance(shape, dict):
+        # Explicit edits stay ordinary blocks, even when the chosen material
+        # matches the original surface. Removing a cut cell exposes the cubes below.
+        full_cells = set(shape.get('fullCellIndices') or [])
+        full_cells.add(index)
+        content['metadata'] = {**metadata, 'terrainSurface': {**shape, 'fullCellIndices': sorted(full_cells)}}
 
 
 def _block_type_id_from_cell_value(content: dict[str, Any], cell_value: int) -> Optional[str]:
@@ -2198,6 +2206,10 @@ def _runtime_content_from_generated(
     if isinstance(stats, Mapping):
         runtime["stats"] = _make_json_safe(dict(stats), max_depth=20)
 
+    generated_metadata = candidate.get('metadata') or wrapper.get('metadata')
+    if isinstance(generated_metadata, Mapping):
+        runtime['metadata'] = _make_json_safe(dict(generated_metadata), max_depth=20)
+
     if content_hash is not None:
         runtime["contentHash"] = _coerce_string(content_hash)
 
@@ -2345,6 +2357,8 @@ def _runtime_content_from_snapshot(
     _ensure_palette(runtime)
     _update_content_stats(runtime, chunk_size=int(world.chunk_size or 16))
 
+    from src.world.earth.terrain_snapshot_upgrade import upgrade_legacy_terrain_snapshot
+    runtime = upgrade_legacy_terrain_snapshot(snapshot=snapshot, content=runtime, world=world)
     return _make_json_safe(runtime, max_depth=60)
 
 

@@ -9,9 +9,43 @@ from src.world.earth.terrain_pipeline import (
     TerrainChunkCache,
     TerrainPipelineConfig,
     _claim_region_job,
+    _generated_content,
+    _surfaces_from_region,
     apply_earth_surface_shell,
     generate_earth_terrain_chunk,
 )
+
+
+def test_cut_surface_preserves_fractional_heights_and_regular_subsurface():
+    corners = [1.2, 1.8, 2.2, 1.2, 1.8, 2.2, 1.2, 1.8, 2.2]
+    content = _generated_content(
+        chunk_size=2, chunk_x=0, chunk_y=0, chunk_z=0, min_y=-64, max_y=512,
+        surfaces=[1, 1, 1, 1], reference_fingerprint='cut-test', release_key='release-test',
+        terrain={'status': 'dgm', 'surfaceShape': {
+            'schemaVersion': 'terrain-cut-cells.v1', 'cornerHeights': corners,
+        }},
+    )
+    assert content['metadata']['terrainSurface']['cornerHeights'] == corners
+    assert content['surfaceYByColumn'] == [1, 2, 1, 2]
+    assert content['cells'][0] == 2  # full subsurface soil cube
+    assert content['cells'][2] == 1  # editable cut surface cell
+    assert apply_earth_surface_shell(content)
+    assert content['metadata']['terrainSurface']['cornerHeights'][0] == 1.2
+
+
+def test_adjacent_terrain_chunks_share_exact_corner_heights_including_negative_coordinates():
+    region = {
+        'axisWorldX': [-16, 0, 16], 'axisWorldZ': [-16, 0, 16],
+        'values': [98.1, 99.3, 100.5, 99.2, 100.4, 101.6, 100.3, 101.5, 102.7],
+        'anchorElevationM': 100.4,
+    }
+    west: list[float] = []
+    east: list[float] = []
+    _surfaces_from_region(region, chunk_size=16, chunk_x=-1, chunk_z=0, surface_y=0, corners=west)
+    _surfaces_from_region(region, chunk_size=16, chunk_x=0, chunk_z=0, surface_y=0, corners=east)
+    assert len(west) == len(east) == 17 ** 2
+    assert [west[16 + 17*z] for z in range(17)] == [east[17*z] for z in range(17)]
+    assert any(height != round(height) for height in east)
 
 
 @dataclass
@@ -148,8 +182,9 @@ def test_dgm_chunk_is_release_cached(tmp_path):
     assert second['terrain']['cache']['status'] == 'hit'
     assert second['contentHash'] == first['contentHash']
     assert client.grid_calls == 1
-    assert first['terrain']['samplePointCount'] == 16
-    assert first['terrain']['queryCounts']['requested'] == 17
+    # Sampling includes both chunk edges so adjacent cut surfaces share vertices.
+    assert first['terrain']['samplePointCount'] == 289
+    assert first['terrain']['queryCounts']['requested'] == 290
 
 
 def test_vertical_chunks_reuse_release_column_cache(tmp_path):
@@ -181,7 +216,7 @@ def test_vertical_chunks_reuse_release_column_cache(tmp_path):
     assert client.grid_calls == 1
 
 
-def test_prepared_project_region_avoids_per_chunk_geodata_query(tmp_path):
+def test_ready_dgm_keeps_one_metre_relief_even_when_project_overview_exists(tmp_path):
     client = _Client()
     cache = TerrainChunkCache(tmp_path)
     config = replace(_config(tmp_path), region_enabled=True)
@@ -217,9 +252,11 @@ def test_prepared_project_region_avoids_per_chunk_geodata_query(tmp_path):
     )
 
     assert result['terrain']['status'] == 'dgm'
-    assert result['terrain']['cache']['region'] == 'hit'
-    assert result['terrain']['sampleStepM'] == 32
-    assert client.grid_calls == 0
+    assert result['terrain']['sampleStepM'] == 1
+    assert result['terrain']['samplePointCount'] == 289
+    assert result['metadata']['terrainSurface']['sampleStepM'] == 1
+    assert client.grid_calls == 1
+    assert max(result['metadata']['terrainSurface']['cornerHeights']) == 17
 
 
 def test_preparing_release_keeps_previous_project_region_active(tmp_path):
@@ -262,6 +299,25 @@ def test_preparing_release_keeps_previous_project_region_active(tmp_path):
     assert result['terrain']['releaseSwitchPending'] is True
     assert result['terrain']['cache']['region'] == 'hit'
     assert client.grid_calls == 0
+
+
+def test_transient_detail_failure_preserves_overview_relief_and_recovers_without_stale_cache(tmp_path):
+    class BrokenGrid(_Client):
+        def terrain_grid(self, *args, **kwargs):
+            raise RuntimeError('temporary source outage')
+    config=replace(_config(tmp_path),region_enabled=True)
+    cache=TerrainChunkCache(tmp_path)
+    cache.store_region(reference_fingerprint='reference-test',dataset_id='digitales-gelaendemodell-5m',release_key='release-1',
+        center_chunk_x=0,center_chunk_z=0,radius_chunks=64,sample_step_chunks=2,
+        axis_world_x=[0,32],axis_world_z=[0,32],values=[100,104,100,104],
+        anchor_elevation_m=100,source_partial=False,missing_samples=0)
+    args=dict(world=_World(),provider=_Provider(),chunk_x=0,chunk_y=0,chunk_z=0,config=config,cache=cache)
+    fallback=generate_earth_terrain_chunk(**args,client=BrokenGrid())
+    assert fallback['terrain']['status']=='dgm-region-fallback'
+    assert max(fallback['metadata']['terrainSurface']['cornerHeights'])>1
+    restored=generate_earth_terrain_chunk(**args,client=_Client())
+    assert restored['terrain']['status']=='dgm'
+    assert restored['metadata']['terrainSurface']['sampleStepM']==1
 
 
 def test_region_preparation_lock_is_shared_via_filesystem(tmp_path):
