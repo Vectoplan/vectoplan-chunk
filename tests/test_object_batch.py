@@ -178,7 +178,8 @@ def test_object_batch_is_allowed_by_installed_database_constraints():
 @pytestmark_db
 def test_object_batch_success_aggregates_children_under_one_command_log():
     from extensions import db
-    from models import WorldObjectInstance
+    from models import WorldObjectInstance, ChunkEvent
+    from sqlalchemy import event
     from wsgi import app
 
     with app.app_context(), app.test_request_context("/"):
@@ -218,12 +219,19 @@ def test_object_batch_success_aggregates_children_under_one_command_log():
                 ],
             }
 
-            command_log, result = commands._execute_command(
-                project=project,
-                universe=universe,
-                world=world,
-                payload=payload,
-            )
+            snapshot_updates = []
+            def observe_snapshot_updates(_connection, _cursor, statement, _parameters, _context, _many):
+                if statement.lower().startswith('update chunk_snapshots '):
+                    snapshot_updates.append(statement)
+            event.listen(db.engine, 'before_cursor_execute', observe_snapshot_updates)
+            try:
+                command_log, result = commands._execute_command(
+                    project=project, universe=universe, world=world, payload=payload)
+            finally:
+                event.remove(db.engine, 'before_cursor_execute', observe_snapshot_updates)
+            # Intermediate revisions belong to their events; persist the large
+            # final snapshot once rather than at every child query/autoflush.
+            assert len(snapshot_updates) <= 1
 
             assert result["commandType"] == "ObjectBatch"
             assert result["changed"] is True
@@ -244,6 +252,12 @@ def test_object_batch_success_aggregates_children_under_one_command_log():
             # Both writes touch the same materialized snapshot. The response
             # reports that final resource once while retaining both events.
             assert len(result["snapshotIds"]) == 1
+            events = commands._query_without_relationships(ChunkEvent.query.filter(
+                ChunkEvent.command_id == command_log.command_id)).order_by(ChunkEvent.id).all()
+            assert len(events) == 3
+            for previous, following in zip(events, events[1:]):
+                assert following.chunk_revision_before == previous.chunk_revision_after
+                assert following.content_hash_before == previous.content_hash_after
 
             assert command_log.command_type == "ObjectBatch"
             assert command_log.command_status == "applied"

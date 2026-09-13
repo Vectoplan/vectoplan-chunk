@@ -65,6 +65,8 @@ def _operation() -> str:
             return "chunks.materialize"
         return "chunks.read" if method in {"GET", "HEAD"} else "chunks.batch.read"
     if blueprint == "commands":
+        if method in {"GET", "HEAD"} and request.endpoint == "commands.get_lod2_building":
+            return "world.read"
         return "commands.execute"
     return ""
 

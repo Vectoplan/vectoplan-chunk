@@ -15,12 +15,14 @@ volume and object renderers can be added without coupling them to terrain.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 import json
 import math
 import os
+from hashlib import sha256
 from threading import RLock
 import time
 from typing import Any, Optional
@@ -101,6 +103,10 @@ DEFAULT_OVERLAY_DEFINITIONS: tuple[dict[str, Any], ...] = (
 
 class GeodataOverlayError(RuntimeError):
     """A recoverable overlay source or contract error."""
+
+
+class GeodataOverlayExtentError(GeodataOverlayError):
+    """The requested region is incomplete; smaller regions can still succeed."""
 
 
 def _remote_service_failure(error: BaseException) -> bool:
@@ -316,7 +322,8 @@ class OverlayDefinition:
             ),
             max_features=max(
                 1,
-                min(10_000, int(source.get("maxFeatures") or 2_000)),
+                min(1_000 if dataset_id == "flurstuecke" or overlay_id == "parcel-boundaries" else 10_000,
+                    int(source.get("maxFeatures") or 2_000)),
             ),
         )
 
@@ -519,6 +526,21 @@ class GeoServerWfsClient:
             "count": str(definition.max_features),
         }
         workspace = quote(definition.workspace, safe="")
+        # count is a total budget, not a page size. Never expand the scope by
+        # following numberMatched pages while the user moves or zooms the map.
+        payload = self._page(workspace, params)
+        features = payload.get("features") or []
+        if not isinstance(features, list):
+            raise GeodataOverlayError("GeoServer WFS lieferte ungueltige Features.")
+        features = features[:definition.max_features]
+        try:
+            matched = int(payload.get("numberMatched", payload.get("totalFeatures")))
+        except (TypeError, ValueError):
+            matched = len(features)
+        return {**payload, "features": features, "numberReturned": len(features),
+                "limited": matched > len(features) or len(features) == definition.max_features}
+
+    def _page(self, workspace, params):
         url = f"{self.config.geoserver_base_url}/{workspace}/ows?{urlencode(params)}"
         request = Request(
             url,
@@ -532,7 +554,9 @@ class GeoServerWfsClient:
             with urlopen(
                 request, timeout=self.config.request_timeout_seconds
             ) as response:
-                raw = response.read(32 * 1024 * 1024)
+                raw = response.read(32 * 1024 * 1024 + 1)
+                if len(raw) > 32 * 1024 * 1024:
+                    raise GeodataOverlayExtentError("GeoServer WFS Ergebnisseite ist zu gross.")
         except HTTPError as exc:
             raise GeodataOverlayError(
                 f"GeoServer WFS antwortete mit HTTP {exc.code}."
@@ -670,6 +694,9 @@ class GeodataOverlayService:
         self.orchestrator = orchestrator or OrchestratorOverlayClient(config)
         self.wfs = wfs or GeoServerWfsClient(config)
         self._tiles: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        # Adjacent WFS tiles repeat entire parcel rings. Reuse exact projected
+        # vertices in the immutable Earth reference frame, before clipping.
+        self._local_vertices: OrderedDict[tuple[str, float, float], tuple[float, float]] = OrderedDict()
         self._unavailable: dict[tuple[str, str], tuple[float, str]] = {}
         self._remote_failure_until = 0.0
         self._remote_failure_message = ""
@@ -682,6 +709,22 @@ class GeodataOverlayService:
             self._remote_failure_until = max(self._remote_failure_until, time.monotonic() + 30.0)
             self._remote_failure_message = _text(error, "Optionaler Geodatendienst nicht erreichbar")[:500]
 
+    def _project_vertex(self, provider: Any, reference: str, lon: float, lat: float) -> tuple[float, float]:
+        if reference == "unknown-reference":
+            return _wgs84_to_local(provider, lon, lat)
+        key = (reference, lon, lat)
+        with self._lock:
+            cached = self._local_vertices.get(key)
+            if cached is not None:
+                self._local_vertices.move_to_end(key)
+                return cached
+        projected = _wgs84_to_local(provider, lon, lat)
+        with self._lock:
+            self._local_vertices[key] = projected
+            if len(self._local_vertices) > 32_768:
+                self._local_vertices.popitem(last=False)
+        return projected
+
     def _tile_item(
         self,
         *,
@@ -691,6 +734,8 @@ class GeodataOverlayService:
         chunk_x: int,
         chunk_z: int,
         chunk_size: int,
+        local_bounds: Optional[tuple[float, float, float, float]] = None,
+        geographic_circle: Optional[tuple[float, float, float]] = None,
     ) -> dict[str, Any]:
         release_key = _text(publication.get("release_key"))
         reference_fingerprint = _text(
@@ -715,6 +760,8 @@ class GeodataOverlayService:
             int(chunk_x),
             int(chunk_z),
             int(chunk_size),
+            local_bounds,
+            geographic_circle,
         )
         now = time.monotonic()
         cached = self._tiles.get(cache_key)
@@ -725,6 +772,8 @@ class GeodataOverlayService:
         min_z = int(chunk_z) * int(chunk_size)
         max_x = min_x + int(chunk_size)
         max_z = min_z + int(chunk_size)
+        if local_bounds is not None:
+            min_x, min_z, max_x, max_z = local_bounds
         corners = (
             _local_to_wgs84(provider, min_x, min_z),
             _local_to_wgs84(provider, max_x, min_z),
@@ -755,12 +804,16 @@ class GeodataOverlayService:
             for feature in features:
                 if not isinstance(feature, Mapping):
                     continue
+                if geographic_circle is not None:
+                    from src.geodata.parcel_context import parcel_intersects_circle
+                    if not parcel_intersects_circle(feature.get("geometry"), geographic_circle):
+                        continue
                 feature_count += 1
                 for line in _geometry_lines(feature.get("geometry")):
                     if len(line) < 2:
                         continue
                     local_line = [
-                        _wgs84_to_local(provider, lon, lat) for lon, lat in line
+                        self._project_vertex(provider, reference_fingerprint, lon, lat) for lon, lat in line
                     ]
                     for index in range(1, len(local_line)):
                         source_segment_count += 1
@@ -802,6 +855,7 @@ class GeodataOverlayService:
             },
             "stats": {
                 "featureCount": feature_count,
+                "limited": bool(feature_collection.get("limited")),
                 "sourceSegmentCount": source_segment_count,
                 "emittedSegmentCount": len(segments),
             },
@@ -821,6 +875,10 @@ class GeodataOverlayService:
         chunk_x: int,
         chunk_z: int,
         chunk_size: int,
+        local_bounds: Optional[tuple[float, float, float, float]] = None,
+        overlay_ids: Optional[set[str]] = None,
+        exclude_overlay_ids: Optional[set[str]] = None,
+        geographic_circle: Optional[tuple[float, float, float]] = None,
     ) -> dict[str, Any]:
         if not self.config.enabled:
             return {
@@ -833,6 +891,10 @@ class GeodataOverlayService:
         errors: list[dict[str, str]] = []
         availability: list[dict[str, str]] = []
         for definition in definitions:
+            if overlay_ids is not None and definition.overlay_id not in overlay_ids:
+                continue
+            if exclude_overlay_ids and definition.overlay_id in exclude_overlay_ids:
+                continue
             source_key = (definition.dataset_id, definition.type_name)
             try:
                 if self._remote_failure_until > time.monotonic():
@@ -856,6 +918,8 @@ class GeodataOverlayService:
                         chunk_x=chunk_x,
                         chunk_z=chunk_z,
                         chunk_size=chunk_size,
+                        local_bounds=local_bounds,
+                        geographic_circle=geographic_circle,
                     )
                 availability.append({"id":definition.overlay_id,"kind":"vector","status":"available" if item["geometry"]["coordinates"] else "no-data"})
                 if item["geometry"]["coordinates"]:
@@ -863,7 +927,9 @@ class GeodataOverlayService:
                 self._unavailable.pop(source_key, None)
             except Exception as exc:
                 self._trip_remote_circuit(exc)
-                if not self._unavailable.get(source_key) or self._unavailable[source_key][0] <= time.monotonic():
+                if not isinstance(exc, GeodataOverlayExtentError) and (
+                    not self._unavailable.get(source_key) or self._unavailable[source_key][0] <= time.monotonic()
+                ):
                     if len(self._unavailable)>=128:
                         self._unavailable.pop(next(iter(self._unavailable)))
                     self._unavailable[source_key] = (time.monotonic()+30, _text(exc)[:500])
@@ -890,6 +956,23 @@ class GeodataOverlayService:
         if earth_grid is not None:
             contract["earthGrid"] = earth_grid
         return contract
+
+    def parcel_region_contract(self, *, world: Any, provider: Any, bounds, geographic_circle=None):
+        """Same WFS boundaries as 3D, limited to the project's neighbourhood.
+
+        Project markers do not define the immutable world origin. Transform all
+        four geographic corners before clipping; longitude cells are not metres
+        on the ground and must not define a fixed 512m-wide CAD window.
+        """
+        west, south, east, north = bounds
+        corners = [_wgs84_to_local(provider, lon, lat) for lon, lat in (
+            (west, south), (east, south), (east, north), (west, north))]
+        local_bounds = (min(p[0] for p in corners), min(p[1] for p in corners),
+                        max(p[0] for p in corners), max(p[1] for p in corners))
+        return self.chunk_contract(world=world, provider=provider, chunk_x=0, chunk_z=0,
+                                   chunk_size=1, local_bounds=local_bounds,
+                                   geographic_circle=geographic_circle,
+                                   overlay_ids={"parcel-boundaries"})
 
 
 _DEFAULT_SERVICE: Optional[GeodataOverlayService] = None
@@ -924,6 +1007,9 @@ def attach_geodata_overlays(chunk: dict[str, Any], world: Any) -> bool:
         from src.geodata.lod2_buildings import append_building_overlay
 
         append_building_overlay(contract, chunk=chunk, world=world, provider=provider)
+        from src.geodata.tree_instances import append_tree_overlay
+
+        append_tree_overlay(contract, chunk=chunk, world=world, provider=provider)
     except Exception as exc:
         contract = {
             "schemaVersion": OVERLAY_SCHEMA_VERSION,

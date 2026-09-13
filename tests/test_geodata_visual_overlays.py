@@ -96,6 +96,107 @@ def _service() -> GeodataOverlayService:
     )
 
 
+def test_cad_parcels_follow_geographic_viewport_instead_of_fixed_world_origin(monkeypatch):
+    monkeypatch.delenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', raising=False)
+    service = _service()
+    calls = []
+    class RegionWfs:
+        def feature_collection(self, definition, bbox):
+            calls.append((definition.overlay_id, bbox))
+            return {'type': 'FeatureCollection', 'features': [{'geometry': {'type': 'Polygon', 'coordinates': [[
+                [13.009, 52.009], [13.011, 52.009], [13.011, 52.011], [13.009, 52.011], [13.009, 52.009]] ]}}]}
+    service.wfs = RegionWfs()
+    bounds = (13.01, 52.01, 13.012, 52.012)
+    result = service.parcel_region_contract(world=_World(), provider=_Provider(), bounds=bounds)
+    assert len(calls) == 1 and calls[0][0] == 'parcel-boundaries'
+    import pytest
+    assert calls[0][1] == pytest.approx(bounds)
+    lines = result['items'][0]['geometry']['coordinates']
+    assert len(lines) == 2  # original boundary parts only, no invented tile-edge rectangle
+    assert all(1000 <= v <= 1200 for line in lines for p in line for v in p)
+    service.parcel_region_contract(world=_World(), provider=_Provider(), bounds=bounds)
+    assert len(calls) == 1, 'regional WFS result reused'
+    service.parcel_region_contract(world=_World(), provider=_Provider(), bounds=(13.02, 52.02, 13.022, 52.022))
+    assert len(calls) == 2, 'pan changes the cache key and requested area'
+
+
+def test_wfs_count_is_a_total_budget_even_when_more_parcels_match():
+    from src.geodata.visual_overlays import GeoServerWfsClient
+    from dataclasses import replace
+    service = _service()
+    client = GeoServerWfsClient(service.config)
+    definition = replace(effective_overlay_definitions(_World())[0], max_features=2)
+    requests = []
+    def page(workspace, params):
+        requests.append(dict(params))
+        return {'type': 'FeatureCollection', 'numberMatched': 5,
+                'features': [{'id': str(i)} for i in range(2)]}
+    client._page = page
+    result = client.feature_collection(definition, (13, 52, 13.1, 52.1))
+    assert len(requests) == 1
+    assert requests[0]['count'] == '2' and 'startIndex' not in requests[0]
+    assert len(result['features']) == result['numberReturned'] == 2
+    assert result['limited']
+
+
+def test_parcel_limit_cannot_be_raised_by_metadata_or_noncompliant_wfs():
+    from src.geodata.visual_overlays import GeoServerWfsClient, OverlayDefinition
+    client = GeoServerWfsClient(_service().config)
+    client._page = lambda *args: {'type': 'FeatureCollection', 'numberMatched': 4000,
+                                 'features': [{'id': str(i)} for i in range(1500)]}
+    definition = OverlayDefinition.from_mapping({'id': 'parcel-boundaries', 'datasetId': 'flurstuecke',
+                                                  'source': {'maxFeatures': 100000}})
+    result = client.feature_collection(definition, (13, 52, 13.1, 52.1))
+    assert definition.max_features == 1000
+    assert len(result['features']) == 1000 and result['limited']
+
+
+def test_large_region_failure_does_not_block_smaller_viewports(monkeypatch):
+    from src.geodata.visual_overlays import GeodataOverlayExtentError
+    monkeypatch.delenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', raising=False)
+    service = _service()
+    calls = []
+    def read(definition, bbox):
+        calls.append(bbox)
+        if len(calls) == 1:
+            raise GeodataOverlayExtentError('region too large')
+        return _Wfs().feature_collection(definition, bbox)
+    service.wfs.feature_collection = read
+    first = service.parcel_region_contract(world=_World(), provider=_Provider(), bounds=(13, 52, 13.1, 52.1))
+    second = service.parcel_region_contract(world=_World(), provider=_Provider(), bounds=(13, 52, 13.00016, 52.00016))
+    assert first['errors'] and not second['errors']
+    assert len(calls) == 2 and second['items']
+
+
+def test_adjacent_tiles_reuse_exact_vertices_but_never_another_reference_frame(monkeypatch):
+    monkeypatch.delenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', raising=False)
+    service = _service()
+    provider = _Provider()
+    calls = []
+    original = provider.global_to_local
+    def project(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+    provider.global_to_local = project
+    first = service.chunk_contract(world=_World(), provider=provider, chunk_x=0, chunk_z=0, chunk_size=16)
+    assert len(calls) == 4  # two identical closed rings, two overlay definitions
+    service.chunk_contract(world=_World(), provider=provider, chunk_x=1, chunk_z=0, chunk_size=16)
+    assert len(calls) == 4
+    provider.reference_fingerprint = 'another-earth-frame'
+    second = service.chunk_contract(world=_World(), provider=provider, chunk_x=0, chunk_z=0, chunk_size=16)
+    assert len(calls) == 8
+    assert [i['geometry'] for i in first['items']] == [i['geometry'] for i in second['items']]
+
+
+def test_unknown_reference_is_not_cached():
+    service = _service()
+    first = _Provider()
+    second = _Provider()
+    second.global_to_local = lambda *_: SimpleNamespace(local_position=SimpleNamespace(x=1, z=2))
+    assert service._project_vertex(first, 'unknown-reference', 13, 52) == (0, 0)
+    assert service._project_vertex(second, 'unknown-reference', 13, 52) == (1, 2)
+
+
 def test_unavailable_publication_is_negative_cached_but_other_layers_survive(monkeypatch):
     monkeypatch.delenv('VECTOPLAN_CHUNK_GEODATA_OVERLAYS_JSON', raising=False)
     service = _service()

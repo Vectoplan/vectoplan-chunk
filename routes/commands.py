@@ -323,7 +323,7 @@ def _make_json_safe(
                 except Exception:
                     safe_key = "<unserializable-key>"
 
-                result[safe_key] = _make_json_safe(
+                result[safe_key] = item if _depth < max_depth and (item is None or type(item) in (str, int, float, bool)) else _make_json_safe(
                     item,
                     _seen=_seen,
                     _depth=_depth + 1,
@@ -341,7 +341,7 @@ def _make_json_safe(
         _seen.add(value_id)
         try:
             return [
-                _make_json_safe(
+                item if _depth < max_depth and (item is None or type(item) in (str, int, float, bool)) else _make_json_safe(
                     item,
                     _seen=_seen,
                     _depth=_depth + 1,
@@ -1356,7 +1356,16 @@ def _add_object_ref_to_content(content: dict[str, Any], object_ref: Mapping[str,
         for ref in refs
         if not isinstance(ref, Mapping) or ref.get("objectInstanceId") != object_instance_id
     ]
-    filtered.append(_make_json_safe(dict(object_ref), max_depth=20))
+    from src.chunk_object_projection import construction_refs_for_chunk
+    local_ref = construction_refs_for_chunk(
+        [object_ref], chunk_x=int(content.get("chunkX") or 0),
+        chunk_y=int(content.get("chunkY") or 0), chunk_z=int(content.get("chunkZ") or 0),
+        chunk_size=int(content.get("chunkSize") or 16),
+    )[0]
+    from src.frozen_json import freeze_json
+    from src.batch_chunk_mutation import batch_is_active
+    normalized_ref = _make_json_safe(local_ref, max_depth=20)
+    filtered.append(freeze_json(normalized_ref) if batch_is_active() else normalized_ref)
     content["objectRefs"] = filtered
 
 
@@ -1515,32 +1524,9 @@ def _filter_detached_cells(
     chunk_z: int,
 ) -> tuple[list[Any], int]:
     """Remove target coordinates from one occupied-cell list."""
-    original = occupied_cells if isinstance(occupied_cells, list) else []
-    retained: list[Any] = []
-    detached_count = 0
-    for candidate in original:
-        matches = False
-        if isinstance(candidate, Mapping):
-            for target in target_cells:
-                if _object_ref_cell_matches(
-                    candidate,
-                    world_x=int(target["worldX"]),
-                    world_y=int(target["worldY"]),
-                    world_z=int(target["worldZ"]),
-                    chunk_x=chunk_x,
-                    chunk_y=chunk_y,
-                    chunk_z=chunk_z,
-                    local_x=int(target["localX"]),
-                    local_y=int(target["localY"]),
-                    local_z=int(target["localZ"]),
-                ):
-                    matches = True
-                    break
-        if matches:
-            detached_count += 1
-        else:
-            retained.append(candidate)
-    return retained, detached_count
+    from src.object_cell_index import filter_detached_cells
+    return filter_detached_cells(occupied_cells, target_cells=target_cells,
+                                 chunk=(chunk_x, chunk_y, chunk_z))
 
 
 def _detach_cells_from_runtime_object_refs(
@@ -1609,7 +1595,11 @@ def _detach_cells_from_persisted_object_refs(
         WorldObjectChunkRef.deleted_at.is_(None),
     )
     detached_object_ids: set[str] = set()
-    for ref in _query_without_relationships(query).all():
+    from src.batch_chunk_mutation import chunk_refs
+    refs = chunk_refs(world.id, (chunk_x, chunk_y, chunk_z), lambda: _query_without_relationships(query).all())
+    for ref in refs:
+        if ref.deleted_at is not None:
+            continue
         object_instance_id = _coerce_string(ref.object_instance_id)
         if not object_instance_id or object_instance_id in excluded:
             continue
@@ -2293,7 +2283,7 @@ def _runtime_content_from_snapshot(
     runtime: dict[str, Any] = {}
 
     try:
-        built = snapshot.build_runtime_content()
+        built = dict(snapshot.content_json) if isinstance(snapshot.content_json, Mapping) else snapshot.build_runtime_content()
         if isinstance(built, Mapping):
             runtime = dict(built)
     except Exception as exc:
@@ -2340,7 +2330,7 @@ def _runtime_content_from_snapshot(
                 "blockCellValueRule": snapshot.block_cell_value_rule or BLOCK_CELL_VALUE_RULE,
             },
             "palette": _normalize_palette(snapshot.palette_json or []),
-            "objectRefs": _make_json_safe(snapshot.object_refs_json or [], max_depth=30),
+            "objectRefs": snapshot.object_refs_json or [],
             "cellCount": int(snapshot.cell_count or 0),
             "contentHash": snapshot.content_hash,
             "blockRegistryId": snapshot.block_registry_id,
@@ -2357,9 +2347,17 @@ def _runtime_content_from_snapshot(
     _ensure_palette(runtime)
     _update_content_stats(runtime, chunk_size=int(world.chunk_size or 16))
 
+    from src.chunk_object_projection import project_chunk_construction_refs
+    runtime = project_chunk_construction_refs(runtime)
+
     from src.world.earth.terrain_snapshot_upgrade import upgrade_legacy_terrain_snapshot
     runtime = upgrade_legacy_terrain_snapshot(snapshot=snapshot, content=runtime, world=world)
-    return _make_json_safe(runtime, max_depth=60)
+    runtime = _make_json_safe(runtime, max_depth=60)
+    from src.frozen_json import freeze_json
+    from src.batch_chunk_mutation import batch_is_active
+    if batch_is_active():
+        runtime['objectRefs'] = [freeze_json(ref) if isinstance(ref, dict) else ref for ref in runtime.get('objectRefs', [])]
+    return runtime
 
 
 def _load_chunk_for_mutation(
@@ -2372,6 +2370,10 @@ def _load_chunk_for_mutation(
     chunk_z: int,
 ) -> tuple[Optional[ChunkSnapshot], dict[str, Any]]:
     """Load active snapshot or generate base chunk for mutation."""
+    from src.batch_chunk_mutation import cached_chunk
+    cached = cached_chunk(world.id, chunk_x, chunk_y, chunk_z)
+    if cached is not None:
+        return cached
     snapshot = _find_chunk_snapshot(
         world=world,
         chunk_x=chunk_x,
@@ -2380,6 +2382,8 @@ def _load_chunk_for_mutation(
     )
 
     if snapshot is not None:
+        from src.batch_chunk_mutation import defer_snapshot
+        defer_snapshot(snapshot)
         return snapshot, _runtime_content_from_snapshot(
             snapshot=snapshot,
             project=project,
@@ -2414,6 +2418,10 @@ def _save_snapshot_after_mutation(
     chunk_y = int(content["chunkY"])
     chunk_z = int(content["chunkZ"])
 
+    from src.chunk_object_projection import project_chunk_construction_refs
+    from src.batch_chunk_mutation import remember_chunk, defer_snapshot
+    content = project_chunk_construction_refs(content)
+
     _update_content_stats(content, chunk_size=int(world.chunk_size or 16))
 
     if existing_snapshot is None:
@@ -2438,6 +2446,8 @@ def _save_snapshot_after_mutation(
         )
         db.session.add(snapshot)
         db.session.flush()
+        defer_snapshot(snapshot)
+        remember_chunk(world.id, snapshot, content)
         return snapshot
 
     existing_snapshot.replace_content(
@@ -2449,10 +2459,12 @@ def _save_snapshot_after_mutation(
         last_session_id=session_id,
         bump_revision=True,
     )
-    db.session.add(existing_snapshot)
+    if not defer_snapshot(existing_snapshot):
+        db.session.add(existing_snapshot)
     # Existing snapshots already have their database id.  The final transaction
     # commit can persist this update together with the event and command log;
     # flushing here added a synchronous database round-trip to every block edit.
+    remember_chunk(world.id, existing_snapshot, content)
     return existing_snapshot
 
 
@@ -2472,7 +2484,9 @@ def _attach_event_to_snapshot(snapshot: ChunkSnapshot, event: ChunkEvent, *, use
         except Exception:
             pass
 
-    db.session.add(snapshot)
+    from src.batch_chunk_mutation import defer_snapshot
+    if not defer_snapshot(snapshot):
+        db.session.add(snapshot)
     # Keep the snapshot update pending so it is written in the same flush as the
     # event and final command state at commit time.
 
@@ -2505,8 +2519,13 @@ def _safe_model_to_dict(model: Any, *, fallback: Mapping[str, Any] | None = None
     return dict(fallback or {})
 
 
-def _mark_command_applied(command_log: WorldCommandLog, **kwargs: Any) -> None:
+def _mark_command_applied(command_log: WorldCommandLog, *, batch_result: bool = False, **kwargs: Any) -> None:
     """Mark command as applied with fallback fields."""
+    from src.batch_chunk_mutation import batch_is_active
+    if batch_is_active() and not batch_result:
+        # One batch owns one receipt. Serializing and autoflushing each child's
+        # partial receipt wastes work and is overwritten by the aggregate.
+        return
     mark_applied = getattr(command_log, "mark_applied", None)
 
     if callable(mark_applied):
@@ -2604,6 +2623,9 @@ def _create_chunk_event(
     payload_json: Optional[Mapping[str, Any]] = None,
 ) -> ChunkEvent:
     """Create ChunkEvent and leave it pending for the transaction commit."""
+    from src.frozen_json import FrozenJsonDict, FrozenJsonList
+    def event_json(value):
+        return value if isinstance(value, (FrozenJsonDict, FrozenJsonList)) else _make_json_safe(value, max_depth=30)
     event = ChunkEvent.create(
         project_db_id=project.id,
         universe_db_id=universe.id,
@@ -2639,11 +2661,11 @@ def _create_chunk_event(
         object_instance_id=object_instance_id,
         object_type_id=object_type_id,
         object_variant_id=object_variant_id,
-        object_footprint_json=_make_json_safe(object_footprint_json or {}, max_depth=30),
-        affected_bounds_json=_make_json_safe(affected_bounds_json or {}, max_depth=30),
-        affected_cells_json=_make_json_safe(list(affected_cells or []), max_depth=30),
+        object_footprint_json=event_json(object_footprint_json or {}),
+        affected_bounds_json=event_json(affected_bounds_json or {}),
+        affected_cells_json=event_json(list(affected_cells or [])),
         dirty_chunks_json=list(dirty_chunks or []),
-        payload_json=_make_json_safe(dict(payload_json or {}), max_depth=30),
+        payload_json=event_json(payload_json or {}),
         metadata_json={
             "routeSource": ROUTE_SOURCE,
             "projectId": project.project_id,
@@ -3559,6 +3581,10 @@ def _clear_legacy_metadata_only_ref_voxels(
     cleared: list[dict[str, Any]] = []
     preserved: list[dict[str, Any]] = []
     cells = ref.occupied_cells_json if isinstance(ref.occupied_cells_json, list) else []
+    from src.object_cell_index import runtime_owner_index
+    owners = runtime_owner_index(content, chunk=(int(ref.chunk_x), int(ref.chunk_y), int(ref.chunk_z)),
+        chunk_size=chunk_size, ownership_policy=OBJECT_CELL_OWNERSHIP_POLICY,
+        include_metadata_object_instance_id=object_instance.object_instance_id)
 
     for stored_cell in cells:
         if not isinstance(stored_cell, Mapping):
@@ -3600,19 +3626,7 @@ def _clear_legacy_metadata_only_ref_voxels(
             chunk_size=chunk_size,
         )
         before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
-        runtime_owner = _runtime_object_cell_owner(
-            content,
-            world_x=world_x,
-            world_y=world_y,
-            world_z=world_z,
-            chunk_x=int(ref.chunk_x),
-            chunk_y=int(ref.chunk_y),
-            chunk_z=int(ref.chunk_z),
-            local_x=local_x,
-            local_y=local_y,
-            local_z=local_z,
-            include_metadata_object_instance_id=object_instance.object_instance_id,
-        )
+        runtime_owner = owners.get((world_x, world_y, world_z))
         expected_block_type_id = _coerce_string(
             stored_cell.get("ownedBlockTypeId")
             or stored_cell.get("afterBlockTypeId")
@@ -3832,10 +3846,11 @@ def _execute_place_object(
         "occupiedCells": _make_json_safe(runtime_occupied_world_cells, max_depth=20),
         "metadata": _make_json_safe(object_ref_metadata, max_depth=20),
     }
-    metadata_only = (
-        object_instance.object_type_id in {"building_roof", "planning_build_area"}
-        and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
-    )
+    metadata_only = (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
+    from src.frozen_json import freeze_json
+    event_payload = freeze_json(_make_json_safe(dict(payload), max_depth=30))
+    event_footprint = freeze_json(_make_json_safe(object_instance.footprint_json or {}, max_depth=30))
+    event_bounds = freeze_json(_make_json_safe(object_instance.bounds_json or {}, max_depth=30))
 
     for chunk_key, group in grouped.items():
         existing_snapshot, content = _load_chunk_for_mutation(
@@ -3857,6 +3872,11 @@ def _execute_place_object(
         chunk_changed = False
 
         existing_ref_for_chunk = existing_refs_by_chunk.get(chunk_key)
+        previous_cell_records = {
+            (cell.get("localX"), cell.get("localY"), cell.get("localZ")): cell
+            for cell in (existing_ref_for_chunk.occupied_cells_json or [])
+            if isinstance(cell, Mapping)
+        } if existing_ref_for_chunk is not None else {}
         if (
             metadata_only
             and existing_ref_for_chunk is not None
@@ -3909,6 +3929,10 @@ def _execute_place_object(
             )
             displaced_object_ids_all.update(displaced_object_ids)
 
+        from src.terrain_object_underlay import capture_terrain_underlay
+        terrain_shape_before = (content.get("metadata") or {}).get("terrainSurface")
+        full_terrain_cells_before = set(terrain_shape_before.get("fullCellIndices") or []) \
+            if isinstance(terrain_shape_before, Mapping) else None
         for cell in group["cells"]:
             before_cell_value = _get_cell_value(
                 content,
@@ -3918,6 +3942,12 @@ def _execute_place_object(
                 chunk_size=int(world.chunk_size or 16),
             )
             before_block_type_id = _block_type_id_from_cell_value(content, before_cell_value)
+
+            local_index = _flatten_cell_index(cell["localX"], cell["localY"], cell["localZ"], int(world.chunk_size or 16))
+            terrain_underlay = capture_terrain_underlay(before_block_type_id,
+                full_cell=local_index in full_terrain_cells_before if full_terrain_cells_before is not None else None,
+                previous_cell=previous_cell_records.get((cell["localX"], cell["localY"], cell["localZ"]))) \
+                if (object_instance.metadata_json or {}).get("generatedFromAreaId") else None
 
             if metadata_only:
                 # Retain the anchor for routing/update identity, but never occupy
@@ -3954,6 +3984,8 @@ def _execute_place_object(
                 "ownerObjectInstanceId": object_instance.object_instance_id,
                 "ownershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
             }
+            if terrain_underlay:
+                affected_cell["terrainUnderlay"] = terrain_underlay
             if displaced_object_ids:
                 affected_cell["displacedObjectInstanceIds"] = sorted(displaced_object_ids)
             group_affected_cells.append(affected_cell)
@@ -4008,6 +4040,8 @@ def _execute_place_object(
                 "fillBlockTypeId": fill_block_type_id,
                 "cellOwnershipPolicy": OBJECT_CELL_OWNERSHIP_POLICY,
             }
+        from src.batch_chunk_mutation import remember_ref
+        remember_ref(ref_obj)
         db.session.flush()
 
         event = _create_chunk_event(
@@ -4039,9 +4073,9 @@ def _execute_place_object(
             object_instance_id=object_instance.object_instance_id,
             object_type_id=object_instance.object_type_id,
             object_variant_id=object_instance.object_variant_id,
-            object_footprint_json=object_instance.footprint_json,
-            affected_bounds_json=object_instance.bounds_json,
-            payload_json=dict(payload),
+            object_footprint_json=event_footprint,
+            affected_bounds_json=event_bounds,
+            payload_json=event_payload,
         )
 
         _attach_event_to_snapshot(snapshot, event, user_id=user_id, session_id=session_id)
@@ -4146,9 +4180,9 @@ def _execute_place_object(
             object_instance_id=object_instance.object_instance_id,
             object_type_id=object_instance.object_type_id,
             object_variant_id=object_instance.object_variant_id,
-            object_footprint_json=object_instance.footprint_json,
-            affected_bounds_json=object_instance.bounds_json,
-            payload_json=dict(payload),
+            object_footprint_json=event_footprint,
+            affected_bounds_json=event_bounds,
+            payload_json=event_payload,
         )
         _attach_event_to_snapshot(snapshot, event, user_id=user_id, session_id=session_id)
         stale_ref.replace_occupied_cells([])
@@ -4162,6 +4196,7 @@ def _execute_place_object(
 
     dirty_chunks = sorted(dirty_chunks_set)
 
+    from src.batch_chunk_mutation import batch_is_active
     try:
         command_log.object_instance_id = object_instance.object_instance_id
         command_log.object_type_id = object_instance.object_type_id
@@ -4205,7 +4240,7 @@ def _execute_place_object(
         "affectedCells": affected_cells_all,
         "snapshotIds": snapshot_ids,
         "chunkVersions": chunk_versions,
-        "object": _safe_model_to_dict(
+        "object": None if batch_is_active() else _safe_model_to_dict(
             object_instance,
             fallback={"objectInstanceId": object_instance.object_instance_id},
             include_internal=False,
@@ -4251,7 +4286,39 @@ def _execute_remove_object(
     )
 
     if object_instance is None:
+        from src.geodata.tree_instances import materialize_tree_for_removal
+
+        object_instance = materialize_tree_for_removal(
+            world=world, payload=payload, command_log=command_log,
+            user_id=user_id, session_id=session_id,
+        )
+    if object_instance is None:
         raise LookupError(f"Object instance '{object_instance_id}' was not found.")
+
+    facade_results = []
+    if payload.get("preserveLod2Facade") is True:
+        from src.geodata.lod2_facade_source import facade_source_placement
+        facade_payload = facade_source_placement(object_instance, int(world.chunk_size or 16))
+        if facade_payload is not None:
+            lod2_config = dict((world.metadata_json or {}).get("lod2Buildings") or {})
+            removed_roofs = dict(lod2_config.get("removedRoofObjectIds") or {})
+            removed_roofs[object_instance_id] = {"buildingId": (object_instance.metadata_json or {}).get("lod2BuildingId"),
+                                                "commandId": command_log.command_id}
+            world.metadata_json = {**(world.metadata_json or {}), "lod2Buildings": {**lod2_config, "removedRoofObjectIds": removed_roofs}}
+            db.session.add(world)
+            facade_results.append(_execute_place_object(project=project, universe=universe, world=world,
+                payload=facade_payload, command_log=command_log, user_id=user_id, session_id=session_id))
+            parent_id = (object_instance.metadata_json or {}).get("generatedFromAreaId")
+            if parent_id:
+                parent = _query_without_relationships(WorldObjectInstance.query.filter(
+                    WorldObjectInstance.world_db_id == world.id, WorldObjectInstance.object_instance_id == parent_id,
+                    WorldObjectInstance.object_type_id == "planning_build_area", WorldObjectInstance.deleted_at.is_(None))).one_or_none()
+                if parent is not None:
+                    from src.geodata.lod2_facade_source import parent_facade_replacement
+                    parent_payload = parent_facade_replacement(parent, object_instance_id, facade_payload["objectInstanceId"])
+                    if parent_payload is not None:
+                        facade_results.append(_execute_place_object(project=project, universe=universe, world=world,
+                            payload=parent_payload, command_log=command_log, user_id=user_id, session_id=session_id))
 
     refs_query = WorldObjectChunkRef.query.filter(
         WorldObjectChunkRef.object_instance_db_id == object_instance.id,
@@ -4269,6 +4336,13 @@ def _execute_remove_object(
     snapshot_ids: list[str] = []
     chunk_versions: dict[str, str] = {}
 
+    for facade_result in facade_results:
+        changed_chunks.extend(facade_result.get("changedChunks", []))
+        dirty_chunks_set.update(facade_result.get("dirtyChunks", []))
+        event_ids.extend(facade_result.get("eventIds", []))
+        snapshot_ids.extend(facade_result.get("snapshotIds", []))
+        chunk_versions.update(facade_result.get("chunkVersions", {}))
+
     for ref in refs:
         existing_snapshot, content = _load_chunk_for_mutation(
             project=project,
@@ -4283,10 +4357,7 @@ def _execute_remove_object(
         before_version = existing_snapshot.chunk_version if existing_snapshot else "generated"
         before_hash = existing_snapshot.content_hash if existing_snapshot else content.get("contentHash")
 
-        metadata_only = (
-            object_instance.object_type_id in {"building_roof", "planning_build_area"}
-            and (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
-        )
+        metadata_only = (object_instance.metadata_json or {}).get("voxelOccupancy") == "none"
         group_cells = ref.occupied_cells_json if isinstance(ref.occupied_cells_json, list) else []
         if metadata_only:
             group_cells = []
@@ -4294,6 +4365,9 @@ def _execute_remove_object(
         group_affected_cells: list[dict[str, Any]] = []
         chunk_changed = False
 
+        from src.object_cell_index import runtime_owner_index
+        owners = runtime_owner_index(content, chunk=(int(ref.chunk_x), int(ref.chunk_y), int(ref.chunk_z)),
+            chunk_size=int(world.chunk_size or 16), ownership_policy=OBJECT_CELL_OWNERSHIP_POLICY) if group_cells else {}
         for cell in group_cells:
             if not isinstance(cell, Mapping):
                 continue
@@ -4340,18 +4414,7 @@ def _execute_remove_object(
                 "chunkKey": ref.chunk_key,
             }
 
-            runtime_owner = _runtime_object_cell_owner(
-                content,
-                world_x=world_x,
-                world_y=world_y,
-                world_z=world_z,
-                chunk_x=int(ref.chunk_x),
-                chunk_y=int(ref.chunk_y),
-                chunk_z=int(ref.chunk_z),
-                local_x=local_x,
-                local_y=local_y,
-                local_z=local_z,
-            )
+            runtime_owner = owners.get((world_x, world_y, world_z))
             expected_block_type_id = _coerce_string(
                 cell.get("ownedBlockTypeId")
                 or cell.get("afterBlockTypeId")
@@ -4374,14 +4437,19 @@ def _execute_remove_object(
                 preservation_reason = "cell_replaced_after_object_placement"
 
             if preservation_reason is None:
+                from src.terrain_object_underlay import terrain_restore_value, restore_terrain_cut_flag
+                after_cell_value, underlay = terrain_restore_value(content, cell,
+                    generated_building=bool((object_instance.metadata_json or {}).get("generatedFromAreaId")))
                 _set_cell_value(
                     content,
                     local_x=local_x,
                     local_y=local_y,
                     local_z=local_z,
                     chunk_size=int(world.chunk_size or 16),
-                    cell_value=AIR_CELL_VALUE,
+                    cell_value=after_cell_value,
                 )
+                restore_terrain_cut_flag(content, _flatten_cell_index(local_x, local_y, local_z,
+                    int(world.chunk_size or 16)), underlay)
                 chunk_changed = True
 
             affected_cell = {
@@ -4395,9 +4463,9 @@ def _execute_remove_object(
                 "localY": local_y,
                 "localZ": local_z,
                 "beforeCellValue": before_cell_value,
-                "afterCellValue": AIR_CELL_VALUE,
+                "afterCellValue": after_cell_value if preservation_reason is None else before_cell_value,
                 "beforeBlockTypeId": before_block_type_id,
-                "afterBlockTypeId": None,
+                "afterBlockTypeId": underlay["blockTypeId"] if preservation_reason is None and underlay else None,
                 "objectInstanceId": object_instance.object_instance_id,
                 "ownerObjectInstanceId": (
                     runtime_owner.get("objectInstanceId") if runtime_owner else None
@@ -4662,7 +4730,18 @@ def _normalize_object_batch_commands(payload: Mapping[str, Any]) -> list[dict[st
     return normalized_commands
 
 
-def _execute_object_batch(
+def _execute_object_batch(**kwargs) -> dict[str, Any]:
+    from src.batch_chunk_mutation import batch_chunk_mutations
+    started = time.perf_counter()
+    with batch_chunk_mutations(db.session):
+        result = _execute_object_batch_children(**kwargs)
+    current_app.logger.info('ObjectBatch completed: command=%s children=%s chunks=%s affectedCells=%s durationMs=%.1f',
+        kwargs['command_log'].command_id, result['objectBatch']['commandCount'], len(result['changedChunks']),
+        len(result['affectedCells']), (time.perf_counter() - started) * 1000)
+    return result
+
+
+def _execute_object_batch_children(
     *,
     project: Project,
     universe: Universe,
@@ -4680,6 +4759,22 @@ def _execute_object_batch(
     the route rollback and removes every partial child mutation.
     """
     children = _normalize_object_batch_commands(payload)
+    from src.planning_generation import prepare_planning_generation
+    children = prepare_planning_generation(world, payload, children)
+    from src.geodata.lod2_building_edit import prepare_lod2_building_edit
+    children, original_wall_cleanup, lod2_edit = prepare_lod2_building_edit(
+        project=project, universe=universe, world=world, payload=payload,
+        children=children, command_log=command_log,
+    )
+    from src.planning_removal import prepare_planning_removal
+    children, removal_cleanup, removal_marker = prepare_planning_removal(
+        project=project, universe=universe, world=world, payload=payload,
+        children=children, command_log=command_log,
+    )
+    if removal_cleanup is not None:
+        original_wall_cleanup = removal_cleanup
+    if removal_marker is not None:
+        lod2_edit = removal_marker
 
     event_ids: list[str] = []
     changed_chunks: set[str] = set()
@@ -4692,13 +4787,23 @@ def _execute_object_batch(
     object_instance_ids: list[str] = []
     seen_object_instance_ids: set[str] = set()
     displaced_object_instance_ids: set[str] = set()
-    preserved_cells: list[dict[str, Any]] = []
+    preserved_cells: list[dict[str, Any]] = list(lod2_edit.get("preservedCells", [])) if lod2_edit else []
     changed_command_count = 0
 
-    for index, child in enumerate(children):
+    # Cleanup is server-derived from imported geometry and edit provenance.
+    # Public batch children remain strictly PlaceObject/RemoveObject. Sharing
+    # this command log and transaction also rolls cleanup back if a child fails.
+    actions = ([(-1, original_wall_cleanup)] if original_wall_cleanup else []) + list(enumerate(children))
+    for index, child in actions:
         child_type = str(child["type"])
         try:
-            if child_type == "PlaceObject":
+            if index == -1:
+                child_result = _execute_world_edit(
+                    project=project, universe=universe, world=world,
+                    payload=child, command_log=command_log,
+                    user_id=user_id, session_id=session_id,
+                )
+            elif child_type == "PlaceObject":
                 child_result = _execute_place_object(
                     project=project,
                     universe=universe,
@@ -4784,6 +4889,7 @@ def _execute_object_batch(
     dirty_chunks_list = sorted(dirty_chunks)
     batch_summary = {
         "commandCount": len(children),
+        "internalCleanupCommandCount": int(original_wall_cleanup is not None),
         "changedCommandCount": changed_command_count,
         "objectInstanceIds": object_instance_ids,
         "results": child_results,
@@ -4805,6 +4911,7 @@ def _execute_object_batch(
         command_log,
         changed=changed,
         affected_chunks_json=changed_chunks_list,
+        batch_result=True,
         affected_cells_json=affected_cells,
         affected_bounds_json={},
         event_count=len(event_ids),
@@ -4818,6 +4925,7 @@ def _execute_object_batch(
             "objectBatch": batch_summary,
             "displacedObjectInstanceIds": sorted(displaced_object_instance_ids),
             "preservedCells": preserved_cells,
+            **({"lod2BuildingEdit": lod2_edit} if lod2_edit else {}),
         },
     )
 
@@ -4833,6 +4941,7 @@ def _execute_object_batch(
         "objectBatch": batch_summary,
         "displacedObjectInstanceIds": sorted(displaced_object_instance_ids),
         "preservedCells": preserved_cells,
+        **({"lod2BuildingEdit": lod2_edit} if lod2_edit else {}),
     }
 
 
@@ -4847,9 +4956,18 @@ def _execute_command(
     # The bounded LoD2 importer takes the same row lock before inspecting edits.
     # Serialize mutations in these opted-in worlds so import cannot race a user
     # command and restore an intentionally removed cell. No lock on other worlds.
-    if (world.metadata_json or {}).get("lod2Buildings", {}).get("enabled") is True:
+    if payload.get("commandId") or (world.metadata_json or {}).get("lod2Buildings", {}).get("enabled") is True:
         from sqlalchemy import select
         db.session.execute(select(WorldInstance.id).where(WorldInstance.id == world.id).with_for_update()).one()
+    requested_id = payload.get("commandId")
+    if requested_id:
+        existing = _query_without_relationships(WorldCommandLog.query.filter(
+            WorldCommandLog.command_id == requested_id)).one_or_none()
+        if existing is not None:
+            if existing.world_db_id != world.id or existing.project_db_id != project.id:
+                raise ValueError("commandId already belongs to another world.")
+            from src.planning_generation import replay_result
+            return existing, replay_result(existing, payload)
     command_type = _normalize_command_type(
         payload.get("type")
         or payload.get("commandType")
@@ -5024,6 +5142,9 @@ def _serialize_command_result(
     if isinstance(result.get("objectBatch"), Mapping):
         body["objectBatch"] = _make_json_safe(result.get("objectBatch"), max_depth=35)
 
+    if isinstance(result.get("lod2BuildingEdit"), Mapping):
+        body["lod2BuildingEdit"] = _make_json_safe(result.get("lod2BuildingEdit"), max_depth=35)
+
     if "clipboard" in result:
         body["clipboard"] = _make_json_safe(list(result.get("clipboard") or []), max_depth=35)
 
@@ -5041,6 +5162,73 @@ def _serialize_command_result(
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
+
+@commands_bp.get("/projects/<project_id>/worlds/<world_id>/lod2-buildings/<building_id>")
+def get_lod2_building(project_id: str, world_id: str, building_id: str):
+    """Read all persisted roofs and the editable parent without materialization."""
+    try:
+        from src.geodata.lod2_building_edit import read_lod2_building_objects
+        project, universe, world = _resolve_project_world_context(
+            project_id, world_id, universe_id=_get_query_string("universeId", "universe_id", fallback="") or None)
+        payload = read_lod2_building_objects(world=world, building_id=building_id)
+        return _json_response(_ok_response(
+            response_version="lod2-building-read.v1",
+            payload={"projectId": project.project_id, "universeId": universe.universe_id,
+                     "worldId": world.world_id, **payload},
+            metadata={"readOnly": True, "projectScoped": True},
+        ), 200)
+    except LookupError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="lod2_building_not_found", status_code=404)
+    except ValueError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="invalid_lod2_building_request", status_code=400)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc)
+
+
+@commands_bp.get("/projects/<project_id>/worlds/<world_id>/commands/<command_id>")
+def get_command_status(project_id: str, world_id: str, command_id: str):
+    """Read a committed receipt; absence never means a request cannot commit."""
+    try:
+        project, universe, world = _resolve_project_world_context(project_id, world_id)
+        command = _query_without_relationships(WorldCommandLog.query.filter(
+            WorldCommandLog.project_db_id == project.id, WorldCommandLog.world_db_id == world.id,
+            WorldCommandLog.command_id == command_id)).one_or_none()
+        if command is None:
+            return _json_response({"ok": True, "commandId": command_id, "commandStatus": "unconfirmed"}, 200)
+        result = {**(command.result_payload_json or {}), "affectedCells": []}
+        return _json_response(_ok_response(response_version=COMMAND_RESPONSE_VERSION,
+            payload=_serialize_command_result(project=project, universe=universe, world=world,
+                command_log=command, result=result, include_command_log=False),
+            metadata={"readOnly": True}), 200)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc)
+
+
+@commands_bp.get("/projects/<project_id>/worlds/<world_id>/planning-buildings/<parent_id>")
+def get_planning_building(project_id: str, world_id: str, parent_id: str):
+    """Read current parent metadata without loading its repeated chunk meshes."""
+    try:
+        project, universe, world = _resolve_project_world_context(project_id, world_id)
+        parent = _query_without_relationships(WorldObjectInstance.query.filter(
+            WorldObjectInstance.world_db_id == world.id, WorldObjectInstance.object_instance_id == parent_id,
+            WorldObjectInstance.object_type_id == "planning_build_area", WorldObjectInstance.deleted_at.is_(None))).one_or_none()
+        if parent is None:
+            raise LookupError("Building parent was not found.")
+        return _json_response(_ok_response(response_version="planning-building-read.v1", payload={"parentRef": {
+            "objectInstanceId": parent.object_instance_id,
+            "anchor": {"x": parent.anchor_x, "y": parent.anchor_y, "z": parent.anchor_z},
+            "footprint": parent.footprint_json, "metadata": parent.metadata_json}}, metadata={"readOnly": True}), 200)
+    except LookupError as exc:
+        _safe_rollback()
+        return _error_response(exc, code="building_not_found", status_code=404)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc)
+
 
 @commands_bp.post("/projects/<project_id>/worlds/<world_id>/commands")
 def post_project_world_command(project_id: str, world_id: str):
@@ -5067,7 +5255,8 @@ def post_project_world_command(project_id: str, world_id: str):
     started_at = time.perf_counter()
 
     try:
-        payload = _get_json_body()
+        from src.command_transport import decode_command_transport
+        payload = decode_command_transport(_get_json_body())
 
         _log_checkpoint(
             "request_start",

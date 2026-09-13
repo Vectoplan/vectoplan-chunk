@@ -219,6 +219,10 @@ def make_json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)):
         return value
 
+    from src.frozen_json import FrozenJsonDict, FrozenJsonList
+    if isinstance(value, (FrozenJsonDict, FrozenJsonList)):
+        return value
+
     if isinstance(value, datetime):
         return datetime_to_iso(value)
 
@@ -229,11 +233,11 @@ def make_json_safe(value: Any) -> Any:
                 safe_key = str(key)
             except Exception:
                 safe_key = "<unserializable-key>"
-            safe_dict[safe_key] = make_json_safe(item)
+            safe_dict[safe_key] = item if item is None or type(item) in (str, int, float, bool) else make_json_safe(item)
         return safe_dict
 
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [make_json_safe(item) for item in value]
+        return [item if item is None or type(item) in (str, int, float, bool) else make_json_safe(item) for item in value]
 
     if isinstance(value, bytes):
         return {

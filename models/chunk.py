@@ -221,6 +221,10 @@ def make_json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)):
         return value
 
+    from src.frozen_json import FrozenJsonDict, FrozenJsonList
+    if isinstance(value, (FrozenJsonDict, FrozenJsonList)):
+        return value
+
     if isinstance(value, datetime):
         return datetime_to_iso(value)
 
@@ -231,11 +235,11 @@ def make_json_safe(value: Any) -> Any:
                 safe_key = str(key)
             except Exception:
                 safe_key = "<unserializable-key>"
-            safe_dict[safe_key] = make_json_safe(item)
+            safe_dict[safe_key] = item if item is None or type(item) in (str, int, float, bool) else make_json_safe(item)
         return safe_dict
 
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [make_json_safe(item) for item in value]
+        return [item if item is None or type(item) in (str, int, float, bool) else make_json_safe(item) for item in value]
 
     if isinstance(value, bytes):
         return {
@@ -706,6 +710,22 @@ def estimate_content_size_bytes(
         total += len(content_binary)
 
     return total
+
+
+def _normalized_content_fingerprint(content_json, content_binary):
+    """Hash/count an already normalized snapshot with one JSON encoding pass."""
+    digest = hashlib.sha256()
+    size = 0
+    if content_json is not None:
+        encoded = json.dumps(content_json, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        digest.update(b"json:")
+        digest.update(encoded)
+        size += len(encoded)
+    if content_binary is not None:
+        digest.update(b"|binary:")
+        digest.update(content_binary)
+        size += len(content_binary)
+    return digest.hexdigest(), size
 
 
 def normalize_content_hash(value: Any) -> str:
@@ -1516,13 +1536,8 @@ class ChunkSnapshot(db.Model):
             default=0,
         )
 
-        content_hash = compute_content_hash(
-            content_json=normalized_content_json,
-            content_binary=normalized_content_binary,
-        )
-        content_size_bytes = estimate_content_size_bytes(
-            content_json=normalized_content_json,
-            content_binary=normalized_content_binary,
+        content_hash, content_size_bytes = _normalized_content_fingerprint(
+            normalized_content_json, normalized_content_binary,
         )
 
         now = utc_now()
@@ -1965,13 +1980,8 @@ class ChunkSnapshot(db.Model):
         self.content_json = normalized_content_json
         self.content_binary = normalized_content_binary
         self.content_encoding = normalize_content_encoding(content_encoding)
-        self.content_hash = compute_content_hash(
-            content_json=normalized_content_json,
-            content_binary=normalized_content_binary,
-        )
-        self.content_size_bytes = estimate_content_size_bytes(
-            content_json=normalized_content_json,
-            content_binary=normalized_content_binary,
+        self.content_hash, self.content_size_bytes = _normalized_content_fingerprint(
+            normalized_content_json, normalized_content_binary,
         )
         self.palette_json = resolved_palette
         self.object_refs_json = resolved_object_refs

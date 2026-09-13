@@ -185,6 +185,21 @@ def test_materialized_building_never_reappears_from_bundle_after_canonical_delet
     assert chunk["metadata"]["editorDataset"]["roofObjectRefsAdded"] == 0
 
 
+@pytest.mark.parametrize("local_source", [True, False])
+def test_single_deleted_roof_is_not_resurrected_by_immutable_bundle(tmp_path, local_source):
+    _bundle(tmp_path)
+    world = _world()
+    chunk = {"chunkX": 0, "chunkY": 0, "chunkZ": 0, "objectRefs": [], "metadata": {}}
+    if local_source:
+        chunk["objectRefs"] = [{"objectInstanceId": "preserved-facade", "objectTypeId": "building_facade_source",
+            "metadata": {"lod2FacadeSource": {"deletedRoofObjectInstanceId": "roof-building-1"}}}]
+    else:
+        world.metadata_json = {"lod2Buildings": {"removedRoofObjectIds": {"roof-building-1": {"buildingId": "building-1"}}}}
+    attach_active_editor_dataset(chunk, project=_project(), world=world, root=tmp_path)
+    assert not any(item.get("objectInstanceId") == "roof-building-1" for item in chunk["objectRefs"])
+    assert chunk["metadata"]["editorDataset"]["roofObjectRefsAdded"] == 0
+
+
 def test_street_surface_ribbon_has_only_the_y_zero_owner(tmp_path):
     _bundle(tmp_path)
     chunk = {"chunkX": 0, "chunkY": 1, "chunkZ": 0, "objectRefs": [], "metadata": {}}

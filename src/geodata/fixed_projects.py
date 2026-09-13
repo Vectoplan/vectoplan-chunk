@@ -71,6 +71,11 @@ PARCELS: Final[FixedGeodataProject] = FixedGeodataProject(
     capabilities=('vector', 'earth-parcel-boundaries'),
 )
 
+TREE_REGISTER: Final[FixedGeodataProject] = FixedGeodataProject(
+    dataset_id='baumkataster', display_name='Baumkataster', category='vegetation',
+    capabilities=('tree-points', 'geopackage', 'earth-tree-instances'),
+)
+
 FIXED_GEODATA_PROJECTS: Final[dict[str, FixedGeodataProject]] = {
     item.dataset_id: item
     for item in (
@@ -79,6 +84,7 @@ FIXED_GEODATA_PROJECTS: Final[dict[str, FixedGeodataProject]] = {
         ACTUAL_USE,
         BUILDING_FOOTPRINTS,
         PARCELS,
+        TREE_REGISTER,
     )
 }
 
@@ -99,5 +105,6 @@ __all__ = (
     'FixedGeodataProject',
     'PARCELS',
     'THREE_D_BUILDINGS',
+    'TREE_REGISTER',
     'get_fixed_geodata_project',
 )

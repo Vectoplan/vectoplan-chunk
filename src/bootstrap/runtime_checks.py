@@ -2554,6 +2554,12 @@ def _empty_project_access_runtime_status(
     }
 
 
+def _readiness_query_without_relationships(query: Any) -> Any:
+    """Readiness reads scalar access fields, never the project's world graph."""
+    from sqlalchemy.orm import noload
+    return query.options(noload("*"))
+
+
 def _project_scoped_query(
     session: Any,
     model: Any,
@@ -2573,7 +2579,7 @@ def _project_scoped_query(
     value = project_public_id if public_field is not None else project_db_id
     if field is None or value is None:
         return None
-    return session.query(model).filter(field == value)
+    return _readiness_query_without_relationships(session.query(model)).filter(field == value)
 
 
 def _query_project_scoped_rows(
@@ -2735,7 +2741,7 @@ def _legacy_access_status(
     if role_field is None or role_value is None:
         role_rows, stored_role_count, role_truncated = [], 0, False
     else:
-        role_query = session.query(ProjectRole).filter(role_field == role_value)
+        role_query = _readiness_query_without_relationships(session.query(ProjectRole)).filter(role_field == role_value)
         role_key_field = _first_model_attribute(
             ProjectRole,
             ("role_key", "role", "project_role"),
@@ -2787,7 +2793,7 @@ def _legacy_access_status(
         project_field = _first_model_attribute(ProjectRoleAssignment, ("project_db_id",))
         role_field = _first_model_attribute(ProjectRoleAssignment, ("role_db_id",))
         if project_field is not None and role_field is not None:
-            query = session.query(ProjectRoleAssignment).filter(
+            query = _readiness_query_without_relationships(session.query(ProjectRoleAssignment)).filter(
                 project_field == project_db_id,
                 role_field == owner_role_db_id,
             )
@@ -2896,7 +2902,7 @@ def run_project_access_readiness_check(
         if project_field is None:
             raise RuntimeError("Project model has no queryable public project id.")
         project = (
-            session.query(Project)
+            _readiness_query_without_relationships(session.query(Project))
             .filter(project_field == resolved_project_id)
             .limit(1)
             .one_or_none()
