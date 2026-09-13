@@ -17,6 +17,7 @@ from bisect import bisect_left
 import gzip
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -32,9 +33,9 @@ from ...geodata.fixed_projects import DIGITAL_ELEVATION_MODEL
 from ...georeferencing.earth_grid import LocalEarthPosition
 
 
-TERRAIN_PIPELINE_VERSION: Final[str] = 'earth-dgm5-terrain.v3'
-CACHE_SCHEMA_VERSION: Final[str] = 'earth-terrain-chunk-cache.v4'
-COLUMN_CACHE_SCHEMA_VERSION: Final[str] = 'earth-terrain-column-cache.v2'
+TERRAIN_PIPELINE_VERSION: Final[str] = 'earth-dgm5-terrain.v5'
+CACHE_SCHEMA_VERSION: Final[str] = 'earth-terrain-chunk-cache.v6'
+COLUMN_CACHE_SCHEMA_VERSION: Final[str] = 'earth-terrain-column-cache.v4'
 REGION_CACHE_SCHEMA_VERSION: Final[str] = 'earth-terrain-region-cache.v1'
 PALETTE: Final[tuple[str, ...]] = (
     'system_terrain_humus',
@@ -82,7 +83,7 @@ class TerrainPipelineConfig:
     version_cache_seconds: float
     cache_root: Path
     radius_m: float
-    sample_step_m: float = 5.0
+    sample_step_m: float = 1.0
     region_enabled: bool = True
     region_radius_chunks: int = 64
     region_sample_step_chunks: int = 2
@@ -125,7 +126,7 @@ class TerrainPipelineConfig:
                 1.0,
                 min(
                     10.0,
-                    float(os.getenv('VECTOPLAN_CHUNK_TERRAIN_SAMPLE_STEP_M', '5')),
+                    float(os.getenv('VECTOPLAN_CHUNK_TERRAIN_SAMPLE_STEP_M', '1')),
                 ),
             ),
             region_enabled=_env_bool(
@@ -706,6 +707,7 @@ def _content_hash(
     reference_fingerprint: str,
     release_key: str,
     chunk: tuple[int, int, int],
+    surface_shape: Optional[Mapping[str, Any]] = None,
 ) -> str:
     payload = {
         'pipelineVersion': TERRAIN_PIPELINE_VERSION,
@@ -714,6 +716,7 @@ def _content_hash(
         'chunk': list(chunk),
         'palette': list(PALETTE),
         'cellsSha256': sha256(bytes(cells)).hexdigest(),
+        'terrainSurface': surface_shape,
     }
     return sha256(
         json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -733,6 +736,18 @@ def _generated_content(
     release_key: str,
     terrain: Mapping[str, Any],
 ) -> dict[str, Any]:
+    surface_shape = terrain.get('surfaceShape')
+    if isinstance(surface_shape, Mapping):
+        corners = surface_shape.get('cornerHeights')
+        if isinstance(corners, list) and len(corners) == (chunk_size + 1) ** 2:
+            # Occupancy encloses the true surface. Only cells intersected by
+            # the heightfield are cut; everything underneath stays a cube.
+            stride = chunk_size + 1
+            surfaces = [
+                math.ceil(max(corners[x + stride * z], corners[x + 1 + stride * z],
+                              corners[x + stride * (z + 1)], corners[x + 1 + stride * (z + 1)])) - 1
+                for z in range(chunk_size) for x in range(chunk_size)
+            ]
     cells, non_air = _chunk_cells(
         chunk_size=chunk_size,
         chunk_y=chunk_y,
@@ -746,7 +761,9 @@ def _generated_content(
         reference_fingerprint=reference_fingerprint,
         release_key=release_key,
         chunk=chunk,
+        surface_shape=surface_shape if isinstance(surface_shape, Mapping) else None,
     )
+    public_terrain = {key: value for key, value in terrain.items() if key != 'surfaceShape'}
     return {
         'schemaVersion': 'earth-generated-chunk.v2',
         'source': 'generated',
@@ -771,9 +788,10 @@ def _generated_content(
             'nonAirCellCount': non_air,
             'minimumSurfaceY': min(surfaces),
             'maximumSurfaceY': max(surfaces),
-            'terrain': dict(terrain),
+            'terrain': public_terrain,
         },
-        'terrain': dict(terrain),
+        'terrain': public_terrain,
+        'metadata': {'terrainSurface': dict(surface_shape)} if isinstance(surface_shape, Mapping) else {},
     }
 
 
@@ -841,8 +859,8 @@ def _local_to_wgs84(provider: Any, x: Decimal, z: Decimal) -> tuple[float, float
 
 
 def _sample_axis(chunk_size: int, step_m: float) -> list[float]:
-    last = max(0.5, float(chunk_size) - 0.5)
-    positions = [0.5]
+    last = float(chunk_size)
+    positions = [0.0]
     while positions[-1] < last:
         candidate = min(last, positions[-1] + max(1.0, float(step_m)))
         if candidate <= positions[-1]:
@@ -867,6 +885,7 @@ def _interpolate_surface_values(
     samples: Mapping[tuple[int, int], float],
     anchor_height: float,
     surface_y: int,
+    corners: Optional[list[float]] = None,
 ) -> tuple[list[int], int]:
     surfaces: list[int] = []
     missing = 0
@@ -885,6 +904,16 @@ def _interpolate_surface_values(
             bottom = values[2] * (1.0 - tx) + values[3] * tx
             height = top * (1.0 - tz) + bottom * tz
             surfaces.append(int(round(height - anchor_height + surface_y)))
+    if corners is not None:
+        for local_z in range(chunk_size + 1):
+            z0, z1, tz = _axis_bounds(axis, float(local_z))
+            for local_x in range(chunk_size + 1):
+                x0, x1, tx = _axis_bounds(axis, float(local_x))
+                values = [float(samples.get(key, anchor_height))
+                          for key in ((x0, z0), (x1, z0), (x0, z1), (x1, z1))]
+                height = ((values[0] * (1-tx) + values[1] * tx) * (1-tz)
+                          + (values[2] * (1-tx) + values[3] * tx) * tz)
+                corners.append(round(height - anchor_height + surface_y + 1, 6))
     return surfaces, missing
 
 
@@ -1206,6 +1235,7 @@ def _surfaces_from_region(
     chunk_x: int,
     chunk_z: int,
     surface_y: int,
+    corners: Optional[list[float]] = None,
 ) -> Optional[list[int]]:
     axis_x = [float(value) for value in region.get('axisWorldX') or []]
     axis_z = [float(value) for value in region.get('axisWorldZ') or []]
@@ -1243,6 +1273,14 @@ def _surfaces_from_region(
             bottom = value(x0, z1) * (1.0 - factor_x) + value(x1, z1) * factor_x
             height = top * (1.0 - factor_z) + bottom * factor_z
             surfaces.append(int(round(height - anchor_height + surface_y)))
+    if corners is not None:
+        for local_z in range(chunk_size + 1):
+            z0, z1, tz = _axis_bounds(axis_z, float(chunk_z * chunk_size + local_z))
+            for local_x in range(chunk_size + 1):
+                x0, x1, tx = _axis_bounds(axis_x, float(chunk_x * chunk_size + local_x))
+                height = ((value(x0, z0) * (1-tx) + value(x1, z0) * tx) * (1-tz)
+                          + (value(x0, z1) * (1-tx) + value(x1, z1) * tx) * tz)
+                corners.append(round(height - anchor_height + surface_y + 1, 6))
     return surfaces
 
 
@@ -1374,7 +1412,13 @@ def generate_earth_terrain_chunk(
         'chunk_z': chunk_z,
     }
     exact = active_cache.load_exact(**cache_key)
-    if exact is not None:
+    # The region is an overview and an offline fallback. It must not permanently
+    # replace the available DGM's local relief with interpolated 32-m planes.
+    can_query_detail = serving_ready and release_key == target_release_key
+    if exact is not None and (
+        not can_query_detail
+        or float((exact.get('content', {}).get('terrain') or {}).get('sampleStepM') or math.inf) <= active_config.sample_step_m
+    ):
         return _with_pending_release(
             _cached_content(exact, cache_status='hit'),
             pending_release_key=pending_release_key,
@@ -1418,7 +1462,9 @@ def generate_earth_terrain_chunk(
             'chunk_z': chunk_z,
         }
         column = active_cache.load_column(**column_key)
-        if column is not None and len(column.get('surfaces') or []) == chunk_size ** 2:
+        if column is not None and len(column.get('surfaces') or []) == chunk_size ** 2 and (
+            not can_query_detail or float((column.get('terrain') or {}).get('sampleStepM') or math.inf) <= active_config.sample_step_m
+        ):
             surfaces = [int(value) for value in column['surfaces']]
             terrain = dict(column['terrain'])
             terrain['cache'] = {'status': 'miss', 'column': 'hit'}
@@ -1435,6 +1481,7 @@ def generate_earth_terrain_chunk(
                 if active_config.region_enabled
                 else None
             )
+            surface_corners: list[float] = []
             region_surfaces = (
                 _surfaces_from_region(
                     region,
@@ -1442,12 +1489,15 @@ def generate_earth_terrain_chunk(
                     chunk_x=chunk_x,
                     chunk_z=chunk_z,
                     surface_y=int(getattr(world, 'surface_y', 0) or 0),
+                    corners=surface_corners,
                 )
                 if region is not None
                 else None
             )
-            if region_surfaces is not None:
+            if region_surfaces is not None and not can_query_detail:
                 terrain = {
+                    'surfaceShape': {'schemaVersion': 'terrain-cut-cells.v1', 'cornerHeights': surface_corners,
+                                     'sampleStepM': active_config.region_sample_step_chunks * chunk_size},
                     'status': 'dgm',
                     'fallback': False,
                     'datasetId': dataset_id,
@@ -1550,14 +1600,18 @@ def generate_earth_terrain_chunk(
                     item = items.get(f'sample:{sample_x}:{sample_z}') or {}
                     if item.get('found') and item.get('value') is not None:
                         samples[(sample_x, sample_z)] = float(item['value'])
+            surface_corners = []
             surfaces, missing = _interpolate_surface_values(
                 chunk_size=chunk_size,
                 axis=axis,
                 samples=samples,
                 anchor_height=anchor_height,
                 surface_y=int(getattr(world, 'surface_y', 0) or 0),
+                corners=surface_corners,
             )
             terrain = {
+                'surfaceShape': {'schemaVersion': 'terrain-cut-cells.v1', 'cornerHeights': surface_corners,
+                                 'sampleStepM': active_config.sample_step_m},
                 'status': 'dgm',
                 'fallback': False,
                 'datasetId': dataset_id,
@@ -1613,6 +1667,28 @@ def generate_earth_terrain_chunk(
                 pending_release_key=pending_release_key,
                 terrain_serving=version.get('terrain_serving'),
             )
+        # A temporary detail query failure must not flatten an already known
+        # landscape. Keep the explicitly labelled overview until detail recovers;
+        # do not persist this response as a permanent replacement for 1-m data.
+        if selected_region is not None:
+            fallback_corners: list[float] = []
+            fallback_surfaces = _surfaces_from_region(
+                selected_region, chunk_size=chunk_size, chunk_x=chunk_x, chunk_z=chunk_z,
+                surface_y=int(getattr(world, 'surface_y', 0) or 0), corners=fallback_corners,
+            )
+            if fallback_surfaces is not None:
+                return _generated_content(
+                    chunk_size=chunk_size, chunk_x=chunk_x, chunk_y=chunk_y, chunk_z=chunk_z,
+                    min_y=int(getattr(world, 'min_y', -1024) or -1024),
+                    max_y=int(getattr(world, 'max_y', 8192) or 8192), surfaces=fallback_surfaces,
+                    reference_fingerprint=reference_fingerprint, release_key=release_key,
+                    terrain={'status': 'dgm-region-fallback', 'fallback': True, 'releaseKey': release_key,
+                             'sampleStepM': active_config.region_sample_step_chunks * chunk_size,
+                             'anchorElevationM': selected_region.get('anchorElevationM'),
+                             'detailError': _short_error(exc), 'surfaceShape': {
+                                 'schemaVersion': 'terrain-cut-cells.v1', 'cornerHeights': fallback_corners,
+                                 'sampleStepM': active_config.region_sample_step_chunks * chunk_size}},
+                )
         return _fallback_content(
             world,
             chunk_x=chunk_x,

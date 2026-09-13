@@ -1240,8 +1240,14 @@ def _make_instance(model_class: Any, values: Mapping[str, Any]) -> Any:
         return instance
 
 
+def _scalar_row_query(session: Any, model_class: Any) -> Any:
+    """Bootstrap/status lookups use scalar IDs/metadata, never world backrefs."""
+    from sqlalchemy.orm import noload
+    return session.query(model_class).options(noload("*"))
+
+
 def _query_first_by_fields(session: Any, model_class: Any, **fields: Any) -> Any | None:
-    """Query first row matching supported fields."""
+    """Query first scalar row matching supported fields without its object graph."""
     if session is None or model_class is None:
         return None
 
@@ -1255,13 +1261,13 @@ def _query_first_by_fields(session: Any, model_class: Any, **fields: Any) -> Any
         return None
 
     try:
-        query = session.query(model_class)
+        query = _scalar_row_query(session, model_class)
         for key, value in filters.items():
             query = query.filter(getattr(model_class, key) == value)
         return query.first()
     except Exception:
         try:
-            return session.query(model_class).filter_by(**filters).first()
+            return _scalar_row_query(session, model_class).filter_by(**filters).first()
         except Exception:
             return None
 
@@ -2153,13 +2159,13 @@ def _canonical_project_access_status(
 
     try:
         rows = (
-            db_obj.session.query(assignment_model)
+            _scalar_row_query(db_obj.session, assignment_model)
             .filter(getattr(assignment_model, "chunk_project_id") == project_id)
             .all()
         )
     except Exception:
         try:
-            rows = db_obj.session.query(assignment_model).all()
+            rows = _scalar_row_query(db_obj.session, assignment_model).all()
         except Exception:
             rows = []
         rows = [
@@ -2286,7 +2292,7 @@ def _legacy_project_access_status(
 
     try:
         role_rows = (
-            db_obj.session.query(ProjectRole)
+            _scalar_row_query(db_obj.session, ProjectRole)
             .filter(getattr(ProjectRole, "project_db_id") == project_db_id)
             .limit(max(16, len(DEFAULT_PROJECT_ROLE_KEYS) * 4))
             .all()
@@ -2345,7 +2351,7 @@ def _legacy_project_access_status(
     assignment_rows: list[Any] = []
     assignment_query_error: str | None = None
     try:
-        assignment_query = db_obj.session.query(ProjectRoleAssignment).filter(
+        assignment_query = _scalar_row_query(db_obj.session, ProjectRoleAssignment).filter(
             getattr(ProjectRoleAssignment, "project_db_id") == project_db_id
         )
         if (

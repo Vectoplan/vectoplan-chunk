@@ -265,7 +265,11 @@ def _make_json_safe(
                 except Exception:
                     safe_key = "<unserializable-key>"
 
-                result[safe_key] = _make_json_safe(
+                # Chunk cells, coordinates and material attributes are mostly
+                # plain JSON scalars. Do not recurse millions of times merely
+                # to return them unchanged; retain the depth/cycle guard for
+                # nested and provider-owned values.
+                result[safe_key] = item if _depth < max_depth and type(item) in (str, int, float, bool, type(None)) else _make_json_safe(
                     item,
                     _seen=_seen,
                     _depth=_depth + 1,
@@ -283,7 +287,7 @@ def _make_json_safe(
         _seen.add(value_id)
         try:
             return [
-                _make_json_safe(
+                item if _depth < max_depth and type(item) in (str, int, float, bool, type(None)) else _make_json_safe(
                     item,
                     _seen=_seen,
                     _depth=_depth + 1,
@@ -470,7 +474,11 @@ def _safe_rollback() -> None:
 def _json_response(body: Mapping[str, Any], status_code: int = 200):
     """Return JSON response."""
     safe_body = _make_json_safe(dict(body))
-    return jsonify(safe_body), int(status_code)
+    # Large geometry responses must not grow fivefold in development mode.
+    return current_app.response_class(
+        current_app.json.dumps(safe_body, separators=(",", ":")),
+        status=int(status_code), mimetype="application/json",
+    )
 
 
 def _route_metadata(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -1402,6 +1410,10 @@ def _runtime_content_from_generated(
     if isinstance(terrain, Mapping):
         runtime['terrain'] = _make_json_safe(dict(terrain), max_depth=20)
 
+    generated_metadata = candidate.get('metadata') or wrapper.get('metadata')
+    if isinstance(generated_metadata, Mapping):
+        runtime['metadata'] = _make_json_safe(dict(generated_metadata), max_depth=20)
+
     if isinstance(surface_y_by_column, Sequence) and not isinstance(
         surface_y_by_column,
         (str, bytes, bytearray),
@@ -1549,7 +1561,7 @@ def _runtime_content_from_snapshot(
     runtime: dict[str, Any] = {}
 
     try:
-        built = snapshot.build_runtime_content()
+        built = dict(snapshot.content_json) if isinstance(snapshot.content_json, Mapping) else snapshot.build_runtime_content()
         if isinstance(built, Mapping):
             runtime = dict(built)
     except Exception as exc:
@@ -1597,7 +1609,7 @@ def _runtime_content_from_snapshot(
                 "blockCellValueRule": snapshot.block_cell_value_rule or BLOCK_CELL_VALUE_RULE,
             },
             "palette": _normalize_palette(snapshot.palette_json or []),
-            "objectRefs": _make_json_safe(snapshot.object_refs_json or [], max_depth=30),
+            "objectRefs": snapshot.object_refs_json or [],
             "cellCount": int(snapshot.cell_count or 0),
             "contentHash": snapshot.content_hash,
             "blockRegistryId": snapshot.block_registry_id,
@@ -1610,6 +1622,11 @@ def _runtime_content_from_snapshot(
         }
     )
 
+    from src.chunk_object_projection import project_chunk_construction_refs
+    runtime = project_chunk_construction_refs(runtime)
+
+    from src.world.earth.terrain_snapshot_upgrade import upgrade_legacy_terrain_snapshot
+    runtime = upgrade_legacy_terrain_snapshot(snapshot=snapshot, content=runtime, world=world)
     return _make_json_safe(runtime, max_depth=60)
 
 
@@ -2719,28 +2736,9 @@ def get_project_world_user_placements(project_id: str, world_id: str):
             include_system_structures=include_system_structures,
         )
         page_entries = [] if summary_only else current_entries[offset : offset + limit]
-        payload_by_event_id: dict[int, tuple[Any, Any, Any]] = {}
         page_event_ids = sorted({int(entry["eventDbId"]) for entry in page_entries})
-        for batch_start in range(0, len(page_event_ids), 500):
-            payload_rows = (
-                db.session.query(
-                    ChunkEvent.id,
-                    ChunkEvent.payload_json,
-                    ChunkEvent.object_footprint_json,
-                    WorldCommandLog.request_payload_json,
-                )
-                .outerjoin(WorldCommandLog, ChunkEvent.command_log_db_id == WorldCommandLog.id)
-                .filter(ChunkEvent.id.in_(page_event_ids[batch_start : batch_start + 500]))
-                .all()
-            )
-            payload_by_event_id.update({
-                int(payload_row.id): (
-                    payload_row.payload_json,
-                    payload_row.request_payload_json,
-                    payload_row.object_footprint_json,
-                )
-                for payload_row in payload_rows
-            })
+        from src.placement_projection_payloads import page_projection_payloads
+        payload_by_event_id = page_projection_payloads(page_event_ids)
 
         entries = []
         for entry in page_entries:
@@ -3050,6 +3048,9 @@ def get_project_world_map_structures(project_id: str, world_id: str):
         from src.geodata.structure_streaming import map_structure_preview
 
         preview = map_structure_preview(world)
+        if _get_query_bool("includePlanContext", fallback=False):
+            from src.geodata.plan_context import plan_context
+            preview["planContext"] = plan_context(world)
         return _json_response(
             _ok_response(
                 response_version=MAP_STRUCTURES_RESPONSE_VERSION,
@@ -3076,6 +3077,24 @@ def get_project_world_map_structures(project_id: str, world_id: str):
     except Exception as exc:
         _safe_rollback()
         return _error_response(exc, code="map_structures_failed", status_code=500)
+
+
+@chunks_bp.get("/projects/<project_id>/worlds/<world_id>/map/parcels")
+def get_project_world_parcels(project_id: str, world_id: str):
+    try:
+        from src.geodata.parcel_context import parcel_context_neighbourhood, neighbourhood_bounds
+        lon, lat = request.args.get("lon"), request.args.get("lat")
+        neighbourhood_bounds(lon, lat)
+        _, _, world = _resolve_project_world_context(project_id, world_id,
+            universe_id=_get_query_string("universeId", fallback="") or None, include_deleted=False)
+        return _json_response({"ok": True, "parcelContext": parcel_context_neighbourhood(world, lon, lat)}, 200)
+    except LookupError as exc:
+        return _error_response(exc, code="parcel_context_not_found", status_code=404)
+    except ValueError as exc:
+        return _error_response(exc, code="invalid_parcel_context", status_code=400)
+    except Exception as exc:
+        _safe_rollback()
+        return _error_response(exc, code="parcel_context_failed", status_code=503)
 
 
 @chunks_bp.post("/projects/<project_id>/worlds/<world_id>/chunks/batch")

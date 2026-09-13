@@ -724,6 +724,16 @@ def attach_active_editor_dataset(
         for item in object_refs
         if isinstance(item, Mapping)
     }
+    # A preserved facade source is not a visible roof. Both its explicit
+    # tombstone and the world ledger prevent immutable bundle projection from
+    # reviving that deleted roof in another streamed chunk.
+    lod2_config = (getattr(world, "metadata_json", None) or {}).get("lod2Buildings") or {}
+    removed_roofs = lod2_config.get("removedRoofObjectIds") or {}
+    existing_ids.update(str(key) for key in removed_roofs)
+    for item in object_refs:
+        source = (item.get("metadata") or {}).get("lod2FacadeSource") if isinstance(item, Mapping) else None
+        if isinstance(source, Mapping):
+            existing_ids.update(str(source[key]) for key in ("deletedRoofObjectInstanceId", "originalRoofObjectInstanceId") if source.get(key))
     materialized = _materialized_building_ids(world)
     added_roofs = 0
     if exact is not None:
